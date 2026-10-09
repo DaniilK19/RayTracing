@@ -45,6 +45,8 @@ add_executable(RayTracing
     src/utf8.manifest)   # UTF-8 as the process code page (see the comment in the file)
 target_sources(RayTracing PRIVATE
     FILE_SET CXX_MODULES FILES   # our modules: files with `export module ...`
+        src/aabb.ixx
+        src/bvh.ixx
         src/camera.ixx
         src/hittable.ixx
         src/image.ixx

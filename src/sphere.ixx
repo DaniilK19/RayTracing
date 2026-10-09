@@ -2,6 +2,7 @@
 export module sphere;
 
 import std;
+import aabb;
 import hittable;
 import interval;
 import ray;
@@ -13,7 +14,11 @@ public:
     sphere(const point3& center, double radius, std::shared_ptr<const material> mat)
         : center_(center), radius_(std::fmax(0.0, radius)), mat_(std::move(mat))
     {
+        const vec3 radius_vector{radius_, radius_, radius_};
+        bbox_ = aabb::from_corners(center_ - radius_vector, center_ + radius_vector);
     }
+
+    aabb bounding_box() const override { return bbox_; }
 
     std::optional<hit_record> hit(const ray& r, interval ray_t) const override
     {
@@ -54,4 +59,5 @@ private:
     point3 center_;
     double radius_;
     std::shared_ptr<const material> mat_; // several objects can share one material, so ownership is shared
+    aabb bbox_;
 };

@@ -10,6 +10,13 @@ export struct interval
     double min = +infinity; // the interval is empty by default: min > max
     double max = -infinity;
 
+    constexpr double size() const { return max - min; }
     constexpr bool surrounds(double x) const { return min < x && x < max; } // strictly inside
     constexpr double clamp(double x) const { return std::clamp(x, min, max); }
 };
+
+// The smallest interval containing both given ones
+export constexpr interval enclose(const interval& a, const interval& b)
+{
+    return {std::min(a.min, b.min), std::max(a.max, b.max)};
+}

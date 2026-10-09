@@ -2,6 +2,7 @@
 export module hittable;
 
 import std;
+import aabb;
 import interval;
 import ray;
 import vec3;
@@ -54,13 +55,30 @@ public:
 
     // The nearest hit with parameter t strictly inside ray_t, or std::nullopt on a miss.
     virtual std::optional<hit_record> hit(const ray& r, interval ray_t) const = 0;
+
+    // A box that fully contains the object (for the BVH)
+    virtual aabb bounding_box() const = 0;
 };
 
 // An object list is a hittable too: it looks for the nearest hit among all objects.
 export class hittable_list : public hittable
 {
 public:
-    void add(std::unique_ptr<hittable> object) { objects_.push_back(std::move(object)); }
+    void add(std::unique_ptr<hittable> object)
+    {
+        bbox_ = enclose(bbox_, object->bounding_box());
+        objects_.push_back(std::move(object));
+    }
+
+    // Takes the objects out of the list, e.g. to build a BVH from them. `&&` after the parentheses means
+    // it can only be called on a temporary or explicitly handed-over list: std::move(list).release_objects().
+    std::vector<std::unique_ptr<hittable>> release_objects() &&
+    {
+        bbox_ = {};
+        return std::exchange(objects_, {});
+    }
+
+    aabb bounding_box() const override { return bbox_; }
 
     std::optional<hit_record> hit(const ray& r, interval ray_t) const override
     {
@@ -78,4 +96,5 @@ public:
 
 private:
     std::vector<std::unique_ptr<hittable>> objects_; // the list owns the objects
+    aabb bbox_;                                      // box around all objects
 };

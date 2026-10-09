@@ -1,4 +1,5 @@
 import std;
+import bvh;
 import camera;
 import hittable;
 import image;
@@ -150,7 +151,8 @@ int main(int argc, char* argv[])
         return 0;
     }
 
-    const hittable_list world = final_scene();
+    // Put the scene's objects into a BVH: each ray is then tested against a few spheres, not all of them
+    const std::unique_ptr<hittable> world = build_bvh(final_scene());
 
     const camera cam({
         .aspect_ratio = 16.0 / 9.0,
@@ -166,7 +168,7 @@ int main(int argc, char* argv[])
     });
 
     const auto start = std::chrono::steady_clock::now();
-    const image img = cam.render(world);
+    const image img = cam.render(*world);
     const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
     std::println("Render time: {:.1f} s", elapsed.count());
 
