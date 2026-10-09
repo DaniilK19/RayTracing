@@ -43,6 +43,7 @@ target_sources(std_module PUBLIC
 add_executable(RayTracing src/main.cpp)
 target_sources(RayTracing PRIVATE
     FILE_SET CXX_MODULES FILES   # our modules: files with `export module ...`
+        src/camera.ixx
         src/hittable.ixx
         src/image.ixx
         src/interval.ixx
