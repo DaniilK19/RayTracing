@@ -40,7 +40,14 @@ target_sources(std_module PUBLIC
     FILES "${MSVC_MODULES_DIR}/std.ixx")
 
 # --- Ray tracer --------------------------------------------------------------
-add_executable(RayTracing
-    src/main.cpp)
+add_executable(RayTracing src/main.cpp)
+target_sources(RayTracing PRIVATE
+    FILE_SET CXX_MODULES FILES   # our modules: files with `export module ...`
+        src/image.ixx)
+
+# Third-party code lives in external/. SYSTEM keeps the compiler from showing its warnings.
+#   stb/stb_image_write.h - v1.16, github.com/nothings/stb, commit 2c980bb (PNG writing)
+target_include_directories(RayTracing SYSTEM PRIVATE external/stb)
+
 target_link_libraries(RayTracing PRIVATE std_module)
 target_compile_options(RayTracing PRIVATE /W4)
