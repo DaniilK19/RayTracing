@@ -31,7 +31,16 @@ int main()
     world.add(std::make_unique<sphere>(point3{-1.0, 0.0, -1.0}, 0.4, material_bubble)); // air inside the glass
     world.add(std::make_unique<sphere>(point3{1.0, 0.0, -1.0}, 0.5, material_right));
 
-    const camera cam({.aspect_ratio = 16.0 / 9.0, .image_width = 400, .samples_per_pixel = 100, .max_depth = 50});
+    const camera cam({
+        .aspect_ratio = 16.0 / 9.0,
+        .image_width = 400,
+        .samples_per_pixel = 100,
+        .max_depth = 50,
+        .vfov = 20,
+        .lookfrom = {-2, 2, 1},
+        .lookat = {0, 0, -1},
+        .vup = {0, 1, 0},
+    });
     const image img = cam.render(world);
 
     const std::filesystem::path output = "image.png";

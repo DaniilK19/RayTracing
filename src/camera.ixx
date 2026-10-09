@@ -9,6 +9,8 @@ import random;
 import ray;
 import vec3;
 
+constexpr double degrees_to_radians(double degrees) { return degrees * std::numbers::pi / 180.0; }
+
 // Camera settings. They are convenient to set with designated initializers (C++20):
 //   camera cam({.aspect_ratio = 16.0 / 9.0, .image_width = 400});
 // Fields that aren't mentioned get their default values.
@@ -18,6 +20,11 @@ export struct camera_settings
     int image_width = 100;      // image width in pixels
     int samples_per_pixel = 10; // how many random rays to average per pixel
     int max_depth = 10;         // how many times a ray may bounce before we give up on it
+
+    double vfov = 90;         // vertical field of view in degrees: a smaller angle means a stronger "zoom"
+    point3 lookfrom{0, 0, 0}; // where the camera stands
+    point3 lookat{0, 0, -1};  // where it looks
+    vec3 vup{0, 1, 0};        // which direction counts as the frame's "up"
 };
 
 export class camera
@@ -30,23 +37,31 @@ public:
           pixel_samples_scale_(1.0 / settings.samples_per_pixel),
           max_depth_(settings.max_depth)
     {
-        // The camera sits at the origin looking along -z. At distance focal_length in front of it stands
-        // the viewport: a window with a ray shot through each of its pixels.
-        const double focal_length = 1.0;
-        const double viewport_height = 2.0;
+        center_ = settings.lookfrom;
+
+        // At distance focal_length in front of the camera stands the viewport: through each
+        // of its pixels we shoot a ray. The field of view sets the window height: tan(vfov / 2) = (height / 2) / distance.
+        const double focal_length = (settings.lookfrom - settings.lookat).length();
+        const double h = std::tan(degrees_to_radians(settings.vfov) / 2);
+        const double viewport_height = 2 * h * focal_length;
         const double viewport_width = viewport_height * (static_cast<double>(image_width_) / image_height_);
-        center_ = point3{0, 0, 0};
+
+        // The camera's own axes (an orthonormal basis): w points backward (from the target to the camera),
+        // u to the right, v up. vup defines where "up" is; cross gives the axes perpendicular to it.
+        const vec3 w = unit_vector(settings.lookfrom - settings.lookat);
+        const vec3 u = unit_vector(cross(settings.vup, w));
+        const vec3 v = cross(w, u);
 
         // Vectors along the window's top edge (rightward) and left edge (downward: image rows go top to bottom)
-        const vec3 viewport_u{viewport_width, 0, 0};
-        const vec3 viewport_v{0, -viewport_height, 0};
+        const vec3 viewport_u = viewport_width * u;
+        const vec3 viewport_v = viewport_height * -v;
 
         // Step between neighboring pixel centers
         pixel_delta_u_ = viewport_u / image_width_;
         pixel_delta_v_ = viewport_v / image_height_;
 
         // Upper-left corner of the window and the center of pixel (0, 0)
-        const point3 viewport_upper_left = center_ - vec3{0, 0, focal_length} - viewport_u / 2 - viewport_v / 2;
+        const point3 viewport_upper_left = center_ - focal_length * w - viewport_u / 2 - viewport_v / 2;
         pixel00_loc_ = viewport_upper_left + 0.5 * (pixel_delta_u_ + pixel_delta_v_);
     }
 
