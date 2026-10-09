@@ -10,7 +10,10 @@ import vec3;
 export class sphere : public hittable
 {
 public:
-    sphere(const point3& center, double radius) : center_(center), radius_(std::fmax(0.0, radius)) {}
+    sphere(const point3& center, double radius, std::shared_ptr<const material> mat)
+        : center_(center), radius_(std::fmax(0.0, radius)), mat_(std::move(mat))
+    {
+    }
 
     std::optional<hit_record> hit(const ray& r, interval ray_t) const override
     {
@@ -43,10 +46,12 @@ public:
         rec.t = root;
         rec.p = r.at(rec.t);
         rec.set_face_normal(r, (rec.p - center_) / radius_); // (p - center) / radius is the unit normal
+        rec.mat = mat_.get();
         return rec;
     }
 
 private:
     point3 center_;
     double radius_;
+    std::shared_ptr<const material> mat_; // several objects can share one material, so ownership is shared
 };

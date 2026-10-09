@@ -37,6 +37,13 @@ export struct vec3
     constexpr double length_squared() const { return x * x + y * y + z * z; }
     inline double length() const { return std::sqrt(length_squared()); }
 
+    // Is the vector close to zero in all coordinates?
+    inline bool near_zero() const
+    {
+        constexpr double s = 1e-8;
+        return std::fabs(x) < s && std::fabs(y) < s && std::fabs(z) < s;
+    }
+
     // Vector with random components in [0, 1) or in [min, max)
     inline static vec3 random() { return {random_double(), random_double(), random_double()}; }
     inline static vec3 random(double min, double max)
@@ -66,6 +73,10 @@ export constexpr vec3 cross(const vec3& u, const vec3& v)
 }
 
 export inline vec3 unit_vector(const vec3& v) { return v / v.length(); }
+
+// Mirror reflection of v off a surface with unit normal n:
+// the component along the normal, dot(v, n) * n, changes sign, so we subtract it twice.
+export constexpr vec3 reflect(const vec3& v, const vec3& n) { return v - 2 * dot(v, n) * n; }
 
 // Random direction: a unit-length vector, uniformly distributed over all directions.
 // Rejection method: take random points in the cube [-1, 1]³ until one falls inside the unit ball,

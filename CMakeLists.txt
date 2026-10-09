@@ -47,6 +47,7 @@ target_sources(RayTracing PRIVATE
         src/hittable.ixx
         src/image.ixx
         src/interval.ixx
+        src/material.ixx
         src/random.ixx
         src/ray.ixx
         src/sphere.ixx

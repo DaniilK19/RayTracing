@@ -130,7 +130,7 @@ private:
     // Random point in the square [-0.5, 0.5] × [-0.5, 0.5]: an offset from the pixel center.
     static vec3 sample_square() { return {random_double() - 0.5, random_double() - 0.5, 0}; }
 
-    // The color a ray "brings back". Having hit an object, the ray bounces in a random direction,
+    // The color a ray "brings back". Having hit an object, the ray is reflected or refracted,
     // and we recursively ask what color comes from there. depth is how many more bounces are allowed.
     static color ray_color(const ray& r, int depth, const hittable& world)
     {
@@ -144,10 +144,12 @@ private:
         // this would give dark spots ("shadow acne").
         if (const auto rec = world.hit(r, interval{0.001, infinity}))
         {
-            // Lambertian (diffuse) reflection: normal + a random unit vector.
-            // Directions close to the normal come up more often, like on real matte surfaces.
-            const vec3 direction = rec->normal + random_unit_vector();
-            return 0.5 * ray_color(ray{rec->p, direction}, depth - 1, world); // half of the light is absorbed
+            // What happens to the ray next is up to the object's material
+            if (const auto s = rec->mat->scatter(r, *rec))
+            {
+                return s->attenuation * ray_color(s->scattered, depth - 1, world);
+            }
+            return color{0, 0, 0}; // the ray is absorbed
         }
 
         // Sky: a smooth blend from white (bottom) to blue (top) by the height of the ray direction.
