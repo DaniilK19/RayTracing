@@ -1,6 +1,9 @@
 import std;
+import hittable;
 import image;
+import interval;
 import ray;
+import sphere;
 import vec3;
 
 // On Windows std::filesystem::path stores the path in UTF-16, and path.string() converts it
@@ -12,24 +15,11 @@ std::string to_utf8(const std::filesystem::path& path)
     return std::string(utf8.begin(), utf8.end());
 }
 
-// Does the ray hit the sphere? A point P is on the sphere if |P - center|² = radius².
-// Substituting P(t) = origin + t * direction gives a quadratic equation a·t² + b·t + c = 0.
-// The ray hits the sphere if the equation has roots, i.e. the discriminant is not negative.
-bool hit_sphere(const point3& center, double radius, const ray& r)
+color ray_color(const ray& r, const hittable& world)
 {
-    const vec3 oc = center - r.origin;
-    const double a = dot(r.direction, r.direction);
-    const double b = -2.0 * dot(r.direction, oc);
-    const double c = dot(oc, oc) - radius * radius;
-    const double discriminant = b * b - 4 * a * c;
-    return discriminant >= 0;
-}
-
-color ray_color(const ray& r)
-{
-    if (hit_sphere(point3{0, 0, -1}, 0.5, r))
+    if (const auto rec = world.hit(r, interval{0, infinity}))
     {
-        return color{1, 0, 0};
+        return 0.5 * (rec->normal + color{1, 1, 1}); // normal components -1..1 → color 0..1
     }
 
     // Sky: a smooth blend from white (bottom) to blue (top) by the height of the ray direction.
@@ -66,6 +56,11 @@ int main()
         camera_center - vec3{0, 0, focal_length} - viewport_u / 2 - viewport_v / 2;
     constexpr point3 pixel00_loc = viewport_upper_left + 0.5 * (pixel_delta_u + pixel_delta_v);
 
+    // Scene: a small sphere and a huge "ground" sphere under it
+    hittable_list world;
+    world.add(std::make_unique<sphere>(point3{0, 0, -1}, 0.5));
+    world.add(std::make_unique<sphere>(point3{0, -100.5, -1}, 100));
+
     image img(image_width, image_height);
 
     for (int j = 0; j < image_height; ++j)
@@ -75,7 +70,7 @@ int main()
         {
             const point3 pixel_center = pixel00_loc + (i * pixel_delta_u) + (j * pixel_delta_v);
             const ray r{camera_center, pixel_center - camera_center};
-            img[i, j] = ray_color(r);
+            img[i, j] = ray_color(r, world);
         }
     }
 
