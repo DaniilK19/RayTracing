@@ -11,14 +11,15 @@ import vec3;
 // Command-line options
 struct options
 {
-    int image_width = 1200;
+    int image_width = 1920; // Full HD: with a 16:9 aspect ratio the height will be 1080
     int samples_per_pixel = 500;
     std::filesystem::path output = "image.png";
     bool help = false;
 };
 
 constexpr std::string_view usage = R"(Usage: RayTracing [options]
-  -w, --width N      image width in pixels (default 1200)
+  -w, --width N      image width in pixels; the height follows the 16:9 aspect ratio
+                     (default 1920, Full HD 1920×1080; the book uses 1200)
   -s, --samples N    rays per pixel (default 500): fewer is faster but noisier
   -o, --output FILE  where to save the PNG (default image.png)
   -h, --help         show this help)";

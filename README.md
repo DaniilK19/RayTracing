@@ -2,9 +2,9 @@
 
 A learning ray tracer following Peter Shirley's book ["Ray Tracing in One Weekend"](https://raytracing.github.io/books/RayTracingInOneWeekend.html), rewritten in modern C++23: modules, `import std;`, multithreading and the BVH from the second book of the series.
 
-![Final scene: 1200×675, 500 rays per pixel](docs/final.png)
+![Final scene in Full HD: 1920×1080, 500 rays per pixel](docs/final.png)
 
-*The book's final scene: 1200×675, 500 rays per pixel, 35 seconds on all cores (Release).*
+*The book's final scene in Full HD: 1920×1080, 500 rays per pixel, 90 seconds on all cores (Release).*
 
 ## Features
 
@@ -39,13 +39,22 @@ out\build\x64-release\RayTracing.exe -s 10
 
 ```
 RayTracing [options]
-  -w, --width N      image width in pixels (default 1200)
+  -w, --width N      image width in pixels; the height follows the 16:9 aspect ratio
+                     (default 1920, Full HD 1920×1080; the book uses 1200)
   -s, --samples N    rays per pixel (default 500): fewer is faster but noisier
   -o, --output FILE  where to save the PNG (default image.png)
   -h, --help         show help
 ```
 
-On all cores at width 1200: `-s 10` takes under a second (draft), `-s 500` about 35 seconds.
+Time on all cores in Release:
+
+| Command | Size | Time |
+|---|---|---|
+| `RayTracing -s 10` | Full HD, draft with visible noise | ~2 s |
+| `RayTracing` | Full HD, final quality | ~90 s |
+| `RayTracing -w 1200` | as in the book, 1200×675 | ~35 s |
+
+Time grows in proportion to the number of pixels and the number of rays per pixel.
 
 To pass options when launching from Visual Studio, open **Debug → Debug and Launch Settings for RayTracing** and add `"args": ["-s", "10"]` to the configuration.
 
