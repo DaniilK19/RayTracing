@@ -78,6 +78,17 @@ export inline vec3 unit_vector(const vec3& v) { return v / v.length(); }
 // the component along the normal, dot(v, n) * n, changes sign, so we subtract it twice.
 export constexpr vec3 reflect(const vec3& v, const vec3& n) { return v - 2 * dot(v, n) * n; }
 
+// Refraction of the unit vector uv at a surface with unit normal n (Snell's law).
+// etai_over_etat is the ratio of refractive indices: of the medium the ray comes from to the one it enters.
+// The refracted ray is assembled from two parts: perpendicular to the normal and parallel to it.
+export inline vec3 refract(const vec3& uv, const vec3& n, double etai_over_etat)
+{
+    const double cos_theta = std::fmin(dot(-uv, n), 1.0);
+    const vec3 r_out_perp = etai_over_etat * (uv + cos_theta * n);
+    const vec3 r_out_parallel = -std::sqrt(std::fabs(1.0 - r_out_perp.length_squared())) * n;
+    return r_out_perp + r_out_parallel;
+}
+
 // Random direction: a unit-length vector, uniformly distributed over all directions.
 // Rejection method: take random points in the cube [-1, 1]³ until one falls inside the unit ball,
 // and normalize it. Normalizing any cube point instead would favor directions toward the cube's corners.
