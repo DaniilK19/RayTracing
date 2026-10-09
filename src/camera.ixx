@@ -49,20 +49,55 @@ public:
     }
 
     // Render: for each pixel average the colors of several rays and write the result into the image.
+    // Rows are computed in parallel on all CPU threads.
     image render(const hittable& world) const
     {
+        const unsigned thread_count = std::max(1u, std::thread::hardware_concurrency());
+        std::println("Rendering {}×{}, rays per pixel: {}, threads: {}", image_width_, image_height_,
+                     samples_per_pixel_, thread_count);
+
         image img(image_width_, image_height_);
-        for (int j = 0; j < image_height_; ++j)
-        {
-            std::print("\rRows remaining: {:4}", image_height_ - j);
-            for (int i = 0; i < image_width_; ++i)
+
+        // Each thread takes the next free row until the rows run out. The counters are atomic
+        // because several threads change them at once. The pixels, however, differ between threads (each writes
+        // only to its own rows), so the image needs no protection.
+        std::atomic<int> next_row = 0;
+        std::atomic<int> rows_done = 0;
+        auto render_rows = [&] {
+            for (int j = next_row++; j < image_height_; j = next_row++)
             {
-                color pixel_color{0, 0, 0};
-                for (int sample = 0; sample < samples_per_pixel_; ++sample)
+                // Each row has its own random number sequence: the image doesn't depend
+                // on which thread computed the row or when, and is the same on every run.
+                seed_random(static_cast<std::uint64_t>(j));
+                for (int i = 0; i < image_width_; ++i)
                 {
-                    pixel_color += ray_color(get_ray(i, j), world);
+                    color pixel_color{0, 0, 0};
+                    for (int sample = 0; sample < samples_per_pixel_; ++sample)
+                    {
+                        pixel_color += ray_color(get_ray(i, j), world);
+                    }
+                    img[i, j] = pixel_samples_scale_ * pixel_color;
                 }
-                img[i, j] = pixel_samples_scale_ * pixel_color;
+                ++rows_done;
+                rows_done.notify_one(); // wake the main thread: time to update the progress
+            }
+        };
+
+        {
+            // std::jthread (C++20), unlike std::thread, waits for its thread to finish
+            // in the destructor, that is, when leaving this block.
+            std::vector<std::jthread> workers;
+            for (unsigned t = 0; t < thread_count; ++t)
+            {
+                workers.emplace_back(render_rows);
+            }
+
+            // The main thread shows progress. atomic::wait (C++20) puts the thread to sleep
+            // until the counter changes, without polling in a loop.
+            for (int done = 0; done < image_height_; done = rows_done.load())
+            {
+                std::print("\rRows remaining: {:4}", image_height_ - done);
+                rows_done.wait(done);
             }
         }
         std::print("\r{:30}\r", ""); // erase the progress line

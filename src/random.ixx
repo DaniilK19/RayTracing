@@ -4,10 +4,18 @@ export module random;
 import std;
 
 // Mersenne Twister generator with 64-bit output. Not exported: only the functions below are visible outside.
+// Each thread has its own generator (thread_local): a shared one would need a mutex,
+// and threads access it millions of times per second.
 inline std::mt19937_64& engine()
 {
-    static std::mt19937_64 generator;
+    thread_local std::mt19937_64 generator;
     return generator;
+}
+
+// Restarts the current thread's generator: the same seed gives the same sequence of numbers.
+export inline void seed_random(std::uint64_t seed)
+{
+    engine().seed(seed);
 }
 
 // Random number in [0, 1).
