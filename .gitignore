@@ -1,0 +1,8 @@
+# Build output: all CMake presets build into out/
+out/
+
+# Visual Studio's working folder (IntelliSense database, window layout)
+.vs/
+
+# Personal CMake presets: everyone has their own, they don't belong in the repository
+CMakeUserPresets.json
