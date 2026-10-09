@@ -1,5 +1,6 @@
 import std;
 import image;
+import vec3;
 
 // On Windows std::filesystem::path stores the path in UTF-16, and path.string() converts it
 // to the legacy Windows code page: Cyrillic in the path would turn into mojibake.
@@ -15,10 +16,6 @@ int main()
     constexpr int width = 256;
     constexpr int height = 256;
 
-    // Channel brightness 0.0–1.0 → byte 0–255. The factor is 255.999, not 255: otherwise only exactly
-    // 1.0 would get 255, and the brightest shade would almost never appear.
-    const auto to_byte = [](double value) { return static_cast<std::uint8_t>(255.999 * value); };
-
     image img(width, height);
 
     for (int y = 0; y < height; ++y)
@@ -28,8 +25,7 @@ int main()
         {
             const double r = static_cast<double>(x) / (width - 1);  // left to right: 0 → 1
             const double g = static_cast<double>(y) / (height - 1); // top to bottom: 0 → 1
-            const double b = 0.0;
-            img[x, y] = {to_byte(r), to_byte(g), to_byte(b)};
+            img[x, y] = color{r, g, 0.0};
         }
     }
 

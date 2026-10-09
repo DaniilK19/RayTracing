@@ -43,7 +43,8 @@ target_sources(std_module PUBLIC
 add_executable(RayTracing src/main.cpp)
 target_sources(RayTracing PRIVATE
     FILE_SET CXX_MODULES FILES   # our modules: files with `export module ...`
-        src/image.ixx)
+        src/image.ixx
+        src/vec3.ixx)
 
 # Third-party code lives in external/. SYSTEM keeps the compiler from showing its warnings.
 #   stb/stb_image_write.h - v1.16, github.com/nothings/stb, commit 2c980bb (PNG writing)

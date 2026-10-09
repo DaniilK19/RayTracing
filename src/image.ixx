@@ -11,17 +11,14 @@ module;
 export module image;
 
 import std;
+import vec3;
 
-// One pixel's color: a byte (0–255) for each of the red, green and blue channels.
-export struct pixel
+// Channel brightness 0.0–1.0 → byte 0–255. The factor is 255.999, not 255: otherwise only exactly
+// 1.0 would get 255, and the brightest shade would almost never appear.
+std::uint8_t to_byte(double value)
 {
-    std::uint8_t r = 0;
-    std::uint8_t g = 0;
-    std::uint8_t b = 0;
-};
-
-// stb expects pixels as a contiguous byte array R,G,B,R,G,B,... with no "holes" between them.
-static_assert(sizeof(pixel) == 3);
+    return static_cast<std::uint8_t>(255.999 * value);
+}
 
 export class image
 {
@@ -34,9 +31,9 @@ public:
     int width() const { return width_; }
     int height() const { return height_; }
 
-    // Pixel access: img[x, y]. Multiple arguments to operator[] are allowed since C++23.
+    // Pixel color: img[x, y]. Multiple arguments to operator[] are allowed since C++23.
     // `this auto& self` is C++23 too ("deducing this"): one function instead of a const/non-const pair.
-    // For a const image, self is a const image&, and a const pixel& is returned.
+    // For a const image, self is a const image&, and a const color& is returned.
     auto& operator[](this auto& self, int x, int y)
     {
         return self.pixels_[static_cast<std::size_t>(y) * self.width_ + x];
@@ -46,6 +43,16 @@ public:
     // holds either "success" (void) or an error description (std::string).
     std::expected<void, std::string> save_png(const std::filesystem::path& path) const
     {
+        // PNG stores one byte per channel: convert the colors into a contiguous byte array R,G,B,R,G,B,...
+        std::vector<std::uint8_t> bytes;
+        bytes.reserve(pixels_.size() * 3);
+        for (const color& pixel : pixels_)
+        {
+            bytes.push_back(to_byte(pixel.x));
+            bytes.push_back(to_byte(pixel.y));
+            bytes.push_back(to_byte(pixel.z));
+        }
+
         std::ofstream file(path, std::ios::binary);
         if (!file)
         {
@@ -57,9 +64,8 @@ public:
         auto write_chunk = [](void* context, void* data, int size) {
             static_cast<std::ofstream*>(context)->write(static_cast<const char*>(data), size);
         };
-        const int row_bytes = width_ * static_cast<int>(sizeof(pixel));
         const bool encoded =
-            stbi_write_png_to_func(write_chunk, &file, width_, height_, 3, pixels_.data(), row_bytes) != 0;
+            stbi_write_png_to_func(write_chunk, &file, width_, height_, 3, bytes.data(), width_ * 3) != 0;
 
         file.close();
         if (!encoded || !file)
@@ -72,5 +78,5 @@ public:
 private:
     int width_;
     int height_;
-    std::vector<pixel> pixels_; // row by row, top to bottom: pixel (x, y) is at [y * width + x]
+    std::vector<color> pixels_; // row by row, top to bottom: pixel (x, y) is at [y * width + x]
 };
