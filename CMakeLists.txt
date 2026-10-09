@@ -44,6 +44,7 @@ add_executable(RayTracing src/main.cpp)
 target_sources(RayTracing PRIVATE
     FILE_SET CXX_MODULES FILES   # our modules: files with `export module ...`
         src/image.ixx
+        src/ray.ixx
         src/vec3.ixx)
 
 # Third-party code lives in external/. SYSTEM keeps the compiler from showing its warnings.
