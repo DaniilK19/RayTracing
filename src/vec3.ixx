@@ -74,6 +74,19 @@ export constexpr vec3 cross(const vec3& u, const vec3& v)
 
 export inline vec3 unit_vector(const vec3& v) { return v / v.length(); }
 
+// Random point inside the unit disk in the z = 0 plane (also by rejection).
+export inline vec3 random_in_unit_disk()
+{
+    while (true)
+    {
+        const vec3 p{random_double(-1, 1), random_double(-1, 1), 0};
+        if (p.length_squared() < 1)
+        {
+            return p;
+        }
+    }
+}
+
 // Mirror reflection of v off a surface with unit normal n:
 // the component along the normal, dot(v, n) * n, changes sign, so we subtract it twice.
 export constexpr vec3 reflect(const vec3& v, const vec3& n) { return v - 2 * dot(v, n) * n; }

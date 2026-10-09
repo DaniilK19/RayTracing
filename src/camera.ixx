@@ -25,6 +25,12 @@ export struct camera_settings
     point3 lookfrom{0, 0, 0}; // where the camera stands
     point3 lookat{0, 0, -1};  // where it looks
     vec3 vup{0, 1, 0};        // which direction counts as the frame's "up"
+
+    // Depth of field. A real camera gathers light with a lens, and only objects at the focus distance
+    // come out sharp. We imitate this: rays start not from a single point
+    // but from random points of a "lens" disk and converge on the focus plane.
+    double defocus_angle = 0; // angle of the ray cone through each pixel, in degrees (0 means everything is sharp)
+    double focus_dist = 10;   // distance from the camera to the plane of perfect focus
 };
 
 export class camera
@@ -35,15 +41,15 @@ public:
           image_height_(std::max(1, static_cast<int>(settings.image_width / settings.aspect_ratio))),
           samples_per_pixel_(settings.samples_per_pixel),
           pixel_samples_scale_(1.0 / settings.samples_per_pixel),
-          max_depth_(settings.max_depth)
+          max_depth_(settings.max_depth),
+          defocus_angle_(settings.defocus_angle)
     {
         center_ = settings.lookfrom;
 
-        // At distance focal_length in front of the camera stands the viewport: through each
-        // of its pixels we shoot a ray. The field of view sets the window height: tan(vfov / 2) = (height / 2) / distance.
-        const double focal_length = (settings.lookfrom - settings.lookat).length();
+        // The viewport stands on the focus plane in front of the camera: through each of its pixels
+        // we shoot a ray. The field of view sets the window height: tan(vfov / 2) = (height / 2) / distance.
         const double h = std::tan(degrees_to_radians(settings.vfov) / 2);
-        const double viewport_height = 2 * h * focal_length;
+        const double viewport_height = 2 * h * settings.focus_dist;
         const double viewport_width = viewport_height * (static_cast<double>(image_width_) / image_height_);
 
         // The camera's own axes (an orthonormal basis): w points backward (from the target to the camera),
@@ -61,8 +67,13 @@ public:
         pixel_delta_v_ = viewport_v / image_height_;
 
         // Upper-left corner of the window and the center of pixel (0, 0)
-        const point3 viewport_upper_left = center_ - focal_length * w - viewport_u / 2 - viewport_v / 2;
+        const point3 viewport_upper_left = center_ - settings.focus_dist * w - viewport_u / 2 - viewport_v / 2;
         pixel00_loc_ = viewport_upper_left + 0.5 * (pixel_delta_u_ + pixel_delta_v_);
+
+        // The "lens" disk: its radius is such that from the viewport center it is seen at the angle defocus_angle
+        const double defocus_radius = settings.focus_dist * std::tan(degrees_to_radians(settings.defocus_angle / 2));
+        defocus_disk_u_ = defocus_radius * u;
+        defocus_disk_v_ = defocus_radius * v;
     }
 
     // Render: for each pixel average the colors of several rays and write the result into the image.
@@ -127,23 +138,35 @@ private:
     int samples_per_pixel_;
     double pixel_samples_scale_; // 1 / samples_per_pixel: the averaging factor
     int max_depth_;
+    double defocus_angle_;
     point3 center_;              // camera position
     point3 pixel00_loc_;         // center of pixel (0, 0)
     vec3 pixel_delta_u_;         // step to the next pixel to the right
     vec3 pixel_delta_v_;         // step to the next pixel below
+    vec3 defocus_disk_u_;        // horizontal radius of the "lens" disk
+    vec3 defocus_disk_v_;        // vertical radius of the "lens" disk
 
-    // A ray from the camera through a random point of pixel (i, j). If all rays went exactly through
-    // the center, object edges would look like "staircases"; random points inside the pixel smooth them out.
+    // A ray through a random point of pixel (i, j). If all rays went exactly through the center,
+    // object edges would look like "staircases"; random points inside the pixel smooth them out.
+    // The ray starts at a random point of the lens (or at the camera center if defocus is off).
     ray get_ray(int i, int j) const
     {
         const vec3 offset = sample_square();
         const point3 pixel_sample =
             pixel00_loc_ + ((i + offset.x) * pixel_delta_u_) + ((j + offset.y) * pixel_delta_v_);
-        return ray{center_, pixel_sample - center_};
+        const point3 ray_origin = defocus_angle_ <= 0 ? center_ : defocus_disk_sample();
+        return ray{ray_origin, pixel_sample - ray_origin};
     }
 
     // Random point in the square [-0.5, 0.5] × [-0.5, 0.5]: an offset from the pixel center.
     static vec3 sample_square() { return {random_double() - 0.5, random_double() - 0.5, 0}; }
+
+    // Random point on the "lens" disk around the camera center.
+    point3 defocus_disk_sample() const
+    {
+        const vec3 p = random_in_unit_disk();
+        return center_ + p.x * defocus_disk_u_ + p.y * defocus_disk_v_;
+    }
 
     // The color a ray "brings back". Having hit an object, the ray is reflected or refracted,
     // and we recursively ask what color comes from there. depth is how many more bounces are allowed.
