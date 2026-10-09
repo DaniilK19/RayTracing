@@ -12,9 +12,27 @@ std::string to_utf8(const std::filesystem::path& path)
     return std::string(utf8.begin(), utf8.end());
 }
 
-// Sky color: a smooth blend from white (bottom) to blue (top) by the height of the ray direction.
+// Does the ray hit the sphere? A point P is on the sphere if |P - center|² = radius².
+// Substituting P(t) = origin + t * direction gives a quadratic equation a·t² + b·t + c = 0.
+// The ray hits the sphere if the equation has roots, i.e. the discriminant is not negative.
+bool hit_sphere(const point3& center, double radius, const ray& r)
+{
+    const vec3 oc = center - r.origin;
+    const double a = dot(r.direction, r.direction);
+    const double b = -2.0 * dot(r.direction, oc);
+    const double c = dot(oc, oc) - radius * radius;
+    const double discriminant = b * b - 4 * a * c;
+    return discriminant >= 0;
+}
+
 color ray_color(const ray& r)
 {
+    if (hit_sphere(point3{0, 0, -1}, 0.5, r))
+    {
+        return color{1, 0, 0};
+    }
+
+    // Sky: a smooth blend from white (bottom) to blue (top) by the height of the ray direction.
     const vec3 unit_direction = unit_vector(r.direction);
     const double a = 0.5 * (unit_direction.y + 1.0); // y from -1 to 1 → a from 0 to 1
     return (1.0 - a) * color{1.0, 1.0, 1.0} + a * color{0.5, 0.7, 1.0};
