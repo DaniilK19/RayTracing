@@ -40,7 +40,9 @@ target_sources(std_module PUBLIC
     FILES "${MSVC_MODULES_DIR}/std.ixx")
 
 # --- Ray tracer --------------------------------------------------------------
-add_executable(RayTracing src/main.cpp)
+add_executable(RayTracing
+    src/main.cpp
+    src/utf8.manifest)   # UTF-8 as the process code page (see the comment in the file)
 target_sources(RayTracing PRIVATE
     FILE_SET CXX_MODULES FILES   # our modules: files with `export module ...`
         src/camera.ixx

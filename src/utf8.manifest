@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Application manifest: asks Windows (Windows 10 version 1903 and later) to use UTF-8 as the
+     process code page. Then argv and all "narrow" (char) Windows and CRT functions work in UTF-8,
+     and a Cyrillic path on the command line won't turn into "????". -->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <application>
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>
