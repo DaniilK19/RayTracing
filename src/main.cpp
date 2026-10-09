@@ -151,6 +151,11 @@ int main(int argc, char* argv[])
         return 0;
     }
 
+#ifndef NDEBUG // NDEBUG is defined in Release and RelWithDebInfo
+    std::println("This is a Debug build: rendering is about 8 times slower than in Release.\n"
+                 "For a final image choose the x64 Release preset; for a quick draft add -s 10.");
+#endif
+
     // Put the scene's objects into a BVH: each ray is then tested against a few spheres, not all of them
     const std::unique_ptr<hittable> world = build_bvh(final_scene());
 

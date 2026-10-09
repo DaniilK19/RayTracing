@@ -6,3 +6,6 @@ out/
 
 # Personal CMake presets: everyone has their own, they don't belong in the repository
 CMakeUserPresets.json
+
+# Renders saved to the project root when run from the command line
+/*.png
