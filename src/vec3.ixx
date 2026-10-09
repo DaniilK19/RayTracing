@@ -2,6 +2,7 @@
 export module vec3;
 
 import std;
+import random;
 
 // All functions here are constexpr or inline. This matters: in a named module a function
 // defined inside a class does NOT become inline by itself (unlike in headers), and without this
@@ -35,6 +36,13 @@ export struct vec3
 
     constexpr double length_squared() const { return x * x + y * y + z * z; }
     inline double length() const { return std::sqrt(length_squared()); }
+
+    // Vector with random components in [0, 1) or in [min, max)
+    inline static vec3 random() { return {random_double(), random_double(), random_double()}; }
+    inline static vec3 random(double min, double max)
+    {
+        return {random_double(min, max), random_double(min, max), random_double(min, max)};
+    }
 };
 
 export using point3 = vec3; // a point in space
@@ -58,3 +66,20 @@ export constexpr vec3 cross(const vec3& u, const vec3& v)
 }
 
 export inline vec3 unit_vector(const vec3& v) { return v / v.length(); }
+
+// Random direction: a unit-length vector, uniformly distributed over all directions.
+// Rejection method: take random points in the cube [-1, 1]³ until one falls inside the unit ball,
+// and normalize it. Normalizing any cube point instead would favor directions toward the cube's corners.
+// Very short vectors are rejected too: dividing by almost zero gives a huge error.
+export inline vec3 random_unit_vector()
+{
+    while (true)
+    {
+        const vec3 p = vec3::random(-1, 1);
+        const double length_squared = p.length_squared();
+        if (1e-160 < length_squared && length_squared <= 1)
+        {
+            return p / std::sqrt(length_squared);
+        }
+    }
+}

@@ -17,6 +17,7 @@ export struct camera_settings
     double aspect_ratio = 1.0;  // image width to height ratio
     int image_width = 100;      // image width in pixels
     int samples_per_pixel = 10; // how many random rays to average per pixel
+    int max_depth = 10;         // how many times a ray may bounce before we give up on it
 };
 
 export class camera
@@ -26,7 +27,8 @@ public:
         : image_width_(settings.image_width),
           image_height_(std::max(1, static_cast<int>(settings.image_width / settings.aspect_ratio))),
           samples_per_pixel_(settings.samples_per_pixel),
-          pixel_samples_scale_(1.0 / settings.samples_per_pixel)
+          pixel_samples_scale_(1.0 / settings.samples_per_pixel),
+          max_depth_(settings.max_depth)
     {
         // The camera sits at the origin looking along -z. At distance focal_length in front of it stands
         // the viewport: a window with a ray shot through each of its pixels.
@@ -74,7 +76,7 @@ public:
                     color pixel_color{0, 0, 0};
                     for (int sample = 0; sample < samples_per_pixel_; ++sample)
                     {
-                        pixel_color += ray_color(get_ray(i, j), world);
+                        pixel_color += ray_color(get_ray(i, j), max_depth_, world);
                     }
                     img[i, j] = pixel_samples_scale_ * pixel_color;
                 }
@@ -109,6 +111,7 @@ private:
     int image_height_;
     int samples_per_pixel_;
     double pixel_samples_scale_; // 1 / samples_per_pixel: the averaging factor
+    int max_depth_;
     point3 center_;              // camera position
     point3 pixel00_loc_;         // center of pixel (0, 0)
     vec3 pixel_delta_u_;         // step to the next pixel to the right
@@ -127,11 +130,24 @@ private:
     // Random point in the square [-0.5, 0.5] × [-0.5, 0.5]: an offset from the pixel center.
     static vec3 sample_square() { return {random_double() - 0.5, random_double() - 0.5, 0}; }
 
-    static color ray_color(const ray& r, const hittable& world)
+    // The color a ray "brings back". Having hit an object, the ray bounces in a random direction,
+    // and we recursively ask what color comes from there. depth is how many more bounces are allowed.
+    static color ray_color(const ray& r, int depth, const hittable& world)
     {
-        if (const auto rec = world.hit(r, interval{0, infinity}))
+        if (depth <= 0)
         {
-            return 0.5 * (rec->normal + color{1, 1, 1}); // normal components -1..1 → color 0..1
+            return color{0, 0, 0}; // too many bounces: assume no light reached the camera
+        }
+
+        // Look for hits with t from 0.001, not from 0: due to rounding errors the reflection point
+        // ends up slightly below the surface, and the ray would immediately "hit" the same surface. In the image
+        // this would give dark spots ("shadow acne").
+        if (const auto rec = world.hit(r, interval{0.001, infinity}))
+        {
+            // Lambertian (diffuse) reflection: normal + a random unit vector.
+            // Directions close to the normal come up more often, like on real matte surfaces.
+            const vec3 direction = rec->normal + random_unit_vector();
+            return 0.5 * ray_color(ray{rec->p, direction}, depth - 1, world); // half of the light is absorbed
         }
 
         // Sky: a smooth blend from white (bottom) to blue (top) by the height of the ray direction.

@@ -14,12 +14,20 @@ import std;
 import interval;
 import vec3;
 
+// Gamma correction. The tracer computes physical ("linear") brightness, while image formats
+// and monitors expect values in gamma space: without correction the image is too dark.
+// The "gamma 2" approximation: take the square root of the linear brightness.
+double linear_to_gamma(double linear)
+{
+    return linear > 0 ? std::sqrt(linear) : 0.0;
+}
+
 // Channel brightness 0.0–1.0 → byte 0–255: the range is split into 256 equal parts.
 // Values outside the range (this happens after averaging samples) are clamped.
-std::uint8_t to_byte(double value)
+std::uint8_t to_byte(double linear)
 {
     constexpr interval intensity{0.000, 0.999};
-    return static_cast<std::uint8_t>(256 * intensity.clamp(value));
+    return static_cast<std::uint8_t>(256 * intensity.clamp(linear_to_gamma(linear)));
 }
 
 export class image

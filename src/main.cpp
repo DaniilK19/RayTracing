@@ -21,7 +21,7 @@ int main()
     world.add(std::make_unique<sphere>(point3{0, 0, -1}, 0.5));
     world.add(std::make_unique<sphere>(point3{0, -100.5, -1}, 100));
 
-    const camera cam({.aspect_ratio = 16.0 / 9.0, .image_width = 400, .samples_per_pixel = 100});
+    const camera cam({.aspect_ratio = 16.0 / 9.0, .image_width = 400, .samples_per_pixel = 100, .max_depth = 50});
     const image img = cam.render(world);
 
     const std::filesystem::path output = "image.png";
