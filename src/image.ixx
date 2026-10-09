@@ -11,13 +11,15 @@ module;
 export module image;
 
 import std;
+import interval;
 import vec3;
 
-// Channel brightness 0.0–1.0 → byte 0–255. The factor is 255.999, not 255: otherwise only exactly
-// 1.0 would get 255, and the brightest shade would almost never appear.
+// Channel brightness 0.0–1.0 → byte 0–255: the range is split into 256 equal parts.
+// Values outside the range (this happens after averaging samples) are clamped.
 std::uint8_t to_byte(double value)
 {
-    return static_cast<std::uint8_t>(255.999 * value);
+    constexpr interval intensity{0.000, 0.999};
+    return static_cast<std::uint8_t>(256 * intensity.clamp(value));
 }
 
 export class image

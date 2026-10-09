@@ -11,4 +11,5 @@ export struct interval
     double max = -infinity;
 
     constexpr bool surrounds(double x) const { return min < x && x < max; } // strictly inside
+    constexpr double clamp(double x) const { return std::clamp(x, min, max); }
 };

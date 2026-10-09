@@ -5,6 +5,7 @@ import std;
 import hittable;
 import image;
 import interval;
+import random;
 import ray;
 import vec3;
 
@@ -13,8 +14,9 @@ import vec3;
 // Fields that aren't mentioned get their default values.
 export struct camera_settings
 {
-    double aspect_ratio = 1.0; // image width to height ratio
-    int image_width = 100;     // image width in pixels
+    double aspect_ratio = 1.0;  // image width to height ratio
+    int image_width = 100;      // image width in pixels
+    int samples_per_pixel = 10; // how many random rays to average per pixel
 };
 
 export class camera
@@ -22,7 +24,9 @@ export class camera
 public:
     explicit camera(const camera_settings& settings)
         : image_width_(settings.image_width),
-          image_height_(std::max(1, static_cast<int>(settings.image_width / settings.aspect_ratio)))
+          image_height_(std::max(1, static_cast<int>(settings.image_width / settings.aspect_ratio))),
+          samples_per_pixel_(settings.samples_per_pixel),
+          pixel_samples_scale_(1.0 / settings.samples_per_pixel)
     {
         // The camera sits at the origin looking along -z. At distance focal_length in front of it stands
         // the viewport: a window with a ray shot through each of its pixels.
@@ -44,7 +48,7 @@ public:
         pixel00_loc_ = viewport_upper_left + 0.5 * (pixel_delta_u_ + pixel_delta_v_);
     }
 
-    // Render: shoot a ray for each pixel and write its color into the image.
+    // Render: for each pixel average the colors of several rays and write the result into the image.
     image render(const hittable& world) const
     {
         image img(image_width_, image_height_);
@@ -53,9 +57,12 @@ public:
             std::print("\rRows remaining: {:4}", image_height_ - j);
             for (int i = 0; i < image_width_; ++i)
             {
-                const point3 pixel_center = pixel00_loc_ + (i * pixel_delta_u_) + (j * pixel_delta_v_);
-                const ray r{center_, pixel_center - center_};
-                img[i, j] = ray_color(r, world);
+                color pixel_color{0, 0, 0};
+                for (int sample = 0; sample < samples_per_pixel_; ++sample)
+                {
+                    pixel_color += ray_color(get_ray(i, j), world);
+                }
+                img[i, j] = pixel_samples_scale_ * pixel_color;
             }
         }
         std::print("\r{:30}\r", ""); // erase the progress line
@@ -65,10 +72,25 @@ public:
 private:
     int image_width_;
     int image_height_;
-    point3 center_;      // camera position
-    point3 pixel00_loc_; // center of pixel (0, 0)
-    vec3 pixel_delta_u_; // step to the next pixel to the right
-    vec3 pixel_delta_v_; // step to the next pixel below
+    int samples_per_pixel_;
+    double pixel_samples_scale_; // 1 / samples_per_pixel: the averaging factor
+    point3 center_;              // camera position
+    point3 pixel00_loc_;         // center of pixel (0, 0)
+    vec3 pixel_delta_u_;         // step to the next pixel to the right
+    vec3 pixel_delta_v_;         // step to the next pixel below
+
+    // A ray from the camera through a random point of pixel (i, j). If all rays went exactly through
+    // the center, object edges would look like "staircases"; random points inside the pixel smooth them out.
+    ray get_ray(int i, int j) const
+    {
+        const vec3 offset = sample_square();
+        const point3 pixel_sample =
+            pixel00_loc_ + ((i + offset.x) * pixel_delta_u_) + ((j + offset.y) * pixel_delta_v_);
+        return ray{center_, pixel_sample - center_};
+    }
+
+    // Random point in the square [-0.5, 0.5] × [-0.5, 0.5]: an offset from the pixel center.
+    static vec3 sample_square() { return {random_double() - 0.5, random_double() - 0.5, 0}; }
 
     static color ray_color(const ray& r, const hittable& world)
     {
