@@ -20,6 +20,13 @@ export struct scene
 {
     hittable_list world;
     camera_settings camera;
+
+    // What the lights sampling strategy aims at (book 3, chapter 9): a copy of each lamp's shape, without
+    // a material, as only its pdf_value and random are used. If the copy drifted away from the lamp, rays would be
+    // aimed where no light comes from, with no error anywhere. So each scene builds both from one function that
+    // takes the material: the glowing one for world, nullptr for lights.
+    // It comes last, so scenes lit by the sky can leave it out: return {std::move(world), camera}.
+    hittable_list lights;
 };
 
 // A scene in the list: a name for the command line, a description for the help and the function that builds it.
@@ -226,7 +233,15 @@ scene simple_light()
 
     const auto light = std::make_shared<diffuse_light>(color{4, 4, 4});
     world.add(std::make_unique<sphere>(point3{0, 7, 0}, 2, light));
-    world.add(std::make_unique<quad>(point3{3, 1, -2}, vec3{2, 0, 0}, vec3{0, 2, 0}, light));
+    // The quad lamp faces +z. A lambda builds it for world and for lights (see scene::lights).
+    const auto quad_lamp = [](std::shared_ptr<const material> mat) {
+        return std::make_unique<quad>(point3{3, 1, -2}, vec3{2, 0, 0}, vec3{0, 2, 0}, std::move(mat));
+    };
+    world.add(quad_lamp(light));
+
+    // Only the quad so far: a sphere can't be aimed at yet
+    hittable_list lights;
+    lights.add(quad_lamp(nullptr));
 
     return {std::move(world),
             {
@@ -238,7 +253,8 @@ scene simple_light()
                 .lookfrom = {26, 3, 6},
                 .lookat = {0, 2, 0},
                 .vup = {0, 1, 0},
-            }}; // the background is black by default
+            }, // the background is black by default
+            std::move(lights)};
 }
 
 // The Cornell box is a classic scene for testing lighting (Cornell University, 1984):
@@ -274,6 +290,13 @@ std::unique_ptr<hittable> short_block(std::shared_ptr<const material> mat)
     return std::make_unique<translate>(std::move(block), vec3{130, 0, 65});
 }
 
+// The lamp of the Cornell box: 130×105, 1 unit below the ceiling, facing down. Built for world and for the
+// scene's lights (see scene::lights).
+std::unique_ptr<hittable> cornell_lamp(std::shared_ptr<const material> mat)
+{
+    return std::make_unique<quad>(point3{343, 554, 332}, vec3{-130, 0, 0}, vec3{0, 0, -105}, std::move(mat));
+}
+
 constexpr camera_settings cornell_camera{
     .aspect_ratio = 1.0,
     .image_width = 1080,
@@ -290,13 +313,15 @@ scene cornell()
 {
     hittable_list world;
     add_cornell_walls(world);
-    const auto light = std::make_shared<diffuse_light>(color{15, 15, 15});
-    world.add(std::make_unique<quad>(point3{343, 554, 332}, vec3{-130, 0, 0}, vec3{0, 0, -105}, light));
+    world.add(cornell_lamp(std::make_shared<diffuse_light>(color{15, 15, 15})));
 
     const auto white = std::make_shared<lambertian>(color{0.73, 0.73, 0.73});
     world.add(tall_block(white));
     world.add(short_block(white));
-    return {std::move(world), cornell_camera};
+
+    hittable_list lights;
+    lights.add(cornell_lamp(nullptr));
+    return {std::move(world), cornell_camera, std::move(lights)};
 }
 
 // Book 2, chapter 9: the same box, but the blocks are made of smoke, black and white. The lamp is bigger and dimmer.
@@ -304,14 +329,20 @@ scene smoke()
 {
     hittable_list world;
     add_cornell_walls(world);
-    const auto light = std::make_shared<diffuse_light>(color{7, 7, 7});
-    world.add(std::make_unique<quad>(point3{113, 554, 127}, vec3{330, 0, 0}, vec3{0, 0, 305}, light));
+    // The lamp faces down. A lambda builds it for world and for lights (see scene::lights).
+    const auto lamp = [](std::shared_ptr<const material> mat) {
+        return std::make_unique<quad>(point3{113, 554, 127}, vec3{330, 0, 0}, vec3{0, 0, 305}, std::move(mat));
+    };
+    world.add(lamp(std::make_shared<diffuse_light>(color{7, 7, 7})));
 
     // The material of the block's walls doesn't matter: only the shape of the volume is used
     const auto white = std::make_shared<lambertian>(color{0.73, 0.73, 0.73});
     world.add(std::make_unique<constant_medium>(tall_block(white), 0.01, color{0, 0, 0}));
     world.add(std::make_unique<constant_medium>(short_block(white), 0.01, color{1, 1, 1}));
-    return {std::move(world), cornell_camera};
+
+    hittable_list lights;
+    lights.add(lamp(nullptr));
+    return {std::move(world), cornell_camera, std::move(lights)};
 }
 
 // Book 2, chapter 10: the final scene, everything from the second book together.
@@ -336,8 +367,11 @@ scene final_scene()
     }
     world.add(build_bvh(std::move(ground_boxes)));
 
-    const auto light = std::make_shared<diffuse_light>(color{7, 7, 7});
-    world.add(std::make_unique<quad>(point3{123, 554, 147}, vec3{300, 0, 0}, vec3{0, 0, 265}, light));
+    // The lamp faces down. A lambda builds it for world and for lights (see scene::lights).
+    const auto lamp = [](std::shared_ptr<const material> mat) {
+        return std::make_unique<quad>(point3{123, 554, 147}, vec3{300, 0, 0}, vec3{0, 0, 265}, std::move(mat));
+    };
+    world.add(lamp(std::make_shared<diffuse_light>(color{7, 7, 7})));
 
     // A moving sphere: motion blur
     const point3 center1{400, 400, 200};
@@ -375,6 +409,9 @@ scene final_scene()
     world.add(std::make_unique<translate>(std::make_unique<rotate_y>(build_bvh(std::move(cloud)), 15),
                                           vec3{-100, 270, 395}));
 
+    hittable_list lights;
+    lights.add(lamp(nullptr));
+
     return {std::move(world),
             {
                 .aspect_ratio = 1.0,
@@ -385,7 +422,8 @@ scene final_scene()
                 .lookfrom = {478, 278, -600},
                 .lookat = {278, 278, 0},
                 .vup = {0, 1, 0},
-            }};
+            },
+            std::move(lights)};
 }
 
 // All scenes, in the order they appear in the books.

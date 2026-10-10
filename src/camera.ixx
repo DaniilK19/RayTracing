@@ -29,12 +29,14 @@ export struct sky
 export constexpr sky daylight_sky{.bottom = {1.0, 1.0, 1.0}, .top = {0.5, 0.7, 1.0}};
 
 // How the camera chooses the next direction after a diffuse bounce (a matte surface or smoke): with what
-// density p. Each choice gives an unbiased estimate of the same image (book 3, chapter 6), only with more
-// or less noise: the more closely p follows pScatter · (incoming light), the less noise.
+// density p. Any p that is above 0 wherever the material scatters light gives an unbiased estimate of the same
+// image (book 3, chapter 6), only with more or less noise: the more closely p follows pScatter · (incoming
+// light), the less noise. lights breaks that rule and is biased (see ray_color).
 export enum class sampling_strategy
 {
     uniform,  // the same density, 1/(4π), in every direction
     material, // the direction the material drew, with p = pScatter
+    lights,   // toward a random point of a random lamp, with the lamps' density p
 };
 
 // The strategies for the command line: a name, the value and a description for the help. Every strategy must have
@@ -49,7 +51,16 @@ export struct sampling_entry
 export constexpr std::array sampling_list{
     sampling_entry{"uniform", sampling_strategy::uniform, "the same density in all directions (for comparison: noisy)"},
     sampling_entry{"material", sampling_strategy::material, "as the surface scatters: the first two books' behavior"},
+    sampling_entry{"lights", sampling_strategy::lights,
+                   "aims only at the lamps: low-noise direct light, but biased: indirect light is lost"},
 };
+
+// The strategy the camera really renders with. lights needs lamps to aim at: a scene without them, like those lit
+// by the sky, is sampled as the material scatters.
+export inline sampling_strategy effective_sampling(sampling_strategy requested, const hittable_list& lights)
+{
+    return requested == sampling_strategy::lights && lights.empty() ? sampling_strategy::material : requested;
+}
 
 // Camera settings. They are convenient to set with designated initializers (C++20):
 //   camera cam({.aspect_ratio = 16.0 / 9.0, .image_width = 400});
@@ -127,9 +138,10 @@ public:
     }
 
     // Render: for each pixel average the colors of several rays and write the result into the image.
-    // Rows are computed in parallel on all CPU threads.
-    image render(const hittable& world) const
+    // Rows are computed in parallel on all CPU threads. lights are the objects the lights strategy aims at.
+    image render(const hittable& world, const hittable_list& lights) const
     {
+        const sampling_strategy strategy = effective_sampling(sampling_, lights);
         const unsigned thread_count = std::max(1u, std::thread::hardware_concurrency());
         std::println("Rendering {}×{}, rays per pixel: {} ({}×{} strata), threads: {}", image_width_, image_height_,
                      rays_per_pixel(), sqrt_spp_, sqrt_spp_, thread_count);
@@ -158,7 +170,7 @@ public:
                     color pixel_color{0, 0, 0};
                     for (const auto [s_j, s_i] : strata)
                     {
-                        pixel_color += ray_color(get_ray(i, j, s_i, s_j), max_depth_, world);
+                        pixel_color += ray_color(get_ray(i, j, s_i, s_j), max_depth_, world, lights, strategy);
                     }
                     img[i, j] = pixel_samples_scale_ * pixel_color;
                 }
@@ -253,7 +265,8 @@ private:
 
     // The color a ray "brings back". Having hit an object, the ray is reflected or refracted,
     // and we recursively ask what color comes from there. depth is how many more bounces are allowed.
-    color ray_color(const ray& r, int depth, const hittable& world) const
+    color ray_color(const ray& r, int depth, const hittable& world, const hittable_list& lights,
+                    sampling_strategy strategy) const
     {
         if (depth <= 0)
         {
@@ -272,7 +285,7 @@ private:
         // The light from the hit point is the light the surface emits by itself plus the reflected light.
         // The material decides whether the ray is absorbed, follows a mirror or glass, or scatters diffusely;
         // for a diffuse bounce the camera's sampling strategy picks the direction (below).
-        const color emitted = rec->mat->emitted(rec->u, rec->v, rec->p);
+        const color emitted = rec->mat->emitted(*rec);
         const auto scatter = rec->mat->scatter(r, *rec);
         if (!scatter)
         {
@@ -283,7 +296,7 @@ private:
         // if it holds that type, and nullptr otherwise.
         if (const auto* specular = std::get_if<specular_scatter>(&*scatter))
         {
-            return emitted + specular->attenuation * ray_color(specular->scattered, depth - 1, world);
+            return emitted + specular->attenuation * ray_color(specular->scattered, depth - 1, world, lights, strategy);
         }
         const auto& diffuse = std::get<diffuse_scatter>(*scatter);
 
@@ -300,10 +313,11 @@ private:
             }
             // The ratio first: when the direction was drawn with the material's own density, both are the same
             // number, the ratio is exactly 1.0, and the image is bit for bit the same as without the ratio.
-            return diffuse.attenuation * (scattering_pdf / pdf) * ray_color(scattered, depth - 1, world);
+            return diffuse.attenuation * (scattering_pdf / pdf) *
+                   ray_color(scattered, depth - 1, world, lights, strategy);
         };
 
-        switch (sampling_)
+        switch (strategy)
         {
         case sampling_strategy::uniform:
             // Ignore the material's direction and draw one with the same density in every direction of the whole
@@ -315,6 +329,18 @@ private:
             return emitted + sample(ray{rec->p, random_unit_vector(), r.time}, uniform_sphere_density);
         case sampling_strategy::material:
             return emitted + sample(diffuse.scattered, diffuse.pdf);
+        case sampling_strategy::lights:
+        {
+            // Aim at a random point of a random lamp (book 3, chapter 9). Direct light gets much less noisy, but
+            // the estimate is biased: importance sampling is unbiased only if p > 0 wherever the integrand isn't 0,
+            // and p is 0 in every direction that misses the lamps. So only light arriving from the lamps'
+            // directions counts: all of the direct light, plus what an object standing between the point and
+            // a lamp reflects. All other indirect light (from walls, ceiling, blocks) is lost, so shadows and the
+            // Cornell box's ceiling go black, and so is the light of lamps missing from the list. Mixing this
+            // density with the material's (chapter 10) will fix it.
+            const ray scattered{rec->p, lights.random(rec->p), r.time}; // keep the time: motion blur
+            return emitted + sample(scattered, lights.pdf_value(rec->p, scattered.direction));
+        }
         }
         std::unreachable(); // C++23: tells the compiler this point is never reached (every case returns)
     }

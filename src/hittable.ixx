@@ -4,6 +4,7 @@ export module hittable;
 import std;
 import aabb;
 import interval;
+import random;
 import ray;
 import vec3;
 
@@ -73,9 +74,10 @@ public:
         return 0;
     }
 
-    // Light the surface emits by itself at point p with texture coordinates (u, v).
+    // Light the surface emits by itself at the hit point. rec gives the point, its texture coordinates (u, v) and
+    // the side the ray came from (book 3, chapter 9: a lamp may glow on one side only).
     // Most materials don't glow, so for them this is black; light sources override the function.
-    virtual color emitted(double /*u*/, double /*v*/, const point3& /*p*/) const { return color{0, 0, 0}; }
+    virtual color emitted(const hit_record& /*rec*/) const { return color{0, 0, 0}; }
 };
 
 // Interface of everything a ray can hit: spheres, object lists and so on.
@@ -89,6 +91,15 @@ public:
 
     // A box that fully contains the object (for the BVH)
     virtual aabb bounding_box() const = 0;
+
+    // Light sampling (book 3, chapter 9): the camera can aim rays at an object, usually a lamp. random(origin)
+    // draws a direction from origin toward the object, of length 1 (up to rounding), as the camera looks for hits
+    // from t = 0.001, measured in direction lengths. pdf_value(origin, direction) is the density, per steradian,
+    // with which random() draws that direction. The two must describe the same distribution, or the image is
+    // biased. These defaults don't: no density anywhere, but a direction anyway. So only objects that override
+    // both may be lights.
+    virtual double pdf_value(const point3& /*origin*/, const vec3& /*direction*/) const { return 0; }
+    virtual vec3 random(const point3& /*origin*/) const { return vec3{1, 0, 0}; }
 };
 
 // An object list is a hittable too: it looks for the nearest hit among all objects.
@@ -110,6 +121,37 @@ public:
     }
 
     aabb bounding_box() const override { return bbox_; }
+
+    inline bool empty() const { return objects_.empty(); }
+
+    // A list of lamps draws a direction toward a randomly chosen one of them, each with probability 1/n. So the
+    // density of a direction is the average of all the objects' densities: it could have been drawn toward any
+    // of them whose solid angle contains it.
+    // An empty list has nothing to aim at: density 0 everywhere and an arbitrary direction (the book's version
+    // reads objects[0] of an empty vector here, undefined behavior). The camera never asks an empty list.
+    double pdf_value(const point3& origin, const vec3& direction) const override
+    {
+        if (objects_.empty())
+        {
+            return 0;
+        }
+        double sum = 0;
+        for (const auto& object : objects_)
+        {
+            sum += object->pdf_value(origin, direction);
+        }
+        return sum / static_cast<double>(objects_.size());
+    }
+
+    vec3 random(const point3& origin) const override
+    {
+        if (objects_.empty())
+        {
+            return vec3{1, 0, 0};
+        }
+        const int index = random_int(0, static_cast<int>(objects_.size()) - 1);
+        return objects_[static_cast<std::size_t>(index)]->random(origin);
+    }
 
     std::optional<hit_record> hit(const ray& r, interval ray_t) const override
     {

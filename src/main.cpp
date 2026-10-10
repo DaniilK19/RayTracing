@@ -170,11 +170,14 @@ int main(int argc, char* argv[])
     const std::unique_ptr<hittable> world = build_bvh(std::move(s.world));
     const camera cam(s.camera);
 
-    // Every sampling_strategy has an entry in sampling_list (see camera.ixx), so find will find it
-    const auto entry = std::ranges::find(sampling_list, s.camera.sampling, &sampling_entry::strategy);
-    std::println("Scene: {}, sampling: {}", opts->scene, entry->name);
+    // The strategy the camera will really use: lights falls back to material in a scene without lights.
+    // Every sampling_strategy has an entry in sampling_list (see camera.ixx), so find will find it.
+    const sampling_strategy sampling = effective_sampling(s.camera.sampling, s.lights);
+    const auto entry = std::ranges::find(sampling_list, sampling, &sampling_entry::strategy);
+    std::println("Scene: {}, sampling: {}{}", opts->scene, entry->name,
+                 sampling != s.camera.sampling ? " (no lights: the sky is the light)" : "");
     const auto start = std::chrono::steady_clock::now();
-    const image img = cam.render(*world);
+    const image img = cam.render(*world, s.lights);
     const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
     std::println("Render time: {:.1f} s", elapsed.count());
 

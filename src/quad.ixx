@@ -5,6 +5,7 @@ import std;
 import aabb;
 import hittable;
 import interval;
+import random;
 import ray;
 import vec3;
 
@@ -20,12 +21,43 @@ public:
         normal_ = unit_vector(n);
         d_ = dot(normal_, q);
         w_ = n / dot(n, n);
+        area_ = n.length(); // |u × v| is the area of the parallelogram
 
         // Box around all four corners: the union of the boxes of the two diagonals
         bbox_ = enclose(aabb::from_corners(q, q + u + v), aabb::from_corners(q + u, q + v));
     }
 
     aabb bounding_box() const override { return bbox_; }
+
+    // Book 3, section 9.1. random() picks a point uniformly on the quad: its density per unit of area is 1/A.
+    // Seen from origin, a small patch dA at distance r, tilted by the angle θ between its normal and the direction,
+    // covers the solid angle dω = dA·cos θ / r². Both describe the same event, so p(ω)·dω = dA / A, and the
+    // density per steradian is p(ω) = r² / (cos θ · A): high where the quad is far away or seen edge-on.
+    double pdf_value(const point3& origin, const vec3& direction) const override
+    {
+        // Directions that miss the quad have density 0: random() never draws them. The search starts at
+        // t = 0.001, like the camera's.
+        const auto rec = hit(ray{origin, direction}, interval{0.001, infinity});
+        if (!rec)
+        {
+            return 0;
+        }
+        // t counts in lengths of the direction, which may differ from 1
+        const double distance_squared = rec->t * rec->t * direction.length_squared();
+        const double cosine = std::fabs(dot(direction, normal_)) / direction.length();
+        return distance_squared / (cosine * area_);
+    }
+
+    // A uniformly random point of the quad, as a unit direction from origin. The book returns the point minus
+    // origin as it is: hundreds of units long in the Cornell box. The camera looks for hits from t = 0.001, in
+    // lengths of the direction, so a 500-unit direction would skip the first half unit of its way to the lamp,
+    // and anything standing there.
+    vec3 random(const point3& origin) const override
+    {
+        const double a = random_double();
+        const double b = random_double();
+        return unit_vector(q_ + a * u_ + b * v_ - origin);
+    }
 
     std::optional<hit_record> hit(const ray& r, interval ray_t) const override
     {
@@ -75,6 +107,7 @@ private:
     vec3 normal_; // unit normal of the plane
     double d_;    // dot(normal, P) for any point P of the plane
     vec3 w_;      // n / |n|², where n = u × v: needed to find α and β
+    double area_; // |u × v|: the area, for the light-sampling density
     aabb bbox_;
 };
 

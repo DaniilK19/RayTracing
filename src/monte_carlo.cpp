@@ -4,6 +4,8 @@
 // Without arguments all experiments but sphere-plot run in the book's order; or name the ones to run:
 // MonteCarlo pi stratified
 import std;
+import hittable;
+import quad;
 import random;
 import vec3;
 
@@ -786,6 +788,97 @@ void hemisphere()
                  rms_errors[0] / rms_errors[1], std::sqrt(samplers[0].variance / samplers[1].variance));
 }
 
+// --- Sampling lights directly (book 3, chapter 9) --------------------------------------------------------------
+
+// The book warns that a wrong PDF still gives a reasonable-looking image, so here is a test beyond the book: are
+// a lamp's random() and pdf_value() a matching pair, i.e. is p = pdf_value the density of the directions random()
+// draws? With N directions from the point o (Ω is the solid angle the lamp covers, seen from o):
+// (a) a density integrates to 1: the mean of 4π·p(d) over uniform directions d (density 1/(4π)) estimates ∫ p dω;
+// (b) the mean of 1/p(d) over the lamp's own directions estimates ∫ (1/p)·p dω over the lamp, i.e. Ω;
+// (c) random() never draws a direction with p = 0 (its weight 1/p would be infinite: the camera would drop it);
+// (d) what the ray tracer does with them: the mean of h(d)/p(d) over the lamp's directions and the mean of
+//     4π·h(d) over all the uniform directions, with 0 for each d that misses the lamp, both estimate ∫ h dω over
+//     the lamp. (The misses must count: a mean over the hits only would estimate 4π·∫ h dω / Ω.) This is the
+//     stricter test: (b) can pass even when the directions are spread wrongly over the lamp. h is the Lambertian
+//     density around a tilted normal, so ∫ h dω is the fraction of the light a matte surface scatters that
+//     reaches the lamp.
+void check_light_pdf(const hittable& lamp, const point3& o, double solid_angle, int n)
+{
+    const vec3 normal = unit_vector(vec3{1, 2, 3});
+    const auto h = [&normal](const vec3& d) { return cosine_density(normal, d); };
+
+    sample_mean density;   // (a)
+    sample_mean uniform_h; // (d)
+    for (int i = 0; i < n; ++i)
+    {
+        const vec3 d = random_unit_vector();
+        const double p = lamp.pdf_value(o, d);
+        density.add(4 * pi * p);
+        uniform_h.add(p > 0 ? 4 * pi * h(d) : 0.0);
+    }
+
+    sample_mean inverse_density; // (b)
+    sample_mean lamp_h;          // (d)
+    int zero_density = 0;        // (c)
+    for (int i = 0; i < n; ++i)
+    {
+        const vec3 d = lamp.random(o);
+        const double p = lamp.pdf_value(o, d);
+        if (!(p > 0))
+        {
+            ++zero_density;
+            continue;
+        }
+        inverse_density.add(1 / p);
+        lamp_h.add(h(d) / p);
+    }
+
+    print_estimate("(a) ∫ p dω", density.mean(), 1, density.standard_error());
+    print_estimate("(b) Ω", inverse_density.mean(), solid_angle, inverse_density.standard_error());
+    std::println("  (c) directions drawn with p = 0: {} of {}", zero_density, n);
+    const double difference = lamp_h.mean() - uniform_h.mean();
+    const double standard_error = std::hypot(lamp_h.standard_error(), uniform_h.standard_error());
+    std::println("  (d) ∫ h dω {:.12f}  uniform {:.12f}  difference {:+.12f}  SE {:.12f}  difference/SE {:+.2f}",
+                 lamp_h.mean(), uniform_h.mean(), difference, standard_error, difference / standard_error);
+}
+
+// The solid angle of the square [-1, 1] × [-1, 1] in the plane z = 1, seen from o below it. A rectangle
+// [0, x] × [0, y] seen from the height h above its corner (0, 0) covers F(x, y) = atan(xy / (h·√(x² + y² + h²)))
+// steradians. With x and y measured from o, signed, any rectangle is a sum of four such ones with signs:
+// inclusion-exclusion, as for the cells in stratified_standard_error.
+double square_solid_angle(const point3& o)
+{
+    const double h = 1 - o.z;
+    const auto f = [h](double x, double y) { return std::atan(x * y / (h * std::sqrt(x * x + y * y + h * h))); };
+    const double x1 = -1 - o.x;
+    const double x2 = 1 - o.x;
+    const double y1 = -1 - o.y;
+    const double y2 = 1 - o.y;
+    return f(x2, y2) - f(x1, y2) - f(x2, y1) + f(x1, y1);
+}
+
+// Light sampling: section 9.1's density of a quad lamp, checked from two points. Seen from the middle, the square
+// covers 2π/3 steradians, a third of the hemisphere (6 such squares make a cube around o).
+void light_pdfs()
+{
+    seed_random(10);
+    constexpr int n = 4'000'000;
+    std::println("  p = pdf_value(o, d); N = {} uniform directions d and N drawn by the lamp's random(o).\n"
+                 "  (a) the mean of 4π·p over the uniform d; (b) the mean of 1/p over the lamp's d;\n"
+                 "  (d) the mean of h/p over the lamp's d, and of 4π·h over all the uniform d, with 0 where d\n"
+                 "      misses the lamp (\"uniform\"); h(d) = max(0, cos θ)/π, θ the angle between d and (1, 2, 3)",
+                 n);
+    // A lamp needs no material here: only its shape is used, as in a scene's list of lights
+    const quad square{point3{-1, -1, 1}, vec3{2, 0, 0}, vec3{0, 2, 0}, nullptr};
+    for (const point3& o : {point3{0, 0, 0}, point3{0.5, 0.25, -0.5}})
+    {
+        const double solid_angle = square_solid_angle(o);
+        std::println("\n  The square [-1, 1]² at z = 1 seen from ({}, {}, {}): Ω = {:.6f} sr", o.x, o.y, o.z,
+                     solid_angle);
+        check_light_pdf(square, o, solid_angle, n);
+    }
+}
+
 // --- The list of experiments and the command line --------------------------------------------------------------
 
 constexpr std::array experiments{
@@ -807,6 +900,8 @@ constexpr std::array experiments{
                .in_all = false},
     experiment{"cos-cubed", "7.2", "∫ cos³θ dω over the hemisphere: uniform vs cosine-distributed directions",
                hemisphere},
+    experiment{"light-pdfs", "9.1",
+               "beyond the book: does a lamp's pdf_value() describe the directions its random() draws?", light_pdfs},
 };
 
 void print_usage()

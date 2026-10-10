@@ -114,6 +114,10 @@ private:
 // Glowing surface: a light source. It emits light but reflects nothing.
 // Brightness can exceed 1: a lamp shines brighter than a white wall reflects. A small lamp
 // must be very bright to light a room: only a small fraction of the scattered rays reach it.
+// It glows on the front side only, the side its outward normal points to (for a quad, u × v): a ceiling lamp
+// shines down into the room. Glowing on both sides, as in the second book, the Cornell box's lamp also lit the
+// ceiling 1 unit above it very brightly, and the rare paths that found that gap spread its light as fireflies
+// (book 3, section 9.3).
 export class diffuse_light : public material
 {
 public:
@@ -122,7 +126,10 @@ public:
 
     std::optional<scatter_record> scatter(const ray&, const hit_record&) const override { return std::nullopt; }
 
-    color emitted(double u, double v, const point3& p) const override { return tex_->value(u, v, p); }
+    color emitted(const hit_record& rec) const override
+    {
+        return rec.front_face ? tex_->value(rec.u, rec.v, rec.p) : color{0, 0, 0};
+    }
 
 private:
     std::shared_ptr<const texture> tex_;
