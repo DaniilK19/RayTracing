@@ -117,3 +117,20 @@ public:
 private:
     std::shared_ptr<const texture> tex_;
 };
+
+// Material of smoke or fog particles: scatters light equally in all directions (isotropically).
+// A cloud of particles has no surface, so the normal doesn't matter: the new direction is fully random.
+export class isotropic : public material
+{
+public:
+    explicit isotropic(const color& albedo) : isotropic(std::make_shared<solid_color>(albedo)) {}
+    explicit isotropic(std::shared_ptr<const texture> tex) : tex_(std::move(tex)) {}
+
+    std::optional<scatter_result> scatter(const ray& r_in, const hit_record& rec) const override
+    {
+        return scatter_result{tex_->value(rec.u, rec.v, rec.p), ray{rec.p, random_unit_vector(), r_in.time}};
+    }
+
+private:
+    std::shared_ptr<const texture> tex_;
+};

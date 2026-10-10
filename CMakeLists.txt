@@ -48,6 +48,7 @@ target_sources(RayTracing PRIVATE
         src/aabb.ixx
         src/bvh.ixx
         src/camera.ixx
+        src/constant_medium.ixx
         src/hittable.ixx
         src/image.ixx
         src/instance.ixx

@@ -3,6 +3,7 @@ export module scenes;
 
 import std;
 import camera;
+import constant_medium;
 import hittable;
 import image;
 import instance;
@@ -297,6 +298,21 @@ scene cornell()
     return {std::move(world), cornell_camera};
 }
 
+// Book 2, chapter 9: the same box, but the blocks are made of smoke, black and white. The lamp is bigger and dimmer.
+scene smoke()
+{
+    hittable_list world;
+    add_cornell_walls(world);
+    const auto light = std::make_shared<diffuse_light>(color{7, 7, 7});
+    world.add(std::make_unique<quad>(point3{113, 554, 127}, vec3{330, 0, 0}, vec3{0, 0, 305}, light));
+
+    // The material of the block's walls doesn't matter: only the shape of the volume is used
+    const auto white = std::make_shared<lambertian>(color{0.73, 0.73, 0.73});
+    world.add(std::make_unique<constant_medium>(tall_block(white), 0.01, color{0, 0, 0}));
+    world.add(std::make_unique<constant_medium>(short_block(white), 0.01, color{1, 1, 1}));
+    return {std::move(world), cornell_camera};
+}
+
 // All scenes, in the order they appear in the books.
 export constexpr std::array scene_list{
     scene_entry{"weekend", "the first book's cover: spheres of three materials", weekend},
@@ -307,6 +323,7 @@ export constexpr std::array scene_list{
     scene_entry{"quads", "five colored quadrilaterals", quads},
     scene_entry{"light", "marble spheres in the dark and two light sources", simple_light},
     scene_entry{"cornell", "the Cornell box, a classic scene for testing lighting", cornell},
+    scene_entry{"smoke", "the Cornell box with blocks of black and white smoke", smoke},
 };
 
 export constexpr std::string_view default_scene = "weekend";
