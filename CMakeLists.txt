@@ -39,11 +39,12 @@ target_sources(std_module PUBLIC
     BASE_DIRS "${MSVC_MODULES_DIR}"
     FILES "${MSVC_MODULES_DIR}/std.ixx")
 
-# --- Ray tracer --------------------------------------------------------------
-add_executable(RayTracing
-    src/main.cpp
-    src/utf8.manifest)   # UTF-8 as the process code page (see the comment in the file)
-target_sources(RayTracing PRIVATE
+# --- Ray tracer library ------------------------------------------------------
+# Two programs use the ray tracer's modules: RayTracing renders the scenes, and MonteCarlo runs
+# the third book's numerical experiments with the ray tracer's own random numbers. So the modules
+# are compiled once into a static library, and both programs link it.
+add_library(raytracer STATIC)
+target_sources(raytracer PUBLIC  # PUBLIC: programs that link the library can `import` its modules
     FILE_SET CXX_MODULES FILES   # our modules: files with `export module ...`
         src/aabb.ixx
         src/bvh.ixx
@@ -64,9 +65,21 @@ target_sources(RayTracing PRIVATE
         src/vec3.ixx)
 
 # Third-party code lives in external/. SYSTEM keeps the compiler from showing its warnings.
+# PRIVATE: stb is used only inside the library (by the image module), not by the programs.
 #   stb/stb_image_write.h - v1.16, github.com/nothings/stb, commit 2c980bb (PNG writing)
 #   stb/stb_image.h       - v2.30, same source, same commit (JPEG/PNG reading for textures)
-target_include_directories(RayTracing SYSTEM PRIVATE external/stb)
+target_include_directories(raytracer SYSTEM PRIVATE external/stb)
 
-target_link_libraries(RayTracing PRIVATE std_module)
+# PUBLIC: the programs `import std;` too and get the std module along with the library
+target_link_libraries(raytracer PUBLIC std_module)
+target_compile_options(raytracer PRIVATE /W4)
+
+# --- Programs ----------------------------------------------------------------
+# utf8.manifest: UTF-8 as the process code page (see the comment in the file)
+add_executable(RayTracing src/main.cpp src/utf8.manifest)
+target_link_libraries(RayTracing PRIVATE raytracer)
 target_compile_options(RayTracing PRIVATE /W4)
+
+add_executable(MonteCarlo src/monte_carlo.cpp src/utf8.manifest)
+target_link_libraries(MonteCarlo PRIVATE raytracer)
+target_compile_options(MonteCarlo PRIVATE /W4)
