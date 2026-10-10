@@ -19,6 +19,8 @@ export struct hit_record
     vec3 normal;                   // unit-length normal, always facing against the ray
     const material* mat = nullptr; // the object's material (a non-owning pointer: the object owns the material)
     double t = 0;                  // ray parameter: p = r.at(t)
+    double u = 0;                  // texture coordinates of the point on the object's surface
+    double v = 0;
     bool front_face = false;       // the ray came from outside the object (true) or from inside (false)
 
     // outward_normal is a unit-length normal pointing out of the object.

@@ -64,8 +64,17 @@ public:
         hit_record rec;
         rec.t = root;
         rec.p = r.at(rec.t);
-        rec.set_face_normal(r, (rec.p - center) / radius_); // (p - center) / radius is the unit normal
+        const vec3 outward_normal = (rec.p - center) / radius_; // (p - center) / radius is the unit normal
+        rec.set_face_normal(r, outward_normal);
         rec.mat = mat_.get();
+
+        // Texture coordinates work like longitude and latitude on a globe, both from 0 to 1.
+        // The normal is a point on the unit sphere centered at the origin; we find the angles from it:
+        // φ around the Y axis, measured from the -X direction; θ from the south pole (-Y) to the north one (+Y).
+        const double phi = std::atan2(-outward_normal.z, outward_normal.x) + std::numbers::pi;
+        const double theta = std::acos(-outward_normal.y);
+        rec.u = phi / (2 * std::numbers::pi);
+        rec.v = theta / std::numbers::pi;
         return rec;
     }
 

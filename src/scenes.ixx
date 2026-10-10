@@ -7,6 +7,7 @@ import hittable;
 import material;
 import random;
 import sphere;
+import texture;
 import vec3;
 
 // A scene: objects and the camera that shoots them.
@@ -28,13 +29,18 @@ export struct scene_entry
 // The first book's cover: three big spheres and a scatter of small ones with random materials.
 // The main thread's random number generator always starts from the same seed, so the scene
 // is the same on every run.
-// bouncing is the second book's variant: the matte spheres bounce while the shutter is open.
+// bouncing is the second book's variant: the matte spheres bounce while the shutter is open,
+// and the floor became a checkerboard.
 hittable_list random_spheres(bool bouncing)
 {
     hittable_list world;
 
-    const auto ground_material = std::make_shared<lambertian>(color{0.5, 0.5, 0.5});
-    world.add(std::make_unique<sphere>(point3{0, -1000, 0}, 1000, ground_material));
+    std::shared_ptr<texture> ground = std::make_shared<solid_color>(color{0.5, 0.5, 0.5});
+    if (bouncing)
+    {
+        ground = std::make_shared<checker_texture>(0.32, color{0.2, 0.3, 0.1}, color{0.9, 0.9, 0.9});
+    }
+    world.add(std::make_unique<sphere>(point3{0, -1000, 0}, 1000, std::make_shared<lambertian>(std::move(ground))));
 
     for (int a = -11; a < 11; ++a)
     {
@@ -100,10 +106,26 @@ scene bouncing()
     return {random_spheres(true), cover_camera};
 }
 
+// Book 2, chapter 4: two huge spheres with a solid checker texture. The squares on them are slices
+// of the same cubes of space.
+scene checker()
+{
+    hittable_list world;
+    const auto checker = std::make_shared<lambertian>(
+        std::make_shared<checker_texture>(0.32, color{0.2, 0.3, 0.1}, color{0.9, 0.9, 0.9}));
+    world.add(std::make_unique<sphere>(point3{0, -10, 0}, 10, checker));
+    world.add(std::make_unique<sphere>(point3{0, 10, 0}, 10, checker));
+
+    camera_settings camera = cover_camera;
+    camera.defocus_angle = 0; // no defocus: everything is sharp
+    return {std::move(world), camera};
+}
+
 // All scenes, in the order they appear in the books.
 export constexpr std::array scene_list{
     scene_entry{"weekend", "the first book's cover: spheres of three materials", weekend},
     scene_entry{"bouncing", "the same, but the matte spheres bounce: motion blur", bouncing},
+    scene_entry{"checker", "two spheres with a solid checker texture", checker},
 };
 
 export constexpr std::string_view default_scene = "weekend";

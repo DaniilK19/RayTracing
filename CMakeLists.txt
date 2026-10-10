@@ -56,6 +56,7 @@ target_sources(RayTracing PRIVATE
         src/ray.ixx
         src/scenes.ixx
         src/sphere.ixx
+        src/texture.ixx
         src/vec3.ixx)
 
 # Third-party code lives in external/. SYSTEM keeps the compiler from showing its warnings.

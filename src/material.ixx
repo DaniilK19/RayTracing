@@ -5,13 +5,15 @@ import std;
 import hittable;
 import random;
 import ray;
+import texture;
 import vec3;
 
 // Matte (diffuse) surface: scatters light in all directions, more often close to the normal.
 export class lambertian : public material
 {
 public:
-    explicit lambertian(const color& albedo) : albedo_(albedo) {}
+    explicit lambertian(const color& albedo) : lambertian(std::make_shared<solid_color>(albedo)) {}
+    explicit lambertian(std::shared_ptr<const texture> tex) : tex_(std::move(tex)) {}
 
     std::optional<scatter_result> scatter(const ray& r_in, const hit_record& rec) const override
     {
@@ -24,11 +26,13 @@ public:
             direction = rec.normal;
         }
         // The scattered ray exists at the same moment in time as the incoming one
-        return scatter_result{albedo_, ray{rec.p, direction, r_in.time}};
+        return scatter_result{tex_->value(rec.u, rec.v, rec.p), ray{rec.p, direction, r_in.time}};
     }
 
 private:
-    color albedo_; // fraction of light reflected per channel: the surface's "color"
+    // Fraction of light reflected per channel: the surface's "color". A texture lets it vary
+    // from point to point; a single color for the whole surface is solid_color.
+    std::shared_ptr<const texture> tex_;
 };
 
 // Metal: mirror reflection blurred by fuzz (0 is a perfect mirror, 1 is a very matte metal).
