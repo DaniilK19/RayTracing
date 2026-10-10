@@ -6,6 +6,7 @@ import camera;
 import hittable;
 import image;
 import material;
+import quad;
 import random;
 import sphere;
 import texture;
@@ -181,6 +182,35 @@ scene perlin_spheres()
     return {std::move(world), camera};
 }
 
+// Book 2, chapter 6: five colored quadrilaterals around the camera.
+scene quads()
+{
+    hittable_list world;
+    const auto left_red = std::make_shared<lambertian>(color{1.0, 0.2, 0.2});
+    const auto back_green = std::make_shared<lambertian>(color{0.2, 1.0, 0.2});
+    const auto right_blue = std::make_shared<lambertian>(color{0.2, 0.2, 1.0});
+    const auto upper_orange = std::make_shared<lambertian>(color{1.0, 0.5, 0.0});
+    const auto lower_teal = std::make_shared<lambertian>(color{0.2, 0.8, 0.8});
+
+    world.add(std::make_unique<quad>(point3{-3, -2, 5}, vec3{0, 0, -4}, vec3{0, 4, 0}, left_red));
+    world.add(std::make_unique<quad>(point3{-2, -2, 0}, vec3{4, 0, 0}, vec3{0, 4, 0}, back_green));
+    world.add(std::make_unique<quad>(point3{3, -2, 1}, vec3{0, 0, 4}, vec3{0, 4, 0}, right_blue));
+    world.add(std::make_unique<quad>(point3{-2, 3, 1}, vec3{4, 0, 0}, vec3{0, 0, 4}, upper_orange));
+    world.add(std::make_unique<quad>(point3{-2, -3, 5}, vec3{4, 0, 0}, vec3{0, 0, -4}, lower_teal));
+
+    return {std::move(world),
+            {
+                .aspect_ratio = 1.0,
+                .image_width = 1080, // square scenes are as tall as Full HD
+                .samples_per_pixel = 500,
+                .max_depth = 50,
+                .vfov = 80,
+                .lookfrom = {0, 0, 9},
+                .lookat = {0, 0, 0},
+                .vup = {0, 1, 0},
+            }};
+}
+
 // All scenes, in the order they appear in the books.
 export constexpr std::array scene_list{
     scene_entry{"weekend", "the first book's cover: spheres of three materials", weekend},
@@ -188,6 +218,7 @@ export constexpr std::array scene_list{
     scene_entry{"checker", "two spheres with a solid checker texture", checker},
     scene_entry{"earth", "the Earth: an image wrapped around a sphere", earth},
     scene_entry{"perlin", "marble spheres made of Perlin noise", perlin_spheres},
+    scene_entry{"quads", "five colored quadrilaterals", quads},
 };
 
 export constexpr std::string_view default_scene = "weekend";

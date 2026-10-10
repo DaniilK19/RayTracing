@@ -11,8 +11,16 @@ export struct interval
     double max = -infinity;
 
     constexpr double size() const { return max - min; }
-    constexpr bool surrounds(double x) const { return min < x && x < max; } // strictly inside
+    constexpr bool contains(double x) const { return min <= x && x <= max; } // including the ends
+    constexpr bool surrounds(double x) const { return min < x && x < max; }  // strictly inside
     constexpr double clamp(double x) const { return std::clamp(x, min, max); }
+
+    // The interval expanded by delta: half of delta on each side
+    constexpr interval expand(double delta) const
+    {
+        const double padding = delta / 2;
+        return {min - padding, max + padding};
+    }
 };
 
 // The smallest interval containing both given ones

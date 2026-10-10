@@ -15,8 +15,7 @@ export struct aabb
     // Box with opposite corners a and b
     static constexpr aabb from_corners(const point3& a, const point3& b)
     {
-        return {interval{std::min(a.x, b.x), std::max(a.x, b.x)}, interval{std::min(a.y, b.y), std::max(a.y, b.y)},
-                interval{std::min(a.z, b.z), std::max(a.z, b.z)}};
+        return {axis_span(a.x, b.x), axis_span(a.y, b.y), axis_span(a.z, b.z)};
     }
 
     constexpr const interval& axis_interval(int axis) const { return axis == 0 ? x : axis == 1 ? y : z; }
@@ -41,6 +40,16 @@ export struct aabb
     }
 
 private:
+    // The segment between a and b on one axis, no thinner than min_size. For a flat object (e.g.
+    // a quad in the z = 0 plane) the box would otherwise have zero thickness: the t segment inside
+    // such a "slab" degenerates to a point, hit_slab would reject every ray, and the object would vanish from the BVH.
+    static constexpr interval axis_span(double a, double b)
+    {
+        constexpr double min_size = 0.0001;
+        const interval span{std::min(a, b), std::max(a, b)};
+        return span.size() < min_size ? span.expand(min_size) : span;
+    }
+
     // Narrows ray_t to the segment where the ray is between the slab's faces. false means no common part.
     // If the ray is parallel to the faces (direction = 0), the division gives ±∞, and the comparisons below still work.
     static constexpr bool hit_slab(const interval& slab, double origin, double direction, interval& ray_t)
