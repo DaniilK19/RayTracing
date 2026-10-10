@@ -121,3 +121,18 @@ export inline vec3 random_unit_vector()
         }
     }
 }
+
+// Densities of directions (book 3, chapters 4 and 5), used by the materials' scattering_pdf and by the camera.
+// A density of directions is per steradian (unit of solid angle): it integrates to 1 over the whole sphere.
+
+// The density of random_unit_vector(): the same in every direction, 1 / (area of the unit sphere).
+export constexpr double uniform_sphere_density = 1 / (4 * std::numbers::pi);
+
+// The Lambertian density around unit_normal (length 1): cos θ / π above the surface, θ being the angle between
+// the direction and the normal, and 0 below it. The 1 / π normalizes it: ∫ cos θ dω over the hemisphere is π.
+// The direction may have any length.
+export inline double cosine_density(const vec3& unit_normal, const vec3& direction)
+{
+    const double cosine = dot(unit_normal, unit_vector(direction));
+    return cosine > 0 ? cosine / std::numbers::pi : 0.0;
+}

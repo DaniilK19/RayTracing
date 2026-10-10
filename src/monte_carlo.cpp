@@ -595,15 +595,16 @@ struct direction_sampler
     double variance; // of one sample f(d)/p(d), worked out below
 };
 
-// The book's listing 16: random_unit_vector() and p = 1/(4π), the density of the directions it returns. (The ray
-// tracer's isotropic scatters along them as they are; lambertian adds one to the normal, and the sum has another
-// density, cos θ/π, as chapter 5 shows.)
+// The book's listing 16: random_unit_vector() and p = 1/(4π), the density of the directions it returns, named
+// uniform_sphere_density in vec3. (The ray tracer's isotropic scatters along them as they are, with this density;
+// lambertian adds one to the normal, and the sum has another density, cos θ/π, as chapter 5 shows.)
 // By Archimedes' hat-box theorem the zone of the unit sphere between the planes z = a and z = b has the area
 // 2π(b - a), like that of the cylinder around the sphere, so the z of a uniform direction is uniform in [-1, 1].
 // A sample is f/p = 4π·z². E[z²] = 1/3 gives the mean 4π/3 once more, and E[z⁴] = 1/5 the variance
 // (4π)²·(1/5 - 1/9) = 64π²/45: σ ≈ 3.747.
 constexpr direction_sampler uniform_directions{"uniform", random_unit_vector,
-                                               [](const vec3& /*d*/) { return 1 / (4 * pi); }, 64 * pi * pi / 45};
+                                               [](const vec3& /*d*/) { return uniform_sphere_density; },
+                                               64 * pi * pi / 45};
 
 // θ uniform in [0, π) and φ uniform in [0, 2π): a uniform point (θ, φ) of a π × 2π rectangle, turned into a unit
 // vector. The directions are not uniform: the whole edge θ = 0 of the rectangle goes to a single point, the pole.

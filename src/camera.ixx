@@ -28,6 +28,29 @@ export struct sky
 // a flat blue background (0.7, 0.8, 1.0) instead, but the gradient is prettier and keeps the first book's scenes unchanged.
 export constexpr sky daylight_sky{.bottom = {1.0, 1.0, 1.0}, .top = {0.5, 0.7, 1.0}};
 
+// How the camera chooses the next direction after a diffuse bounce (a matte surface or smoke): with what
+// density p. Each choice gives an unbiased estimate of the same image (book 3, chapter 6), only with more
+// or less noise: the more closely p follows pScatter · (incoming light), the less noise.
+export enum class sampling_strategy
+{
+    uniform,  // the same density, 1/(4π), in every direction
+    material, // the direction the material drew, with p = pScatter
+};
+
+// The strategies for the command line: a name, the value and a description for the help. Every strategy must have
+// an entry here: main also looks up the name of the strategy it renders with.
+export struct sampling_entry
+{
+    std::string_view name;
+    sampling_strategy strategy;
+    std::string_view description;
+};
+
+export constexpr std::array sampling_list{
+    sampling_entry{"uniform", sampling_strategy::uniform, "the same density in all directions (for comparison: noisy)"},
+    sampling_entry{"material", sampling_strategy::material, "as the surface scatters: the first two books' behavior"},
+};
+
 // Camera settings. They are convenient to set with designated initializers (C++20):
 //   camera cam({.aspect_ratio = 16.0 / 9.0, .image_width = 400});
 // Fields that aren't mentioned get their default values.
@@ -37,6 +60,9 @@ export struct camera_settings
     int image_width = 100;      // image width in pixels
     int samples_per_pixel = 10; // how many random rays to average per pixel (rounded to a square, see camera)
     int max_depth = 10;         // how many times a ray may bounce before we give up on it
+
+    // How a diffuse bounce chooses the next direction
+    sampling_strategy sampling = sampling_strategy::material;
 
     double vfov = 90;         // vertical field of view in degrees: a smaller angle means a stronger "zoom"
     point3 lookfrom{0, 0, 0}; // where the camera stands
@@ -64,6 +90,7 @@ public:
           pixel_samples_scale_(1.0 / rays_per_pixel()),
           recip_sqrt_spp_(1.0 / sqrt_spp_),
           max_depth_(settings.max_depth),
+          sampling_(settings.sampling),
           defocus_angle_(settings.defocus_angle),
           background_(settings.background)
     {
@@ -171,6 +198,7 @@ private:
     double pixel_samples_scale_; // 1 / sqrt_spp²: the averaging factor
     double recip_sqrt_spp_;      // 1 / sqrt_spp: the side of one grid cell, in pixel widths
     int max_depth_;
+    sampling_strategy sampling_;
     double defocus_angle_;
     sky background_;
     point3 center_;              // camera position
@@ -241,13 +269,53 @@ private:
             return background_.in_direction(r.direction); // the ray went off to infinity and brought back the background color
         }
 
-        // The light from the hit point is the light the surface emits by itself plus the reflected light:
-        // the light that came along the scattered ray, attenuated by the material. The material decides what to do with the ray.
+        // The light from the hit point is the light the surface emits by itself plus the reflected light.
+        // The material decides whether the ray is absorbed, follows a mirror or glass, or scatters diffusely;
+        // for a diffuse bounce the camera's sampling strategy picks the direction (below).
         const color emitted = rec->mat->emitted(rec->u, rec->v, rec->p);
-        if (const auto s = rec->mat->scatter(r, *rec))
+        const auto scatter = rec->mat->scatter(r, *rec);
+        if (!scatter)
         {
-            return emitted + s->attenuation * ray_color(s->scattered, depth - 1, world);
+            return emitted; // the ray was absorbed or hit a light source that reflects nothing
         }
-        return emitted; // the ray was absorbed or hit a light source that reflects nothing
+
+        // A mirror or glass: follow the ray it chose. std::get_if (C++17) gives a pointer to the variant's value
+        // if it holds that type, and nullptr otherwise.
+        if (const auto* specular = std::get_if<specular_scatter>(&*scatter))
+        {
+            return emitted + specular->attenuation * ray_color(specular->scattered, depth - 1, world);
+        }
+        const auto& diffuse = std::get<diffuse_scatter>(*scatter);
+
+        // The light a diffuse bounce reflects is the integral over all directions ω of attenuation · pScatter(ω) ·
+        // (light coming from ω). One Monte Carlo sample of it: a direction drawn with some density p, integrand / p.
+        const auto sample = [&](const ray& scattered, double pdf) -> color {
+            const double scattering_pdf = rec->mat->scattering_pdf(r, *rec, scattered);
+
+            // A direction the material doesn't scatter into (below the surface) brings nothing: it isn't traced.
+            // Written as !(x > 0), the test also catches NaN, for which every comparison is false.
+            if (!(pdf > 0) || !(scattering_pdf > 0))
+            {
+                return color{0, 0, 0};
+            }
+            // The ratio first: when the direction was drawn with the material's own density, both are the same
+            // number, the ratio is exactly 1.0, and the image is bit for bit the same as without the ratio.
+            return diffuse.attenuation * (scattering_pdf / pdf) * ray_color(scattered, depth - 1, world);
+        };
+
+        switch (sampling_)
+        {
+        case sampling_strategy::uniform:
+            // Ignore the material's direction and draw one with the same density in every direction of the whole
+            // sphere (smoke scatters into all of it; for a surface the half below it brings nothing). Unbiased,
+            // because we divide by the density the direction was really drawn with. The book (section 6.2)
+            // divides the material's directions, drawn with cos θ / π, by 1/(2π) instead: each bounce then gets
+            // the weight 2 cos θ, on average 4/3, and a white wall (albedo 0.73) acts like one of albedo 0.97:
+            // not a noisier image, but a wrong, too bright one.
+            return emitted + sample(ray{rec->p, random_unit_vector(), r.time}, uniform_sphere_density);
+        case sampling_strategy::material:
+            return emitted + sample(diffuse.scattered, diffuse.pdf);
+        }
+        std::unreachable(); // C++23: tells the compiler this point is never reached (every case returns)
     }
 };

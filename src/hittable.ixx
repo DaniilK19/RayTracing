@@ -32,12 +32,27 @@ export struct hit_record
     }
 };
 
-// What happened to the ray after the hit: where it went next and how much it was attenuated.
-export struct scatter_result
+// A matte surface or a smoke particle scatters light into a whole range of directions, with a density given by
+// the material's scattering_pdf. The material draws one of them at random, but the camera may draw its own instead.
+export struct diffuse_scatter
 {
     color attenuation; // fraction of light kept in each channel (R, G, B)
-    ray scattered;     // the new ray
+    ray scattered;     // the new ray, in the direction the material drew
+    double pdf;        // the density (per steradian) that direction was drawn with
 };
+
+// A mirror (blurred or not) or glass: the camera simply follows the ray the material chose, as in the first two
+// books. The weight pScatter / p is implicitly 1, as the direction comes from the material's own distribution
+// (most renderers make mirrors such a special case).
+export struct specular_scatter
+{
+    color attenuation;
+    ray scattered;
+};
+
+// What happened to the ray after the hit: one of the two kinds of scattering, which the camera treats differently
+// (book 3, chapter 6). std::variant (C++17) holds a value of exactly one of the listed types.
+export using scatter_record = std::variant<diffuse_scatter, specular_scatter>;
 
 // A material decides what happens to a ray at the hit point: reflection, refraction or absorption.
 // A surface can also glow by itself.
@@ -47,7 +62,16 @@ public:
     virtual ~material() = default;
 
     // Ray r_in hit point rec. std::nullopt means the ray was absorbed.
-    virtual std::optional<scatter_result> scatter(const ray& r_in, const hit_record& rec) const = 0;
+    virtual std::optional<scatter_record> scatter(const ray& r_in, const hit_record& rec) const = 0;
+
+    // pScatter in the book (chapter 5): the density, per steradian, with which the material scatters the light
+    // of r_in into the direction of `scattered`. It lets the camera weigh a direction drawn with any other
+    // density. 0 by default: mirrors and glass don't use it, their scatter() returns a specular_scatter
+    // (a perfect mirror has no density at all: it would be infinite in one direction and 0 everywhere else).
+    virtual double scattering_pdf(const ray& /*r_in*/, const hit_record& /*rec*/, const ray& /*scattered*/) const
+    {
+        return 0;
+    }
 
     // Light the surface emits by itself at point p with texture coordinates (u, v).
     // Most materials don't glow, so for them this is black; light sources override the function.

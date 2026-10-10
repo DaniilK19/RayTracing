@@ -15,7 +15,11 @@ public:
     explicit lambertian(const color& albedo) : lambertian(std::make_shared<solid_color>(albedo)) {}
     explicit lambertian(std::shared_ptr<const texture> tex) : tex_(std::move(tex)) {}
 
-    std::optional<scatter_result> scatter(const ray& r_in, const hit_record& rec) const override
+    // normal + random_unit_vector() is a uniformly random point of the unit sphere that touches the surface at p:
+    // its directions already have the Lambertian density. Seen from p, a patch dA of that sphere is 2 cos θ away and
+    // tilted by θ, so it covers the solid angle dω = dA · cos θ / (2 cos θ)² = dA / (4 cos θ): the points have
+    // the density 1/(4π) per unit of area, so the directions have 4 cos θ / (4π) = cos θ / π per steradian.
+    std::optional<scatter_record> scatter(const ray& r_in, const hit_record& rec) const override
     {
         vec3 direction = rec.normal + random_unit_vector();
 
@@ -25,8 +29,15 @@ public:
         {
             direction = rec.normal;
         }
-        // The scattered ray exists at the same moment in time as the incoming one
-        return scatter_result{tex_->value(rec.u, rec.v, rec.p), ray{rec.p, direction, r_in.time}};
+        // The scattered ray exists at the same moment in time as the incoming one. Its density is scattering_pdf
+        // itself: the same function on the same values, so the camera's pScatter is the same number to the last bit.
+        const ray scattered{rec.p, direction, r_in.time};
+        return diffuse_scatter{tex_->value(rec.u, rec.v, rec.p), scattered, scattering_pdf(r_in, rec, scattered)};
+    }
+
+    double scattering_pdf(const ray& /*r_in*/, const hit_record& rec, const ray& scattered) const override
+    {
+        return cosine_density(rec.normal, scattered.direction);
     }
 
 private:
@@ -41,7 +52,7 @@ export class metal : public material
 public:
     metal(const color& albedo, double fuzz) : albedo_(albedo), fuzz_(std::min(fuzz, 1.0)) {}
 
-    std::optional<scatter_result> scatter(const ray& r_in, const hit_record& rec) const override
+    std::optional<scatter_record> scatter(const ray& r_in, const hit_record& rec) const override
     {
         // Blur: move the tip of the reflected unit vector to a random point on a sphere of radius fuzz
         const vec3 reflected = unit_vector(reflect(r_in.direction, rec.normal)) + fuzz_ * random_unit_vector();
@@ -51,7 +62,7 @@ public:
         {
             return std::nullopt;
         }
-        return scatter_result{albedo_, ray{rec.p, reflected, r_in.time}};
+        return specular_scatter{albedo_, ray{rec.p, reflected, r_in.time}};
     }
 
 private:
@@ -67,7 +78,7 @@ public:
     // glass in air ≈ 1.5, and an air bubble inside glass is 1 / 1.5.
     explicit dielectric(double refraction_index) : refraction_index_(refraction_index) {}
 
-    std::optional<scatter_result> scatter(const ray& r_in, const hit_record& rec) const override
+    std::optional<scatter_record> scatter(const ray& r_in, const hit_record& rec) const override
     {
         // Entering the glass, the ray goes from medium 1 to medium n, ratio 1/n; leaving, the other way round: n
         const double ri = rec.front_face ? (1.0 / refraction_index_) : refraction_index_;
@@ -86,7 +97,7 @@ public:
                                    ? reflect(unit_direction, rec.normal)
                                    : refract(unit_direction, rec.normal, ri);
 
-        return scatter_result{color{1.0, 1.0, 1.0}, ray{rec.p, direction, r_in.time}};
+        return specular_scatter{color{1.0, 1.0, 1.0}, ray{rec.p, direction, r_in.time}};
     }
 
 private:
@@ -110,7 +121,7 @@ public:
     explicit diffuse_light(const color& emit) : diffuse_light(std::make_shared<solid_color>(emit)) {}
     explicit diffuse_light(std::shared_ptr<const texture> tex) : tex_(std::move(tex)) {}
 
-    std::optional<scatter_result> scatter(const ray&, const hit_record&) const override { return std::nullopt; }
+    std::optional<scatter_record> scatter(const ray&, const hit_record&) const override { return std::nullopt; }
 
     color emitted(double u, double v, const point3& p) const override { return tex_->value(u, v, p); }
 
@@ -126,9 +137,16 @@ public:
     explicit isotropic(const color& albedo) : isotropic(std::make_shared<solid_color>(albedo)) {}
     explicit isotropic(std::shared_ptr<const texture> tex) : tex_(std::move(tex)) {}
 
-    std::optional<scatter_result> scatter(const ray& r_in, const hit_record& rec) const override
+    std::optional<scatter_record> scatter(const ray& r_in, const hit_record& rec) const override
     {
-        return scatter_result{tex_->value(rec.u, rec.v, rec.p), ray{rec.p, random_unit_vector(), r_in.time}};
+        const ray scattered{rec.p, random_unit_vector(), r_in.time};
+        return diffuse_scatter{tex_->value(rec.u, rec.v, rec.p), scattered, uniform_sphere_density};
+    }
+
+    // In smoke the phase function (the volume's pScatter) is the same in every direction
+    double scattering_pdf(const ray& /*r_in*/, const hit_record& /*rec*/, const ray& /*scattered*/) const override
+    {
+        return uniform_sphere_density;
     }
 
 private:

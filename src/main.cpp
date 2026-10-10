@@ -12,6 +12,7 @@ struct options
     std::string_view scene = default_scene;
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
+    std::optional<sampling_strategy> sampling;
     std::optional<std::filesystem::path> output; // defaults to <scene name>.png
     bool help = false;
 };
@@ -26,14 +27,24 @@ void print_usage()
     std::println(R"(  Default: {}.
 
 Options:
-  -w, --width N      image width in pixels; the height follows the scene's aspect ratio
-                     (each scene has its own default)
-  -s, --samples N    rays per pixel: fewer is faster but noisier
-                     (each scene has its own default); rounded to the nearest square k²,
-                     because the rays form a k×k grid in the pixel
-  -o, --output FILE  where to save the PNG (default <scene>.png)
-  -h, --help         show this help)",
+  -w, --width N        image width in pixels; the height follows the scene's aspect ratio
+                       (each scene has its own default)
+  -s, --samples N      rays per pixel: fewer is faster but noisier
+                       (each scene has its own default); rounded to the nearest square k²,
+                       because the rays form a k×k grid in the pixel
+  -p, --sampling NAME  how a diffuse bounce chooses the next direction ("p" as in pdf,
+                       probability density function): one of the strategies below
+  -o, --output FILE    where to save the PNG (default <scene>.png)
+  -h, --help           show this help
+
+Sampling (-p):)",
                  default_scene);
+    for (const sampling_entry& entry : sampling_list)
+    {
+        // camera_settings{} holds the camera's defaults
+        const bool is_default = entry.strategy == camera_settings{}.sampling;
+        std::println("  {:10} {}{}", entry.name, entry.description, is_default ? " (default)" : "");
+    }
 }
 
 // An integer greater than zero. std::from_chars (C++17) is strict and fast parsing: no exceptions
@@ -74,8 +85,9 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
 
         const bool is_width = arg == "-w" || arg == "--width";
         const bool is_samples = arg == "-s" || arg == "--samples";
+        const bool is_sampling = arg == "-p" || arg == "--sampling";
         const bool is_output = arg == "-o" || arg == "--output";
-        if (!is_width && !is_samples && !is_output)
+        if (!is_width && !is_samples && !is_sampling && !is_output)
         {
             return std::unexpected(std::format("unknown option '{}'", arg));
         }
@@ -88,6 +100,16 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         if (is_output)
         {
             opts.output = value;
+            continue;
+        }
+        if (is_sampling)
+        {
+            const auto it = std::ranges::find(sampling_list, value, &sampling_entry::name);
+            if (it == sampling_list.end())
+            {
+                return std::unexpected(std::format("unknown sampling strategy '{}'", value));
+            }
+            opts.sampling = it->strategy;
             continue;
         }
         const std::optional<int> number = parse_positive_int(value);
@@ -141,13 +163,16 @@ int main(int argc, char* argv[])
     scene s = find_scene(opts->scene)->build();
     s.camera.image_width = opts->image_width.value_or(s.camera.image_width);
     s.camera.samples_per_pixel = opts->samples_per_pixel.value_or(s.camera.samples_per_pixel);
+    s.camera.sampling = opts->sampling.value_or(s.camera.sampling);
     const std::filesystem::path output = opts->output.value_or(std::format("{}.png", opts->scene));
 
     // Put the scene's objects into a BVH: each ray is then tested against a few objects, not all of them
     const std::unique_ptr<hittable> world = build_bvh(std::move(s.world));
     const camera cam(s.camera);
 
-    std::println("Scene: {}", opts->scene);
+    // Every sampling_strategy has an entry in sampling_list (see camera.ixx), so find will find it
+    const auto entry = std::ranges::find(sampling_list, s.camera.sampling, &sampling_entry::strategy);
+    std::println("Scene: {}, sampling: {}", opts->scene, entry->name);
     const auto start = std::chrono::steady_clock::now();
     const image img = cam.render(*world);
     const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
