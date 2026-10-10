@@ -2,6 +2,7 @@
 export module scenes;
 
 import std;
+import bvh;
 import camera;
 import constant_medium;
 import hittable;
@@ -231,7 +232,7 @@ scene simple_light()
             {
                 .aspect_ratio = 16.0 / 9.0,
                 .image_width = 1920,
-                .samples_per_pixel = 500,
+                .samples_per_pixel = 1000, // darkness with small lamps means more noise
                 .max_depth = 50,
                 .vfov = 20,
                 .lookfrom = {26, 3, 6},
@@ -313,6 +314,80 @@ scene smoke()
     return {std::move(world), cornell_camera};
 }
 
+// Book 2, chapter 10: the final scene, everything from the second book together.
+scene final_scene()
+{
+    hittable_list world;
+
+    // The floor is a field of 20×20 boxes of random height. They have their own BVH, which becomes a single
+    // object of the overall tree built by main.
+    hittable_list ground_boxes;
+    const auto ground = std::make_shared<lambertian>(color{0.48, 0.83, 0.53});
+    constexpr int boxes_per_side = 20;
+    for (int i = 0; i < boxes_per_side; ++i)
+    {
+        for (int j = 0; j < boxes_per_side; ++j)
+        {
+            constexpr double w = 100.0;
+            const point3 corner0{-1000.0 + i * w, 0.0, -1000.0 + j * w};
+            const point3 corner1{corner0.x + w, random_double(1, 101), corner0.z + w};
+            ground_boxes.add(box(corner0, corner1, ground));
+        }
+    }
+    world.add(build_bvh(std::move(ground_boxes)));
+
+    const auto light = std::make_shared<diffuse_light>(color{7, 7, 7});
+    world.add(std::make_unique<quad>(point3{123, 554, 147}, vec3{300, 0, 0}, vec3{0, 0, 265}, light));
+
+    // A moving sphere: motion blur
+    const point3 center1{400, 400, 200};
+    const point3 center2 = center1 + vec3{30, 0, 0};
+    world.add(std::make_unique<sphere>(center1, center2, 50, std::make_shared<lambertian>(color{0.7, 0.3, 0.1})));
+
+    // Glass and matte-metal spheres
+    world.add(std::make_unique<sphere>(point3{260, 150, 45}, 50, std::make_shared<dielectric>(1.5)));
+    world.add(std::make_unique<sphere>(point3{0, 150, 145}, 50, std::make_shared<metal>(color{0.8, 0.8, 0.9}, 1.0)));
+
+    // A glass sphere filled with blue fog: the glass and the fog are two objects of the same shape.
+    // In the book it is one and the same shared_ptr; here each object has a single owner, hence two spheres.
+    const auto glass = std::make_shared<dielectric>(1.5);
+    world.add(std::make_unique<sphere>(point3{360, 150, 145}, 70, glass));
+    world.add(std::make_unique<constant_medium>(std::make_unique<sphere>(point3{360, 150, 145}, 70, glass), 0.2,
+                                                color{0.2, 0.4, 0.9}));
+
+    // A light haze over the whole scene: a huge sphere of very thin fog with the camera inside it
+    world.add(std::make_unique<constant_medium>(std::make_unique<sphere>(point3{0, 0, 0}, 5000, glass), 0.0001,
+                                                color{1, 1, 1}));
+
+    // The Earth and a marble sphere
+    world.add(std::make_unique<sphere>(point3{400, 200, 400}, 100,
+                                       std::make_shared<lambertian>(load_texture("earthmap.jpg"))));
+    world.add(std::make_unique<sphere>(point3{220, 280, 300}, 80,
+                                       std::make_shared<lambertian>(std::make_shared<noise_texture>(0.2))));
+
+    // A cloud of 1000 white balls in a 165×165×165 cube, also with its own BVH, rotated and translated
+    hittable_list cloud;
+    const auto white = std::make_shared<lambertian>(color{0.73, 0.73, 0.73});
+    for (int i = 0; i < 1000; ++i)
+    {
+        cloud.add(std::make_unique<sphere>(vec3::random(0, 165), 10, white));
+    }
+    world.add(std::make_unique<translate>(std::make_unique<rotate_y>(build_bvh(std::move(cloud)), 15),
+                                          vec3{-100, 270, 395}));
+
+    return {std::move(world),
+            {
+                .aspect_ratio = 1.0,
+                .image_width = 1080,
+                .samples_per_pixel = 1000, // ~5 minutes on all cores; the book uses 10,000 at 800×800
+                .max_depth = 40,
+                .vfov = 40,
+                .lookfrom = {478, 278, -600},
+                .lookat = {278, 278, 0},
+                .vup = {0, 1, 0},
+            }};
+}
+
 // All scenes, in the order they appear in the books.
 export constexpr std::array scene_list{
     scene_entry{"weekend", "the first book's cover: spheres of three materials", weekend},
@@ -324,9 +399,10 @@ export constexpr std::array scene_list{
     scene_entry{"light", "marble spheres in the dark and two light sources", simple_light},
     scene_entry{"cornell", "the Cornell box, a classic scene for testing lighting", cornell},
     scene_entry{"smoke", "the Cornell box with blocks of black and white smoke", smoke},
+    scene_entry{"final", "the second book's final scene: everything together", final_scene},
 };
 
-export constexpr std::string_view default_scene = "weekend";
+export constexpr std::string_view default_scene = "final";
 
 // The scene with the given name, or nullptr if there is none. The projection &scene_entry::name (C++20):
 // std::ranges::find compares name not with the elements themselves but with their name field.
