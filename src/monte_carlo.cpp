@@ -21,11 +21,17 @@ struct experiment
 // (σ: the standard deviation of one sample), and by the central limit theorem such an average is nearly normally
 // distributed, so about 68% of runs land within 1 SE of the exact value and 99.7% within 3 SE. |error/SE| < 3 is
 // our test that an estimator is correct; a larger ratio points to a bug.
+// An estimator can also have SE = 0 (no random error at all, section 3.7); then there is no ratio to print.
 void print_estimate(std::string_view label, double estimate, double exact, double standard_error)
 {
     const double error = estimate - exact;
-    std::println("  {:10} {:.12f}  exact {:.12f}  error {:+.12f}  SE {:.12f}  error/SE {:+.2f}", label, estimate,
-                 exact, error, standard_error, error / standard_error);
+    std::print("  {:10} {:.12f}  exact {:.12f}  error {:+.12f}  SE {:.12f}", label, estimate, exact, error,
+               standard_error);
+    if (standard_error > 0)
+    {
+        std::print("  error/SE {:+.2f}", error / standard_error);
+    }
+    std::println("");
 }
 
 // --- Estimating π (book 3, chapter 2) --------------------------------------------------------------------------
@@ -258,6 +264,305 @@ void stratified()
                    stratified_standard_error(sqrt_n).standard_error);
 }
 
+// --- One-dimensional Monte Carlo integration (book 3, chapter 3) -----------------------------------------------
+
+// The mean of random samples y, with its standard error. For π a sample was 4 or 0, so σ followed from p = π/4.
+// Usually σ is unknown: σ² = E[y²] - E[y]², and E[y²] is another integral, as hard as the one we estimate. But the
+// same samples estimate it too, as the mean of their squares. (Two remarks for the curious. The subtraction loses
+// digits when σ is tiny next to the mean; Welford's algorithm avoids that, but the σ we estimate here are about as
+// large as the means. And this σ² comes out (N - 1)/N times too small on average, which dividing by N - 1 instead
+// of N would fix; at the N = 10⁴ and 10⁶ where we use it, that is negligible.)
+class sample_mean
+{
+public:
+    void add(double y)
+    {
+        ++count_;
+        sum_ += y;
+        sum_of_squares_ += y * y;
+    }
+
+    int count() const { return count_; }
+    double mean() const { return sum_ / count_; }
+    double mean_of_squares() const { return sum_of_squares_ / count_; }
+
+    // Rounding can push the difference a hair below 0 when all samples are (nearly) equal: σ is 0 then
+    double standard_deviation() const { return std::sqrt(std::max(mean_of_squares() - mean() * mean(), 0.0)); }
+    double standard_error() const { return standard_deviation() / std::sqrt(count_); }
+
+private:
+    int count_ = 0;
+    double sum_ = 0;
+    double sum_of_squares_ = 0;
+};
+
+// Section 3.1: the average of f over [a, b] is ∫ f(x) dx / (b - a). So the integral is (b - a) × the average of f,
+// and the average can be estimated from random points: one sample is y = (b - a)·f(x) with x uniform in [a, b].
+sample_mean integrate_uniformly(double (*f)(double), double a, double b, int n)
+{
+    sample_mean samples;
+    while (samples.count() < n)
+    {
+        const double x = random_double(a, b);
+        // random_double() can return exactly 0 (very rarely), and at x = 0 ln(sin x) is -∞. Such a point is drawn
+        // again: leaving out a single point of [a, b] doesn't change the probability of any interval.
+        if (x == a)
+        {
+            continue;
+        }
+        samples.add((b - a) * f(x));
+    }
+    return samples;
+}
+
+constexpr double x_squared_integral = 8.0 / 3; // ∫ x² dx over [0, 2] = 2³/3
+
+// sin⁵x has an antiderivative, but it takes a trick: sin⁵x = (1 - cos²x)²·sin x, and with u = cos x
+// (du = -sin x dx): ∫ sin⁵x dx = -∫ (1 - 2u² + u⁴) du = -cos x + (2/3)·cos³x - (1/5)·cos⁵x.
+double sin5_antiderivative(double x)
+{
+    const double c = std::cos(x);
+    const double c3 = c * c * c;
+    return -c + 2.0 / 3 * c3 - 1.0 / 5 * c3 * c * c;
+}
+
+// ln(sin x) has no antiderivative made of elementary functions. Its integral over [0, 2] is -2·ln 2 - Cl₂(4)/2
+// (Cl₂ is the Clausen function); the value was computed by numerical quadrature in two ways, which agree to 15 digits.
+constexpr double ln_sin_integral = -1.102222388904956;
+
+// Book 3, section 3.2 (listings 8 to 10): three integrals over [0, 2], from N = 10⁶ uniform samples each. Monte Carlo
+// treats them all the same, whether the exact answer is easy (x²), takes some work (sin⁵x) or has no formula in
+// elementary functions at all (ln(sin x)).
+void integrate()
+{
+    seed_random(4);
+    constexpr int n = 1'000'000;
+    struct integral
+    {
+        std::string_view label;
+        double (*f)(double);
+        double exact;
+    };
+    // A lambda that captures nothing converts to a plain function pointer
+    const std::array integrals{
+        integral{"x²", [](double x) { return x * x; }, x_squared_integral},
+        integral{"sin⁵ x", [](double x) { return std::pow(std::sin(x), 5); },
+                 sin5_antiderivative(2) - sin5_antiderivative(0)},
+        integral{"ln(sin x)", [](double x) { return std::log(std::sin(x)); }, ln_sin_integral},
+    };
+    std::println("  N = {} uniform samples in [0, 2] each; the σ for the SE is estimated from the same samples", n);
+    for (const auto& [label, f, exact] : integrals)
+    {
+        const sample_mean samples = integrate_uniformly(f, 0, 2, n);
+        print_estimate(label, samples.mean(), exact, samples.standard_error());
+    }
+}
+
+// The function of the book's estimate_halfway.cc (section 3.5): p(x) = e^(-x/2π)·sin²x on [0, 2π], a damped wave.
+double damped_sin2(double x)
+{
+    const double sin_x = std::sin(x);
+    return std::exp(-x / (2 * std::numbers::pi)) * sin_x * sin_x;
+}
+
+// Its exact integral from 0 to x, to check the estimates. With a = 1/(2π) and sin²t = (1 - cos 2t)/2:
+// ∫₀ˣ e^(-at) dt = (1 - e^(-ax))/a and ∫₀ˣ e^(-at)·cos 2t dt = (e^(-ax)·(2 sin 2x - a cos 2x) + a)/(a² + 4)
+// (to check, differentiate e^(-at)·(2 sin 2t - a cos 2t): that gives (a² + 4)·e^(-at)·cos 2t).
+double damped_sin2_integral(double x)
+{
+    constexpr double a = 1 / (2 * std::numbers::pi);
+    const double e = std::exp(-a * x);
+    return (1 - e) / (2 * a) - (e * (2 * std::sin(2 * x) - a * std::cos(2 * x)) + a) / (2 * (a * a + 4));
+}
+
+// The exact halfway point: where the integral from 0 reaches half of the area. The integral grows with x (p ≥ 0), so
+// bisection finds that point: halve the interval again and again, keeping the half where the integral crosses
+// area/2. 60 halvings shrink [0, 2π] to 2π/2⁶⁰ ≈ 5·10⁻¹⁸, below the spacing of doubles near 2.
+double exact_halfway_point(double area)
+{
+    double low = 0;
+    double high = 2 * std::numbers::pi;
+    for (int i = 0; i < 60; ++i)
+    {
+        const double middle = (low + high) / 2;
+        if (damped_sin2_integral(middle) < area / 2)
+        {
+            low = middle;
+        }
+        else
+        {
+            high = middle;
+        }
+    }
+    return low;
+}
+
+// Book 3, section 3.5 (listing 12): the point that splits the area under p(x) in half, found without integrating:
+// sort the samples by x and add up their p(x) from the left until the running sum reaches half of the total; the x
+// of that sample is the estimate. The book printed 2.016002314977, about 1 SE below the exact 2.038432: one run
+// with other random numbers.
+void halfway()
+{
+    seed_random(5);
+    constexpr int n = 10'000;
+    constexpr double length = 2 * std::numbers::pi; // of the interval [0, 2π]
+    struct sample
+    {
+        double x;
+        double p_x;
+    };
+    std::vector<sample> samples;
+    samples.reserve(n);
+    sample_mean p_values;
+    for (int i = 0; i < n; ++i)
+    {
+        const double x = random_double(0, length);
+        const double p_x = damped_sin2(x);
+        samples.push_back({x, p_x});
+        p_values.add(p_x);
+    }
+
+    // std::ranges::sort (C++20) takes a projection: &sample::x makes it compare the samples by their x.
+    // {} stands for the default comparison, std::ranges::less.
+    std::ranges::sort(samples, {}, &sample::x);
+    const double half_of_total = p_values.mean() * n / 2;
+    double running_sum = 0;
+    double halfway_point = 0;
+    for (const auto& [x, p_x] : samples)
+    {
+        running_sum += p_x;
+        if (running_sum >= half_of_total)
+        {
+            halfway_point = x;
+            break;
+        }
+    }
+
+    // The average of p estimates ∫ p dx / 2π, and the area is 2π × the average (section 3.1)
+    const double exact_area = damped_sin2_integral(length);
+    std::println("  N = {} samples in [0, 2π]", n);
+    print_estimate("average", p_values.mean(), exact_area / length, p_values.standard_error());
+    print_estimate("area", length * p_values.mean(), exact_area, length * p_values.standard_error());
+
+    // The standard error of the halfway point (beyond the book). Let D(t) be the sum of p(xᵢ) over the samples with
+    // xᵢ ≤ t, minus half of the total; the estimate is where D crosses 0. At the exact point h each sample adds
+    // +p(xᵢ)/2 to D (if xᵢ ≤ h) or -p(xᵢ)/2 (if not), on average 0, because half of the area lies left of h. So D(h)
+    // is 0 give or take ½·√(N·E[p²]). Moving t past h changes D by about N·p(h)/2π per unit of t (N/2π samples per
+    // unit, each adding about p(h)), so the crossing is off by about ½·√(N·E[p²]) / (N·p(h)/2π):
+    // SE = 2π·√E[p²] / (2·√N·p(h)), with E[p²] estimated from the samples and p(h) taken at the estimate.
+    const double halfway_standard_error =
+        length * std::sqrt(p_values.mean_of_squares()) / (2 * std::sqrt(n) * damped_sin2(halfway_point));
+    print_estimate("halfway", halfway_point, exact_halfway_point(exact_area), halfway_standard_error);
+}
+
+// A PDF on [0, 2] for importance sampling: its density p(x), and the inverse of its cumulative distribution function
+// P(x) = ∫₀ˣ p (section 3.6). For d uniform in [0, 1), x = ICD(d) has the density p.
+struct pdf_on_0_2
+{
+    std::string_view name;
+    std::string_view formula; // of p(x), for the table
+    double (*density)(double x);
+    double (*icd)(double d);
+    double variance; // of one sample f(x)/p(x) for f = x²: E[(f/p)²] - I², where E[(f/p)²] = ∫ f²/p dx over [0, 2]
+};
+
+// I² = (8/3)² = 64/9. The quadratic PDF's E[(f/p)²] is 64/9 too, and written the same way, so its variance is
+// exactly 0 (not a rounding error like 10⁻¹⁶, whose square root would be a σ of 10⁻⁸)
+constexpr double i_squared = 64.0 / 9;
+constexpr double sqrt2 = std::numbers::sqrt2; // a short name for √2, for the table below
+
+constexpr std::array importance_pdfs{
+    // Uniform (listing 13): p = 1/2, P(x) = x/2, ICD(d) = 2d. E[(f/p)²] = ∫ x⁴/(1/2) dx = 2·2⁵/5 = 64/5
+    pdf_on_0_2{"uniform", "1/2", [](double /*x*/) { return 0.5; }, [](double d) { return 2 * d; },
+               64.0 / 5 - i_squared},
+    // Two halves (listing 11), section 3.5's crude approximation of x/2: √2 splits x/2 into two halves of
+    // probability 1/2, and each half gets uniform samples, so p = (1/2)/√2 below √2 and (1/2)/(2 - √2) above it.
+    // The book's f(d) uses d only to choose the half and draws a second random number for x inside it. Rescaling d
+    // does both with one number, and that is the ICD of this p (its P is linear on each half).
+    // E[(f/p)²] = 2√2·∫₀^√2 x⁴ dx + 2(2 - √2)·∫_√2^2 x⁴ dx = 16/5 + (144 - 80√2)/5 = 32 - 16√2
+    pdf_on_0_2{"two halves", "1/(2√2) | 1/(4-2√2)",
+               [](double x) { return x < sqrt2 ? 0.5 / sqrt2 : 0.5 / (2 - sqrt2); },
+               [](double d) { return d < 0.5 ? 2 * sqrt2 * d : sqrt2 + (2 - sqrt2) * (2 * d - 1); },
+               32 - 16 * sqrt2 - i_squared},
+    // Linear (listing 14): p = x/2, P(x) = x²/4, ICD(d) = √(4d). E[(f/p)²] = ∫ x⁴/(x/2) dx = ∫ 2x³ dx = 8
+    pdf_on_0_2{"linear", "x/2", [](double x) { return x / 2; }, [](double d) { return std::sqrt(4 * d); },
+               8 - i_squared},
+    // Quadratic (listing 15): p = 3x²/8, P(x) = x³/8, and P(x) = d gives ICD(d) = ∛(8d) = 2·∛d. The book writes
+    // 8·d^(1/3), which spreads the samples over [0, 8], mostly outside [0, 2]. Its estimate can't show the mistake, as
+    // f/p = x²/(3x²/8) = 8/3 for every x. E[(f/p)²] = (8/3)² = 64/9: σ = 0, every sample is the exact answer.
+    pdf_on_0_2{"quadratic", "3x²/8", [](double x) { return 3 * x * x / 8; },
+               [](double d) { return std::cbrt(8 * d); }, 64.0 / 9 - i_squared},
+};
+
+// One estimate of ∫ x² dx over [0, 2] from n samples with the density p: the mean of f(x)/p(x) (section 3.7).
+// Dividing by p weights the samples: where p is high they come often and each counts less, where p is low they come
+// rarely and each counts more.
+struct x_squared_estimate
+{
+    double value;
+    double largest_x; // of the samples: all of them must lie in [0, 2]
+};
+
+x_squared_estimate estimate_x_squared(const pdf_on_0_2& pdf, int n)
+{
+    sample_mean samples;
+    double largest_x = 0;
+    while (samples.count() < n)
+    {
+        const double d = random_double();
+        // d = 0 gives x = 0, where the linear and quadratic densities are 0 and f/p is 0/0; the book skips it too
+        if (d == 0)
+        {
+            continue;
+        }
+        const double x = pdf.icd(d);
+        largest_x = std::max(largest_x, x);
+        samples.add(x * x / pdf.density(x));
+    }
+    return {samples.mean(), largest_x};
+}
+
+// Book 3, section 3.7 (listings 11 and 13 to 15): importance sampling. The same integral, ∫ x² dx over [0, 2] = 8/3,
+// with samples drawn from four PDFs. All of them give the right answer on average, and the closer p is to the shape
+// of f = x², the smaller σ and the errors. σ is known exactly here (the variances above), so the RMS error of many
+// runs can be compared with σ/√N.
+void importance()
+{
+    seed_random(6);
+    constexpr int n = 1'000'000;
+    std::println("  ∫ x² dx over [0, 2] as the mean of f(x)/p(x) = x²/p(x), with x = ICD(d) drawn with the density p.");
+    std::println("  One run of N = {} samples per PDF:", n);
+    for (const pdf_on_0_2& pdf : importance_pdfs)
+    {
+        print_estimate(pdf.name, estimate_x_squared(pdf, n).value, x_squared_integral, std::sqrt(pdf.variance / n));
+    }
+    std::println("  The quadratic p is proportional to f, so every sample f/p is 8/3 (but for its last bits), σ = 0.\n"
+                 "  Its tiny error comes from rounding in the running sum. The sum grows to millions,\n"
+                 "  and each 8/3 added to it loses its low bits.");
+    std::println("  The book's last listing takes a single sample of it: {:.12f}\n",
+                 estimate_x_squared(importance_pdfs.back(), 1).value);
+
+    constexpr int runs = 1000;
+    constexpr int small_n = 100;
+    std::println("  The RMS error of {} runs with N = {} samples each, next to σ/√N:", runs, small_n);
+    std::println("  {:10}  {:19}  {:>8}  {:>8}  {:>8}  {:>9}", "PDF", "p(x)", "σ of f/p", "σ/√N", "RMS", "largest x");
+    for (const pdf_on_0_2& pdf : importance_pdfs)
+    {
+        double squared_error_sum = 0;
+        double largest_x = 0;
+        for (int run = 0; run < runs; ++run)
+        {
+            const x_squared_estimate estimate = estimate_x_squared(pdf, small_n);
+            const double error = estimate.value - x_squared_integral;
+            squared_error_sum += error * error;
+            largest_x = std::max(largest_x, estimate.largest_x);
+        }
+        const double sigma = std::sqrt(pdf.variance);
+        std::println("  {:10}  {:19}  {:8.6f}  {:8.6f}  {:8.6f}  {:9.6f}", pdf.name, pdf.formula, sigma,
+                     sigma / std::sqrt(small_n), std::sqrt(squared_error_sum / runs), largest_x);
+    }
+}
+
 // --- The list of experiments and the command line --------------------------------------------------------------
 
 constexpr std::array experiments{
@@ -265,6 +570,11 @@ constexpr std::array experiments{
     experiment{"convergence", "2.2", "the law of diminishing returns: the error falls as 1/√N", convergence},
     experiment{"stratified", "2.3", "one random point in each cell of a grid (jittering) vs points anywhere",
                stratified},
+    experiment{"integrate", "3.2", "integrals as averages of random samples: x², sin⁵ x and ln(sin x) over [0, 2]",
+               integrate},
+    experiment{"halfway", "3.5", "the point that halves the area under a curve, found by sorting the samples",
+               halfway},
+    experiment{"importance", "3.7", "∫ x² dx with four PDFs: the closer p is to f, the smaller the error", importance},
 };
 
 void print_usage()
