@@ -29,7 +29,8 @@ Options:
   -w, --width N      image width in pixels; the height follows the scene's aspect ratio
                      (each scene has its own default)
   -s, --samples N    rays per pixel: fewer is faster but noisier
-                     (each scene has its own default)
+                     (each scene has its own default); rounded to the nearest square k²,
+                     because the rays form a k×k grid in the pixel
   -o, --output FILE  where to save the PNG (default <scene>.png)
   -h, --help         show this help)",
                  default_scene);
@@ -151,6 +152,13 @@ int main(int argc, char* argv[])
     const image img = cam.render(*world);
     const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
     std::println("Render time: {:.1f} s", elapsed.count());
+
+    // Not in the book: a diagnostic for comparing ways of sampling. Every pixel is a Monte Carlo estimate;
+    // an unbiased one may be noisier or less noisy, but its expected value is the same, so the image mean
+    // of every unbiased method converges to the same number as the rays per pixel grow. The PNG can't show
+    // this: it keeps 8 bits per channel and nothing brighter than white, so a lamp of brightness 15 is just white.
+    const color mean = img.average();
+    std::println("Mean radiance (linear, before clamping): {:.6f}", (mean.x + mean.y + mean.z) / 3);
 
     if (const auto saved = img.save_png(output); !saved)
     {

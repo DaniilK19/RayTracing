@@ -35,7 +35,7 @@ export struct camera_settings
 {
     double aspect_ratio = 1.0;  // image width to height ratio
     int image_width = 100;      // image width in pixels
-    int samples_per_pixel = 10; // how many random rays to average per pixel
+    int samples_per_pixel = 10; // how many random rays to average per pixel (rounded to a square, see camera)
     int max_depth = 10;         // how many times a ray may bounce before we give up on it
 
     double vfov = 90;         // vertical field of view in degrees: a smaller angle means a stronger "zoom"
@@ -58,8 +58,11 @@ public:
     explicit camera(const camera_settings& settings)
         : image_width_(settings.image_width),
           image_height_(std::max(1, static_cast<int>(settings.image_width / settings.aspect_ratio))),
-          samples_per_pixel_(settings.samples_per_pixel),
-          pixel_samples_scale_(1.0 / settings.samples_per_pixel),
+          sqrt_spp_(std::max(1, static_cast<int>(std::lround(std::sqrt(settings.samples_per_pixel))))),
+          // Members are initialized in the order they are declared in the class, not in the order of this list.
+          // sqrt_spp_ is declared before the next two, so they can already use it.
+          pixel_samples_scale_(1.0 / rays_per_pixel()),
+          recip_sqrt_spp_(1.0 / sqrt_spp_),
           max_depth_(settings.max_depth),
           defocus_angle_(settings.defocus_angle),
           background_(settings.background)
@@ -101,8 +104,8 @@ public:
     image render(const hittable& world) const
     {
         const unsigned thread_count = std::max(1u, std::thread::hardware_concurrency());
-        std::println("Rendering {}×{}, rays per pixel: {}, threads: {}", image_width_, image_height_,
-                     samples_per_pixel_, thread_count);
+        std::println("Rendering {}×{}, rays per pixel: {} ({}×{} strata), threads: {}", image_width_, image_height_,
+                     rays_per_pixel(), sqrt_spp_, sqrt_spp_, thread_count);
 
         image img(image_width_, image_height_);
 
@@ -111,6 +114,12 @@ public:
         // only to its own rows), so the image needs no protection.
         std::atomic<int> next_row = 0;
         std::atomic<int> rows_done = 0;
+
+        // All cells (s_j, s_i) of the pixel's grid, row by row. std::views::cartesian_product (C++23) gives every
+        // pair of an element of the first range with one of the second: one loop instead of two nested ones.
+        const auto strata =
+            std::views::cartesian_product(std::views::iota(0, sqrt_spp_), std::views::iota(0, sqrt_spp_));
+
         auto render_rows = [&] {
             for (int j = next_row++; j < image_height_; j = next_row++)
             {
@@ -120,9 +129,9 @@ public:
                 for (int i = 0; i < image_width_; ++i)
                 {
                     color pixel_color{0, 0, 0};
-                    for (int sample = 0; sample < samples_per_pixel_; ++sample)
+                    for (const auto [s_j, s_i] : strata)
                     {
-                        pixel_color += ray_color(get_ray(i, j), max_depth_, world);
+                        pixel_color += ray_color(get_ray(i, j, s_i, s_j), max_depth_, world);
                     }
                     img[i, j] = pixel_samples_scale_ * pixel_color;
                 }
@@ -155,8 +164,12 @@ public:
 private:
     int image_width_;
     int image_height_;
-    int samples_per_pixel_;
-    double pixel_samples_scale_; // 1 / samples_per_pixel: the averaging factor
+    // The rays of a pixel form a sqrt_spp × sqrt_spp grid (see sample_square_stratified), so their number is a
+    // square. We take the one nearest to samples_per_pixel: its square root rounded, where the book truncates
+    // it (1000 rays → 32×32 = 1024, not 31×31 = 961; 500 → 22×22 = 484 either way).
+    int sqrt_spp_;
+    double pixel_samples_scale_; // 1 / sqrt_spp²: the averaging factor
+    double recip_sqrt_spp_;      // 1 / sqrt_spp: the side of one grid cell, in pixel widths
     int max_depth_;
     double defocus_angle_;
     sky background_;
@@ -167,14 +180,17 @@ private:
     vec3 defocus_disk_u_;        // horizontal radius of the "lens" disk
     vec3 defocus_disk_v_;        // vertical radius of the "lens" disk
 
-    // A ray through a random point of pixel (i, j). If all rays went exactly through the center,
-    // object edges would look like "staircases"; random points inside the pixel smooth them out.
+    // sqrt_spp² in 64 bits: for -s near the largest int (2^31 - 1) the rounded-up square no longer fits in an int
+    std::int64_t rays_per_pixel() const { return std::int64_t{sqrt_spp_} * sqrt_spp_; }
+
+    // A ray through a random point of cell (s_i, s_j) of pixel (i, j). If all rays went exactly through
+    // the center, object edges would look like "staircases"; random points inside the pixel smooth them out.
     // The ray starts at a random point of the lens (or at the camera center if defocus is off).
     // The emission moment is random too: the shutter is open from time 0 to 1, and the pixel averages
     // everything a moving object managed to "sweep" in that time, which gives motion blur.
-    ray get_ray(int i, int j) const
+    ray get_ray(int i, int j, int s_i, int s_j) const
     {
-        const vec3 offset = sample_square();
+        const vec3 offset = sample_square_stratified(s_i, s_j);
         const point3 pixel_sample =
             pixel00_loc_ + ((i + offset.x) * pixel_delta_u_) + ((j + offset.y) * pixel_delta_v_);
         const point3 ray_origin = defocus_angle_ <= 0 ? center_ : defocus_disk_sample();
@@ -182,8 +198,23 @@ private:
         return ray{ray_origin, pixel_sample - ray_origin, ray_time};
     }
 
-    // Random point in the square [-0.5, 0.5] × [-0.5, 0.5]: an offset from the pixel center.
-    static vec3 sample_square() { return {random_double() - 0.5, random_double() - 0.5, 0}; }
+    // Random point in cell (s_i, s_j) of the pixel's sqrt_spp × sqrt_spp grid, as an offset from the pixel center
+    // (the pixel is the square [-0.5, 0.5] × [-0.5, 0.5]). This is stratified sampling (book 3, section 2.3):
+    // the cells ("strata") have equal areas and each gets exactly one random point, so the average still estimates
+    // the average over the whole pixel without bias, but the points can't clump together and leave holes. Where
+    // an object's edge or a sharp line of a texture crosses the pixel, only the cells it passes through can get
+    // their point on either side of it, so this part of the error falls as N^(-3/4) instead of N^(-1/2)
+    // (MonteCarlo stratified shows this for a circle). The lens point, the time and the bounce directions
+    // (each bounce adds two more dimensions) stay purely random. The more dimensions d, the less a grid helps:
+    // at an edge the error falls as N^(-1/2 - 1/(2d)), the book's "curse of dimensionality". So edges and
+    // textures get less noisy, but the noise of the lighting hardly changes.
+    vec3 sample_square_stratified(int s_i, int s_j) const
+    {
+        // One random number per statement fixes their order (x, then y); in a + b or f(a, b) C++ leaves it unspecified
+        const double px = (s_i + random_double()) * recip_sqrt_spp_ - 0.5;
+        const double py = (s_j + random_double()) * recip_sqrt_spp_ - 0.5;
+        return {px, py, 0};
+    }
 
     // Random point on the "lens" disk around the camera center.
     point3 defocus_disk_sample() const

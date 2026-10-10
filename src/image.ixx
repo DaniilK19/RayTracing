@@ -85,6 +85,15 @@ public:
     inline int width() const { return width_; }
     inline int height() const { return height_; }
 
+    // The average color of all pixels, in linear light and before any clamping: a channel value above 1 (a lamp,
+    // a bright highlight) counts in full here, while the PNG clamps every channel at 255 (see to_byte), so a white
+    // lamp of brightness 15 is stored as plain white.
+    // std::ranges::fold_left (C++23) sums the range starting from zero; std::plus{} adds with our vec3 operator+.
+    color average() const
+    {
+        return std::ranges::fold_left(pixels_, color{0, 0, 0}, std::plus{}) / static_cast<double>(pixels_.size());
+    }
+
     // Pixel color: img[x, y]. Multiple arguments to operator[] are allowed since C++23.
     // `this auto& self` is C++23 too ("deducing this"): one function instead of a const/non-const pair.
     // For a const image, self is a const image&, and a const color& is returned.
