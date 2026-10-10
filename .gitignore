@@ -9,3 +9,7 @@ CMakeUserPresets.json
 
 # Renders saved to the project root when run from the command line
 /*.png
+
+# Point lists of MonteCarlo sphere-plot, saved the same way (but CMakeLists.txt belongs to the project)
+/*.txt
+!/CMakeLists.txt

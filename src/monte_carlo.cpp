@@ -1,7 +1,8 @@
 // MonteCarlo: the numerical experiments of the third book, "Ray Tracing: The Rest of Your Life".
 // Before the ray tracer learns to choose its rays cleverly, the book studies Monte Carlo estimation on small
 // problems whose exact answers are known, so the error of every estimate can be measured.
-// Without arguments all experiments run in the book's order; or name the ones to run: MonteCarlo pi stratified
+// Without arguments all experiments but sphere-plot run in the book's order; or name the ones to run:
+// MonteCarlo pi stratified
 import std;
 import random;
 import vec3;
@@ -15,6 +16,7 @@ struct experiment
                               // which has no sections)
     std::string_view description;
     void (*run)();
+    bool in_all = true; // runs when no experiment is named on the command line
 };
 
 // Prints an estimate next to the exact value. The error alone says little: for the π estimator below an error of
@@ -592,7 +594,7 @@ struct direction_sampler
     std::string_view name;
     vec3 (*generate)();
     double (*density)(const vec3& d);
-    double variance; // of one sample f(d)/p(d), worked out below
+    double variance; // of one sample f(d)/p(d) for the integrand f it is used with, worked out below
 };
 
 // The book's listing 16: random_unit_vector() and p = 1/(4π), the density of the directions it returns, named
@@ -633,13 +635,13 @@ constexpr direction_sampler polar_directions_without_sin{
     "no sin θ", random_polar_direction, [](const vec3& /*d*/) { return 1 / (2 * pi * pi); }, pi * pi * pi * pi / 2};
 
 // The mean of n samples f(d)/p(d), with the directions d drawn by the sampler.
-double estimate_cos_squared_integral(const direction_sampler& sampler, int n)
+double estimate_direction_integral(double (*f)(const vec3& d), const direction_sampler& sampler, int n)
 {
     double sum = 0;
     for (int i = 0; i < n; ++i)
     {
         const vec3 d = sampler.generate();
-        sum += cos_squared(d) / sampler.density(d);
+        sum += f(d) / sampler.density(d);
     }
     return sum / n;
 }
@@ -653,7 +655,7 @@ void sphere()
     std::println("  ∫ cos²θ dω over the unit sphere as the mean of f(d)/p(d) = d.z²/p(d), p per steradian, N = {}:", n);
     for (const direction_sampler& sampler : {uniform_directions, polar_directions})
     {
-        print_estimate(sampler.name, estimate_cos_squared_integral(sampler, n), cos_squared_integral,
+        print_estimate(sampler.name, estimate_direction_integral(cos_squared, sampler, n), cos_squared_integral,
                        std::sqrt(sampler.variance / n));
     }
     std::println("  Uniform θ and φ crowd the directions at the poles, where cos²θ is large, so σ is smaller:\n"
@@ -664,10 +666,124 @@ void sphere()
     std::println("  Without the sin θ, p = 1/(2π²) is not a density per steradian: "
                  "over the sphere it integrates to 2/π.\n"
                  "  The estimate still converges, but to π² = ∫∫ cos²θ dθ dφ, the integral over the θ-φ rectangle:");
-    const double estimate = estimate_cos_squared_integral(polar_directions_without_sin, n);
+    const double estimate = estimate_direction_integral(cos_squared, polar_directions_without_sin, n);
     const double standard_error = std::sqrt(polar_directions_without_sin.variance / n);
     print_estimate(polar_directions_without_sin.name, estimate, cos_squared_integral, standard_error);
     print_estimate("vs π²", estimate, pi * pi, standard_error);
+}
+
+// --- Generating random directions (book 3, chapter 7) ----------------------------------------------------------
+
+// random_unit_vector() draws points in a cube until one lands inside the ball: the rejection method. The inversion
+// method of section 3.6 makes a direction from two random numbers r1, r2 in [0, 1), with no loop. If the density per
+// steradian depends only on θ, the angle from the z axis, p = f(θ), then φ is uniform: φ = 2π·r1. θ has the density
+// 2π·f(θ)·sin θ (the band between θ and θ + dθ covers 2π·sin θ·dθ steradians); setting its cumulative distribution
+// equal to r2 and solving for cos θ gives z, and sin θ = √(1 - z²). random_cosine_direction() in vec3 is made so too.
+
+// Uniform on the sphere, f = 1/(4π) (section 7.1): the density of θ is sin θ / 2, its cumulative distribution
+// (1 - cos θ)/2 = r2, so z = 1 - 2·r2 is uniform in (-1, 1] (Archimedes' theorem in chapter 4 above says the same),
+// and sin θ = 2·√(r2·(1 - r2)). The same distribution as random_unit_vector()'s.
+vec3 random_sphere_direction()
+{
+    const double r1 = random_double();
+    const double r2 = random_double();
+    const double phi = 2 * pi * r1;
+    const double sin_theta = 2 * std::sqrt(r2 * (1 - r2));
+    return {std::cos(phi) * sin_theta, std::sin(phi) * sin_theta, 1 - 2 * r2};
+}
+
+// Where sphere-plot writes its points: the console, or the file given with -o. The file holds only the points, what
+// a plotting tool reads: on the console the experiment's header comes first, and PowerShell 5.1's > would save the
+// output as UTF-16. main opens the file before any experiment runs, so a file that can't be written stops the
+// program at once.
+std::optional<std::string_view> sphere_plot_file_name; // none: the console
+std::ofstream sphere_plot_file;
+
+// Book 3, section 7.1 (listing 23, sphere_plot.cc): 200 directions as "x y z" lines, the input of a 3D scatter plot.
+// Turned around in the plot, the points cover the sphere evenly.
+void sphere_plot()
+{
+    seed_random(8);
+    constexpr int n = 200;
+    // std::ofstream is a kind of std::ostream (derived from it), so a reference to ostream can refer to either
+    std::ostream& out = sphere_plot_file.is_open() ? sphere_plot_file : std::cout;
+    for (int i = 0; i < n; ++i)
+    {
+        const vec3 d = random_sphere_direction();
+        std::println(out, "{:9.6f} {:9.6f} {:9.6f}", d.x, d.y, d.z);
+    }
+    if (sphere_plot_file.is_open())
+    {
+        std::println("  {} points written to {}", n, *sphere_plot_file_name);
+    }
+}
+
+// The integrand of sections 7.2 and 7.3: cos³θ = d.z³ over the hemisphere z > 0, where both samplers below draw
+// their directions. Its exact integral: ∫₀^2π dφ · ∫₀^(π/2) cos³θ sin θ dθ = 2π · [-cos⁴θ/4]₀^(π/2) = 2π/4 = π/2.
+double cos_cubed(const vec3& d) { return d.z * d.z * d.z; }
+
+constexpr double cos_cubed_integral = pi / 2;
+
+// Uniform on the hemisphere, f = 1/(2π) (section 7.2): the density of θ is sin θ, its cumulative distribution
+// 1 - cos θ = r2, so z = 1 - r2, uniform in (0, 1]. (The book's cos_cubed.cc needs only z and skips φ.)
+vec3 random_hemisphere_direction()
+{
+    const double r1 = random_double();
+    const double r2 = random_double();
+    const double phi = 2 * pi * r1;
+    const double z = 1 - r2;
+    const double sin_theta = std::sqrt(1 - z * z);
+    return {std::cos(phi) * sin_theta, std::sin(phi) * sin_theta, z};
+}
+
+// Listing 24 (cos_cubed.cc): a sample is f/p = 2π·z³ with z uniform in (0, 1]. E[z³] = 1/4 gives the mean π/2, and
+// E[z⁶] = 1/7 the variance 4π²/7 - π²/4 = 9π²/28: σ ≈ 1.781.
+constexpr direction_sampler uniform_hemisphere{"uniform", random_hemisphere_direction,
+                                               [](const vec3& /*d*/) { return 1 / (2 * pi); }, 9 * pi * pi / 28};
+
+// Listing 26 (cos_density.cc): random_cosine_direction() from vec3 (listing 25, section 7.3) with its density cos θ/π,
+// which is cosine_density with the z axis as the normal. A sample is f/p = π·cos²θ = π·(1 - r2), uniform in (0, π]:
+// the mean π/2, the variance π²/12, σ ≈ 0.907.
+constexpr direction_sampler cosine_hemisphere{"cosine", random_cosine_direction,
+                                              [](const vec3& d) { return cosine_density({0, 0, 1}, d); }, pi * pi / 12};
+
+// Book 3, sections 7.2 and 7.3 (listings 24 and 26): ∫ cos³θ dω over the hemisphere, from uniform directions and
+// from cosine-distributed ones. cos θ/π is closer to the shape of cos³θ than a constant, so σ is √(27/7) ≈ 1.96 times
+// smaller: the same error takes 27/7 ≈ 3.9 times fewer samples (importance sampling, as in section 3.7).
+// Each RMS of 1000 runs is itself random, by about ±2% (see convergence()), so the measured ratio of the two RMS
+// errors scatters by about ±3% around 1.96.
+void hemisphere()
+{
+    seed_random(9);
+    constexpr int n = 1'000'000;
+    constexpr std::array samplers{uniform_hemisphere, cosine_hemisphere};
+    std::println("  ∫ cos³θ dω over the hemisphere z > 0 as the mean of f(d)/p(d) = d.z³/p(d), N = {}:", n);
+    for (const direction_sampler& sampler : samplers)
+    {
+        print_estimate(sampler.name, estimate_direction_integral(cos_cubed, sampler, n), cos_cubed_integral,
+                       std::sqrt(sampler.variance / n));
+    }
+
+    constexpr int runs = 1000;
+    constexpr int small_n = 100;
+    std::println("\n  The RMS error of {} runs with N = {} samples each, next to σ/√N:", runs, small_n);
+    std::println("  {:7}  {:>8}  {:>8}  {:>8}", "p(d)", "σ of f/p", "σ/√N", "RMS");
+    std::array<double, samplers.size()> rms_errors{};
+    for (std::size_t i = 0; i < samplers.size(); ++i)
+    {
+        double squared_error_sum = 0;
+        for (int run = 0; run < runs; ++run)
+        {
+            const double error = estimate_direction_integral(cos_cubed, samplers[i], small_n) - cos_cubed_integral;
+            squared_error_sum += error * error;
+        }
+        rms_errors[i] = std::sqrt(squared_error_sum / runs);
+        const double sigma = std::sqrt(samplers[i].variance);
+        std::println("  {:7}  {:8.6f}  {:8.6f}  {:8.6f}", samplers[i].name, sigma, sigma / std::sqrt(small_n),
+                     rms_errors[i]);
+    }
+    std::println("  With the cosine density the RMS error is {:.2f} times smaller (σ: {:.2f} times).",
+                 rms_errors[0] / rms_errors[1], std::sqrt(samplers[0].variance / samplers[1].variance));
 }
 
 // --- The list of experiments and the command line --------------------------------------------------------------
@@ -683,33 +799,55 @@ constexpr std::array experiments{
                halfway},
     experiment{"importance", "3.7", "∫ x² dx with four PDFs: the closer p is to f, the smaller the error", importance},
     experiment{"sphere", "4", "∫ cos²θ dω over the sphere of directions, with densities per steradian", sphere},
+    // Designated initializers (C++20) name the members: .in_all = false says what the false is for
+    experiment{.name = "sphere-plot",
+               .section = "7.1",
+               .description = "200 random directions as \"x y z\" lines, the input of a 3D scatter plot",
+               .run = sphere_plot,
+               .in_all = false},
+    experiment{"cos-cubed", "7.2", "∫ cos³θ dω over the hemisphere: uniform vs cosine-distributed directions",
+               hemisphere},
 };
 
 void print_usage()
 {
-    std::println("Usage: MonteCarlo [experiment...]\n\n"
+    std::println("Usage: MonteCarlo [experiment...] [options]\n\n"
                  "Experiments from the third book, \"Ray Tracing: The Rest of Your Life\" (section, description):");
     for (const experiment& e : experiments)
     {
         std::println("  {:12} {:4} {}", e.name, e.section, e.description);
     }
-    std::println(R"(  Without arguments all of them run, in the book's order.
+    std::println(R"(  Without arguments all of them run, in the book's order, except sphere-plot.
 
 Options:
-  -h, --help   show this help)");
+  -o, --output FILE  sphere-plot writes its points to FILE instead of the console: only the points,
+                     the input of a plotting tool (on the console a header comes first)
+  -h, --help         show this help)");
 }
 
 int main(int argc, char* argv[])
 {
-    // Check all arguments before running anything: a typo at the end shouldn't wait for the experiments before it.
-    // drop(1) skips argv[0], the program name.
+    // Check all arguments before running anything: a typo at the end shouldn't wait for the experiments before it
+    const std::span<char* const> args(argv, static_cast<std::size_t>(argc));
     std::vector<const experiment*> chosen;
     bool help = false;
-    for (const std::string_view arg : std::span(argv, static_cast<std::size_t>(argc)) | std::views::drop(1))
+    for (std::size_t i = 1; i < args.size(); ++i) // args[0] is the program name
     {
+        const std::string_view arg = args[i];
         if (arg == "-h" || arg == "--help")
         {
             help = true;
+            continue;
+        }
+        if (arg == "-o" || arg == "--output")
+        {
+            if (i + 1 == args.size())
+            {
+                std::println("Error: {} needs a file name\n", arg);
+                print_usage();
+                return 1;
+            }
+            sphere_plot_file_name = args[++i];
             continue;
         }
         // The projection &experiment::name: find compares the names, as find_scene does with the scenes
@@ -720,12 +858,33 @@ int main(int argc, char* argv[])
             print_usage();
             return 1;
         }
-        chosen.push_back(&*it);
+        // An experiment named twice runs once: it seeds its own random numbers, so a second run would only print
+        // the same again. std::ranges::contains is C++23.
+        if (!std::ranges::contains(chosen, &*it))
+        {
+            chosen.push_back(&*it);
+        }
     }
     if (help)
     {
         print_usage();
         return 0;
+    }
+    if (sphere_plot_file_name)
+    {
+        // Only sphere-plot writes to the file, and it never runs unless named. The projection &experiment::name
+        // works on the pointers in chosen too: std::invoke turns it into e->name.
+        if (!std::ranges::contains(chosen, std::string_view("sphere-plot"), &experiment::name))
+        {
+            std::println("Error: -o names the file for the points of sphere-plot: MonteCarlo sphere-plot -o FILE");
+            return 1;
+        }
+        sphere_plot_file.open(std::string(*sphere_plot_file_name));
+        if (!sphere_plot_file)
+        {
+            std::println("Error: can't write the file '{}'", *sphere_plot_file_name);
+            return 1;
+        }
     }
 
 #ifndef NDEBUG // NDEBUG is defined in Release and RelWithDebInfo
@@ -736,7 +895,10 @@ int main(int argc, char* argv[])
     {
         for (const experiment& e : experiments)
         {
-            chosen.push_back(&e);
+            if (e.in_all)
+            {
+                chosen.push_back(&e);
+            }
         }
     }
 

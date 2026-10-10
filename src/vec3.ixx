@@ -136,3 +136,19 @@ export inline double cosine_density(const vec3& unit_normal, const vec3& directi
     const double cosine = dot(unit_normal, unit_vector(direction));
     return cosine > 0 ? cosine / std::numbers::pi : 0.0;
 }
+
+// Random direction with the density cos θ / π around the z axis, i.e. cosine_density((0, 0, 1), d) (book 3,
+// chapter 7). The inversion method: two random numbers and no loop. When a density depends only on θ, the angle
+// from the z axis, φ is uniform: φ = 2π·r1. θ gets the density 2π·sin θ·(cos θ / π) = 2·sin θ·cos θ (the band
+// between θ and θ + dθ covers 2π·sin θ·dθ steradians); its cumulative distribution is sin²θ, and setting it to r2
+// gives sin θ = √r2, cos θ = √(1 - r2). So x² + y² + z² = r2 + (1 - r2): unit length, up to rounding, and z > 0.
+export inline vec3 random_cosine_direction()
+{
+    const double r1 = random_double();
+    const double r2 = random_double();
+    const double phi = 2 * std::numbers::pi * r1;
+    const double x = std::cos(phi) * std::sqrt(r2);
+    const double y = std::sin(phi) * std::sqrt(r2);
+    const double z = std::sqrt(1 - r2);
+    return {x, y, z};
+}
