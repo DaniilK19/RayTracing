@@ -127,6 +127,7 @@ constexpr camera_settings cover_camera{
     .vup = {0, 1, 0},
     .defocus_angle = 0.6,
     .focus_dist = 10.0,
+    .background = daylight_sky,
 };
 
 scene weekend()
@@ -208,7 +209,70 @@ scene quads()
                 .lookfrom = {0, 0, 9},
                 .lookat = {0, 0, 0},
                 .vup = {0, 1, 0},
+                .background = daylight_sky,
             }};
+}
+
+// Book 2, chapter 7: marble spheres in the dark, lit by a glowing sphere and a glowing rectangle.
+scene simple_light()
+{
+    hittable_list world;
+    const auto marble = std::make_shared<lambertian>(std::make_shared<noise_texture>(4));
+    world.add(std::make_unique<sphere>(point3{0, -1000, 0}, 1000, marble));
+    world.add(std::make_unique<sphere>(point3{0, 2, 0}, 2, marble));
+
+    const auto light = std::make_shared<diffuse_light>(color{4, 4, 4});
+    world.add(std::make_unique<sphere>(point3{0, 7, 0}, 2, light));
+    world.add(std::make_unique<quad>(point3{3, 1, -2}, vec3{2, 0, 0}, vec3{0, 2, 0}, light));
+
+    return {std::move(world),
+            {
+                .aspect_ratio = 16.0 / 9.0,
+                .image_width = 1920,
+                .samples_per_pixel = 500,
+                .max_depth = 50,
+                .vfov = 20,
+                .lookfrom = {26, 3, 6},
+                .lookat = {0, 2, 0},
+                .vup = {0, 1, 0},
+            }}; // the background is black by default
+}
+
+// The Cornell box is a classic scene for testing lighting (Cornell University, 1984):
+// a 555×555×555 room with red and green walls and a lamp on the ceiling. There is no front wall: the camera is there.
+// Adds five walls to world; each scene places its own lamp.
+void add_cornell_walls(hittable_list& world)
+{
+    const auto red = std::make_shared<lambertian>(color{0.65, 0.05, 0.05});
+    const auto white = std::make_shared<lambertian>(color{0.73, 0.73, 0.73});
+    const auto green = std::make_shared<lambertian>(color{0.12, 0.45, 0.15});
+
+    world.add(std::make_unique<quad>(point3{555, 0, 0}, vec3{0, 555, 0}, vec3{0, 0, 555}, green));      // left
+    world.add(std::make_unique<quad>(point3{0, 0, 0}, vec3{0, 555, 0}, vec3{0, 0, 555}, red));          // right
+    world.add(std::make_unique<quad>(point3{0, 0, 0}, vec3{555, 0, 0}, vec3{0, 0, 555}, white));        // floor
+    world.add(std::make_unique<quad>(point3{555, 555, 555}, vec3{-555, 0, 0}, vec3{0, 0, -555}, white)); // ceiling
+    world.add(std::make_unique<quad>(point3{0, 0, 555}, vec3{555, 0, 0}, vec3{0, 555, 0}, white));      // back
+}
+
+constexpr camera_settings cornell_camera{
+    .aspect_ratio = 1.0,
+    .image_width = 1080,
+    .samples_per_pixel = 1000, // a closed room with a small lamp is very noisy: more rays are needed
+    .max_depth = 50,
+    .vfov = 40,
+    .lookfrom = {278, 278, -800},
+    .lookat = {278, 278, 0},
+    .vup = {0, 1, 0},
+};
+
+// Book 2, chapter 7: an empty Cornell box
+scene cornell()
+{
+    hittable_list world;
+    add_cornell_walls(world);
+    const auto light = std::make_shared<diffuse_light>(color{15, 15, 15});
+    world.add(std::make_unique<quad>(point3{343, 554, 332}, vec3{-130, 0, 0}, vec3{0, 0, -105}, light));
+    return {std::move(world), cornell_camera};
 }
 
 // All scenes, in the order they appear in the books.
@@ -219,6 +283,8 @@ export constexpr std::array scene_list{
     scene_entry{"earth", "the Earth: an image wrapped around a sphere", earth},
     scene_entry{"perlin", "marble spheres made of Perlin noise", perlin_spheres},
     scene_entry{"quads", "five colored quadrilaterals", quads},
+    scene_entry{"light", "marble spheres in the dark and two light sources", simple_light},
+    scene_entry{"cornell", "the Cornell box, a classic scene for testing lighting", cornell},
 };
 
 export constexpr std::string_view default_scene = "weekend";

@@ -11,6 +11,25 @@ import vec3;
 
 constexpr double degrees_to_radians(double degrees) { return degrees * std::numbers::pi / 180.0; }
 
+// The background is the light brought by a ray that hit nothing. The color changes smoothly with the height
+// of the ray direction: from bottom (the ray looks down) to top (up). Equal colors give a flat background.
+// The background is black by default: the scene is lit only by its own light sources.
+export struct sky
+{
+    color bottom{0, 0, 0};
+    color top{0, 0, 0};
+
+    inline color in_direction(const vec3& direction) const
+    {
+        const double a = 0.5 * (unit_vector(direction).y + 1.0); // y from -1 to 1 → a from 0 to 1
+        return (1.0 - a) * bottom + a * top;
+    }
+};
+
+// The daylight sky from the first book: white at the horizon, blue at the zenith. The second book uses
+// a flat blue background (0.7, 0.8, 1.0) instead, but the gradient is prettier and keeps the first book's scenes unchanged.
+export constexpr sky daylight_sky{.bottom = {1.0, 1.0, 1.0}, .top = {0.5, 0.7, 1.0}};
+
 // Camera settings. They are convenient to set with designated initializers (C++20):
 //   camera cam({.aspect_ratio = 16.0 / 9.0, .image_width = 400});
 // Fields that aren't mentioned get their default values.
@@ -31,6 +50,8 @@ export struct camera_settings
     // but from random points of a "lens" disk and converge on the focus plane.
     double defocus_angle = 0; // angle of the ray cone through each pixel, in degrees (0 means everything is sharp)
     double focus_dist = 10;   // distance from the camera to the plane of perfect focus
+
+    sky background; // what is visible where a ray hits nothing
 };
 
 export class camera
@@ -42,7 +63,8 @@ public:
           samples_per_pixel_(settings.samples_per_pixel),
           pixel_samples_scale_(1.0 / settings.samples_per_pixel),
           max_depth_(settings.max_depth),
-          defocus_angle_(settings.defocus_angle)
+          defocus_angle_(settings.defocus_angle),
+          background_(settings.background)
     {
         center_ = settings.lookfrom;
 
@@ -139,6 +161,7 @@ private:
     double pixel_samples_scale_; // 1 / samples_per_pixel: the averaging factor
     int max_depth_;
     double defocus_angle_;
+    sky background_;
     point3 center_;              // camera position
     point3 pixel00_loc_;         // center of pixel (0, 0)
     vec3 pixel_delta_u_;         // step to the next pixel to the right
@@ -173,7 +196,7 @@ private:
 
     // The color a ray "brings back". Having hit an object, the ray is reflected or refracted,
     // and we recursively ask what color comes from there. depth is how many more bounces are allowed.
-    static color ray_color(const ray& r, int depth, const hittable& world)
+    color ray_color(const ray& r, int depth, const hittable& world) const
     {
         if (depth <= 0)
         {
@@ -183,19 +206,19 @@ private:
         // Look for hits with t from 0.001, not from 0: due to rounding errors the reflection point
         // ends up slightly below the surface, and the ray would immediately "hit" the same surface. In the image
         // this would give dark spots ("shadow acne").
-        if (const auto rec = world.hit(r, interval{0.001, infinity}))
+        const auto rec = world.hit(r, interval{0.001, infinity});
+        if (!rec)
         {
-            // What happens to the ray next is up to the object's material
-            if (const auto s = rec->mat->scatter(r, *rec))
-            {
-                return s->attenuation * ray_color(s->scattered, depth - 1, world);
-            }
-            return color{0, 0, 0}; // the ray is absorbed
+            return background_.in_direction(r.direction); // the ray went off to infinity and brought back the background color
         }
 
-        // Sky: a smooth blend from white (bottom) to blue (top) by the height of the ray direction.
-        const vec3 unit_direction = unit_vector(r.direction);
-        const double a = 0.5 * (unit_direction.y + 1.0); // y from -1 to 1 → a from 0 to 1
-        return (1.0 - a) * color{1.0, 1.0, 1.0} + a * color{0.5, 0.7, 1.0};
+        // The light from the hit point is the light the surface emits by itself plus the reflected light:
+        // the light that came along the scattered ray, attenuated by the material. The material decides what to do with the ray.
+        const color emitted = rec->mat->emitted(rec->u, rec->v, rec->p);
+        if (const auto s = rec->mat->scatter(r, *rec))
+        {
+            return emitted + s->attenuation * ray_color(s->scattered, depth - 1, world);
+        }
+        return emitted; // the ray was absorbed or hit a light source that reflects nothing
     }
 };

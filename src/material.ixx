@@ -100,3 +100,20 @@ private:
         return r0 + (1 - r0) * std::pow(1 - cosine, 5);
     }
 };
+
+// Glowing surface: a light source. It emits light but reflects nothing.
+// Brightness can exceed 1: a lamp shines brighter than a white wall reflects. A small lamp
+// must be very bright to light a room: only a small fraction of the scattered rays reach it.
+export class diffuse_light : public material
+{
+public:
+    explicit diffuse_light(const color& emit) : diffuse_light(std::make_shared<solid_color>(emit)) {}
+    explicit diffuse_light(std::shared_ptr<const texture> tex) : tex_(std::move(tex)) {}
+
+    std::optional<scatter_result> scatter(const ray&, const hit_record&) const override { return std::nullopt; }
+
+    color emitted(double u, double v, const point3& p) const override { return tex_->value(u, v, p); }
+
+private:
+    std::shared_ptr<const texture> tex_;
+};

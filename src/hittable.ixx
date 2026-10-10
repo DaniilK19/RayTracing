@@ -40,6 +40,7 @@ export struct scatter_result
 };
 
 // A material decides what happens to a ray at the hit point: reflection, refraction or absorption.
+// A surface can also glow by itself.
 export class material
 {
 public:
@@ -47,6 +48,10 @@ public:
 
     // Ray r_in hit point rec. std::nullopt means the ray was absorbed.
     virtual std::optional<scatter_result> scatter(const ray& r_in, const hit_record& rec) const = 0;
+
+    // Light the surface emits by itself at point p with texture coordinates (u, v).
+    // Most materials don't glow, so for them this is black; light sources override the function.
+    virtual color emitted(double /*u*/, double /*v*/, const point3& /*p*/) const { return color{0, 0, 0}; }
 };
 
 // Interface of everything a ray can hit: spheres, object lists and so on.
