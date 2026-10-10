@@ -115,24 +115,9 @@ export inline vec3 random_unit_vector()
     }
 }
 
-// Densities of directions (book 3, chapters 4 and 5), used by the materials' scattering_pdf and by the camera.
-// A density of directions is per steradian (unit of solid angle): it integrates to 1 over the whole sphere.
-
-// The density of random_unit_vector(): the same in every direction, 1 / (area of the unit sphere).
-export constexpr double uniform_sphere_density = 1 / (4 * std::numbers::pi);
-
-// The Lambertian density around unit_normal (length 1): cos θ / π above the surface, θ being the angle between
-// the direction and the normal, and 0 below it. The 1 / π normalizes it: ∫ cos θ dω over the hemisphere is π.
-// The direction may have any length.
-export inline double cosine_density(const vec3& unit_normal, const vec3& direction)
-{
-    const double cosine = dot(unit_normal, unit_vector(direction));
-    return cosine > 0 ? cosine / std::numbers::pi : 0.0;
-}
-
-// Random direction with the density cos θ / π around the z axis, i.e. cosine_density((0, 0, 1), d) (book 3,
-// chapter 7). The inversion method: two random numbers and no loop. When a density depends only on θ, the angle
-// from the z axis, φ is uniform: φ = 2π·r1. θ gets the density 2π·sin θ·(cos θ / π) = 2·sin θ·cos θ (the band
+// Random direction with the density cos θ / π around the z axis, i.e. the pdf module's cosine_density((0, 0, 1), d)
+// (book 3, chapter 7). The inversion method: two random numbers and no loop. When a density depends only on θ, the
+// angle from the z axis, φ is uniform: φ = 2π·r1. θ gets the density 2π·sin θ·(cos θ / π) = 2·sin θ·cos θ (the band
 // between θ and θ + dθ covers 2π·sin θ·dθ steradians); its cumulative distribution is sin²θ, and setting it to r2
 // gives sin θ = √r2, cos θ = √(1 - r2). So x² + y² + z² = r2 + (1 - r2): unit length, up to rounding, and z > 0.
 export inline vec3 random_cosine_direction()

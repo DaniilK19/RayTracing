@@ -3,7 +3,7 @@ export module material;
 
 import std;
 import hittable;
-import onb;
+import pdf;
 import random;
 import ray;
 import texture;
@@ -16,22 +16,11 @@ public:
     explicit lambertian(const color& albedo) : lambertian(std::make_shared<solid_color>(albedo)) {}
     explicit lambertian(std::shared_ptr<const texture> tex) : tex_(std::move(tex)) {}
 
-    // A direction with the Lambertian density cos θ / π (book 3, chapter 8): random_cosine_direction() draws one
-    // around the z axis, and the orthonormal basis with w = normal turns the z axis into the normal. The first two
-    // books' normal + random_unit_vector() has the same density (a uniformly random point of the unit sphere that
-    // touches the surface at p), but it needs the rejection loop (1.9 tries of three random numbers on average),
-    // and the sum can be close to zero, which needed a guard. The inversion method takes two random numbers, and
-    // its direction has length 1, up to rounding.
-    std::optional<scatter_record> scatter(const ray& r_in, const hit_record& rec) const override
+    // The Lambertian density cos θ / π around the normal, as a pdf. The material no longer draws the direction
+    // (book 3, section 12.1): the camera draws it, from this pdf or, depending on its strategy, from another one.
+    std::optional<scatter_record> scatter(const ray& /*r_in*/, const hit_record& rec) const override
     {
-        const onb uvw{rec.normal};
-
-        // Unlike the book, we don't normalize the direction: it is already unit length, and cosine_density doesn't
-        // need it. The scattered ray exists at the same moment in time as the incoming one. Its density is
-        // scattering_pdf itself: the same function on the same values, so the camera's pScatter is the same number
-        // to the last bit.
-        const ray scattered{rec.p, uvw.transform(random_cosine_direction()), r_in.time};
-        return diffuse_scatter{tex_->value(rec.u, rec.v, rec.p), scattered, scattering_pdf(r_in, rec, scattered)};
+        return diffuse_scatter{tex_->value(rec.u, rec.v, rec.p), cosine_pdf{rec.normal}};
     }
 
     double scattering_pdf(const ray& /*r_in*/, const hit_record& rec, const ray& scattered) const override
@@ -143,10 +132,10 @@ public:
     explicit isotropic(const color& albedo) : isotropic(std::make_shared<solid_color>(albedo)) {}
     explicit isotropic(std::shared_ptr<const texture> tex) : tex_(std::move(tex)) {}
 
-    std::optional<scatter_record> scatter(const ray& r_in, const hit_record& rec) const override
+    // The same density in every direction, as a pdf: the camera draws the direction (book 3, section 12.1)
+    std::optional<scatter_record> scatter(const ray& /*r_in*/, const hit_record& rec) const override
     {
-        const ray scattered{rec.p, random_unit_vector(), r_in.time};
-        return diffuse_scatter{tex_->value(rec.u, rec.v, rec.p), scattered, uniform_sphere_density};
+        return diffuse_scatter{tex_->value(rec.u, rec.v, rec.p), sphere_pdf{}};
     }
 
     // In smoke the phase function (the volume's pScatter) is the same in every direction

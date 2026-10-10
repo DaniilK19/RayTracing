@@ -5,6 +5,7 @@ import std;
 import hittable;
 import image;
 import interval;
+import pdf;
 import random;
 import ray;
 import vec3;
@@ -35,7 +36,7 @@ export constexpr sky daylight_sky{.bottom = {1.0, 1.0, 1.0}, .top = {0.5, 0.7, 1
 export enum class sampling_strategy
 {
     uniform,  // the same density, 1/(4π), in every direction
-    material, // the direction the material drew, with p = pScatter
+    material, // with the material's own density, p = pScatter
     lights,   // toward a random point of a random lamp, with the lamps' density p
 };
 
@@ -301,36 +302,39 @@ private:
         const auto& diffuse = std::get<diffuse_scatter>(*scatter);
 
         // The light a diffuse bounce reflects is the integral over all directions ω of attenuation · pScatter(ω) ·
-        // (light coming from ω). One Monte Carlo sample of it: a direction drawn with some density p, integrand / p.
-        const auto sample = [&](const ray& scattered, double pdf) -> color {
+        // (light coming from ω). One Monte Carlo sample of it: a direction drawn from some pdf, integrand / p.
+        // The parameter type `const direction_pdf auto&` (C++20) makes the lambda a template: it is compiled
+        // separately for each pdf type it is called with below, and accepts only types that meet the concept.
+        const auto sample = [&](const direction_pdf auto& pdf) -> color {
+            const ray scattered{rec->p, pdf.generate(), r.time}; // keep the time: motion blur
+            const double pdf_value = pdf.value(scattered.direction);
             const double scattering_pdf = rec->mat->scattering_pdf(r, *rec, scattered);
 
             // A direction the material doesn't scatter into (below the surface) brings nothing: it isn't traced.
             // Written as !(x > 0), the test also catches NaN, for which every comparison is false.
-            if (!(pdf > 0) || !(scattering_pdf > 0))
+            if (!(pdf_value > 0) || !(scattering_pdf > 0))
             {
                 return color{0, 0, 0};
             }
             // The ratio first: when the direction was drawn with the material's own density, both are the same
             // number, the ratio is exactly 1.0, and the image is bit for bit the same as without the ratio.
-            return diffuse.attenuation * (scattering_pdf / pdf) *
+            return diffuse.attenuation * (scattering_pdf / pdf_value) *
                    ray_color(scattered, depth - 1, world, lights, strategy);
         };
 
         switch (strategy)
         {
         case sampling_strategy::uniform:
-            // Ignore the material's direction and draw one with the same density in every direction of the whole
-            // sphere (smoke scatters into all of it; for a surface the half below it brings nothing). Unbiased,
+            // Ignore the material's pdf and draw from the same density in every direction of the whole sphere
+            // (smoke scatters into all of it; for a surface the half below it brings nothing). Unbiased,
             // because we divide by the density the direction was really drawn with. The book (section 6.2)
             // divides the material's directions, drawn with cos θ / π, by 1/(2π) instead: each bounce then gets
             // the weight 2 cos θ, on average 4/3, and a white wall (albedo 0.73) acts like one of albedo 0.97:
             // not a noisier image, but a wrong, too bright one.
-            return emitted + sample(ray{rec->p, random_unit_vector(), r.time}, uniform_sphere_density);
+            return emitted + sample(sphere_pdf{});
         case sampling_strategy::material:
-            return emitted + sample(diffuse.scattered, diffuse.pdf);
+            return emitted + sample(diffuse.pdf);
         case sampling_strategy::lights:
-        {
             // Aim at a random point of a random lamp (book 3, chapter 9). Direct light gets much less noisy, but
             // the estimate is biased: importance sampling is unbiased only if p > 0 wherever the integrand isn't 0,
             // and p is 0 in every direction that misses the lamps. So only light arriving from the lamps'
@@ -338,9 +342,7 @@ private:
             // a lamp reflects. All other indirect light (from walls, ceiling, blocks) is lost, so shadows and the
             // Cornell box's ceiling go black, and so is the light of lamps missing from the list. Mixing this
             // density with the material's (chapter 10) will fix it.
-            const ray scattered{rec->p, lights.random(rec->p), r.time}; // keep the time: motion blur
-            return emitted + sample(scattered, lights.pdf_value(rec->p, scattered.direction));
-        }
+            return emitted + sample(hittable_pdf{lights, rec->p});
         }
         std::unreachable(); // C++23: tells the compiler this point is never reached (every case returns)
     }

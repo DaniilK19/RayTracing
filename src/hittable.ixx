@@ -1,9 +1,10 @@
-// Module hittable: everything a ray can hit, the hit record and the material interface.
+// Module hittable: everything a ray can hit, the hit record, the material interface and hittable_pdf.
 export module hittable;
 
 import std;
 import aabb;
 import interval;
+import pdf;
 import random;
 import ray;
 import vec3;
@@ -34,12 +35,12 @@ export struct hit_record
 };
 
 // A matte surface or a smoke particle scatters light into a whole range of directions, with a density given by
-// the material's scattering_pdf. The material draws one of them at random, but the camera may draw its own instead.
+// the material's scattering_pdf. The material doesn't choose one of them (book 3, section 12.1): it hands that
+// density to the camera as a pdf, and the camera's sampling strategy draws the direction, from it or another pdf.
 export struct diffuse_scatter
 {
     color attenuation; // fraction of light kept in each channel (R, G, B)
-    ray scattered;     // the new ray, in the direction the material drew
-    double pdf;        // the density (per steradian) that direction was drawn with
+    material_pdf pdf;  // scattering_pdf as a pdf: the same density, and a way to draw directions with it
 };
 
 // A mirror (blurred or not) or glass: the camera simply follows the ray the material chose, as in the first two
@@ -170,4 +171,20 @@ public:
 private:
     std::vector<std::unique_ptr<hittable>> objects_; // the list owns the objects
     aabb bbox_;                                      // box around all objects
+};
+
+// Directions toward objects, usually the lamps, as a pdf (book 3, section 10.2): seen from origin, its density is
+// the objects' pdf_value() and its directions are their random(). It lives here, not in the pdf module, because it
+// needs hittable, while hittable needs pdf (for diffuse_scatter), and two modules can't import each other.
+export class hittable_pdf
+{
+public:
+    inline hittable_pdf(const hittable& objects, const point3& origin) : objects_(objects), origin_(origin) {}
+
+    inline double value(const vec3& direction) const { return objects_.pdf_value(origin_, direction); }
+    inline vec3 generate() const { return objects_.random(origin_); }
+
+private:
+    const hittable& objects_; // a reference, not a copy: the camera makes a hittable_pdf for one bounce only
+    point3 origin_;
 };
