@@ -9,8 +9,6 @@ import random;
 import ray;
 import vec3;
 
-constexpr double degrees_to_radians(double degrees) { return degrees * std::numbers::pi / 180.0; }
-
 // The background is the light brought by a ray that hit nothing. The color changes smoothly with the height
 // of the ray direction: from bottom (the ray looks down) to top (up). Equal colors give a flat background.
 // The background is black by default: the scene is lit only by its own light sources.

@@ -5,6 +5,7 @@ import std;
 import camera;
 import hittable;
 import image;
+import instance;
 import material;
 import quad;
 import random;
@@ -254,6 +255,23 @@ void add_cornell_walls(hittable_list& world)
     world.add(std::make_unique<quad>(point3{0, 0, 555}, vec3{555, 0, 0}, vec3{0, 555, 0}, white));      // back
 }
 
+// The tall and short blocks of the Cornell box: a box at the origin, rotated around
+// the vertical and moved into place. The order matters: rotation is around the origin,
+// so we rotate first and translate second.
+std::unique_ptr<hittable> tall_block(std::shared_ptr<const material> mat)
+{
+    std::unique_ptr<hittable> block = box(point3{0, 0, 0}, point3{165, 330, 165}, std::move(mat));
+    block = std::make_unique<rotate_y>(std::move(block), 15);
+    return std::make_unique<translate>(std::move(block), vec3{265, 0, 295});
+}
+
+std::unique_ptr<hittable> short_block(std::shared_ptr<const material> mat)
+{
+    std::unique_ptr<hittable> block = box(point3{0, 0, 0}, point3{165, 165, 165}, std::move(mat));
+    block = std::make_unique<rotate_y>(std::move(block), -18);
+    return std::make_unique<translate>(std::move(block), vec3{130, 0, 65});
+}
+
 constexpr camera_settings cornell_camera{
     .aspect_ratio = 1.0,
     .image_width = 1080,
@@ -265,13 +283,17 @@ constexpr camera_settings cornell_camera{
     .vup = {0, 1, 0},
 };
 
-// Book 2, chapter 7: an empty Cornell box
+// Book 2, chapters 7–8: the Cornell box with two blocks
 scene cornell()
 {
     hittable_list world;
     add_cornell_walls(world);
     const auto light = std::make_shared<diffuse_light>(color{15, 15, 15});
     world.add(std::make_unique<quad>(point3{343, 554, 332}, vec3{-130, 0, 0}, vec3{0, 0, -105}, light));
+
+    const auto white = std::make_shared<lambertian>(color{0.73, 0.73, 0.73});
+    world.add(tall_block(white));
+    world.add(short_block(white));
     return {std::move(world), cornell_camera};
 }
 

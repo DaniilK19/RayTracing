@@ -67,6 +67,12 @@ private:
     }
 };
 
+// The box shifted by offset
+export constexpr aabb operator+(const aabb& box, const vec3& offset)
+{
+    return {box.x + offset.x, box.y + offset.y, box.z + offset.z};
+}
+
 // The smallest box containing both given ones
 export constexpr aabb enclose(const aabb& a, const aabb& b)
 {

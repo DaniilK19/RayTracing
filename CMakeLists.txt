@@ -50,6 +50,7 @@ target_sources(RayTracing PRIVATE
         src/camera.ixx
         src/hittable.ixx
         src/image.ixx
+        src/instance.ixx
         src/interval.ixx
         src/material.ixx
         src/perlin.ixx

@@ -77,3 +77,25 @@ private:
     vec3 w_;      // n / |n|², where n = u × v: needed to find α and β
     aabb bbox_;
 };
+
+// A box (rectangular cuboid) with opposite corners a and b: six quadrilateral faces.
+// The sides of each face are chosen so that the normal u × v points out of the box.
+export std::unique_ptr<hittable> box(const point3& a, const point3& b, std::shared_ptr<const material> mat)
+{
+    // Corners with the smallest and the largest coordinates
+    const point3 min{std::fmin(a.x, b.x), std::fmin(a.y, b.y), std::fmin(a.z, b.z)};
+    const point3 max{std::fmax(a.x, b.x), std::fmax(a.y, b.y), std::fmax(a.z, b.z)};
+
+    const vec3 dx{max.x - min.x, 0, 0};
+    const vec3 dy{0, max.y - min.y, 0};
+    const vec3 dz{0, 0, max.z - min.z};
+
+    auto sides = std::make_unique<hittable_list>();
+    sides->add(std::make_unique<quad>(point3{min.x, min.y, max.z}, dx, dy, mat));  // front (z = max)
+    sides->add(std::make_unique<quad>(point3{max.x, min.y, max.z}, -dz, dy, mat)); // right (x = max)
+    sides->add(std::make_unique<quad>(point3{max.x, min.y, min.z}, -dx, dy, mat)); // back (z = min)
+    sides->add(std::make_unique<quad>(point3{min.x, min.y, min.z}, dz, dy, mat));  // left (x = min)
+    sides->add(std::make_unique<quad>(point3{min.x, max.y, max.z}, dx, -dz, mat)); // top (y = max)
+    sides->add(std::make_unique<quad>(point3{min.x, min.y, min.z}, dx, dz, mat));  // bottom (y = min)
+    return sides;
+}

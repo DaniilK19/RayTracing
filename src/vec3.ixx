@@ -74,6 +74,9 @@ export constexpr vec3 cross(const vec3& u, const vec3& v)
 
 export inline vec3 unit_vector(const vec3& v) { return v / v.length(); }
 
+// Degrees → radians: people think in degrees, while std::sin, std::cos and std::tan expect radians.
+export constexpr double degrees_to_radians(double degrees) { return degrees * std::numbers::pi / 180.0; }
+
 // Random point inside the unit disk in the z = 0 plane (also by rejection).
 export inline vec3 random_in_unit_disk()
 {

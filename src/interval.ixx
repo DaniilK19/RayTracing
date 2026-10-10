@@ -23,6 +23,12 @@ export struct interval
     }
 };
 
+// The interval shifted by displacement
+export constexpr interval operator+(const interval& ival, double displacement)
+{
+    return {ival.min + displacement, ival.max + displacement};
+}
+
 // The smallest interval containing both given ones
 export constexpr interval enclose(const interval& a, const interval& b)
 {
