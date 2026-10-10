@@ -170,7 +170,7 @@ int main(int argc, char* argv[])
     const std::unique_ptr<hittable> world = build_bvh(std::move(s.world));
     const camera cam(s.camera);
 
-    // The strategy the camera will really use: lights falls back to material in a scene without lights.
+    // The strategy the camera will really use: lights and mixture fall back to material in a scene without lights.
     // Every sampling_strategy has an entry in sampling_list (see camera.ixx), so find will find it.
     const sampling_strategy sampling = effective_sampling(s.camera.sampling, s.lights);
     const auto entry = std::ranges::find(sampling_list, sampling, &sampling_entry::strategy);

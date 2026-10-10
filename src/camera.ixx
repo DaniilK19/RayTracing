@@ -32,12 +32,13 @@ export constexpr sky daylight_sky{.bottom = {1.0, 1.0, 1.0}, .top = {0.5, 0.7, 1
 // How the camera chooses the next direction after a diffuse bounce (a matte surface or smoke): with what
 // density p. Any p that is above 0 wherever the material scatters light gives an unbiased estimate of the same
 // image (book 3, chapter 6), only with more or less noise: the more closely p follows pScatter · (incoming
-// light), the less noise. lights breaks that rule and is biased (see ray_color).
+// light), the less noise. lights breaks that rule and is biased; mixture keeps it (see ray_color).
 export enum class sampling_strategy
 {
     uniform,  // the same density, 1/(4π), in every direction
     material, // with the material's own density, p = pScatter
     lights,   // toward a random point of a random lamp, with the lamps' density p
+    mixture,  // half of the time as material, half as lights: p is the average of the two densities
 };
 
 // The strategies for the command line: a name, the value and a description for the help. Every strategy must have
@@ -54,13 +55,15 @@ export constexpr std::array sampling_list{
     sampling_entry{"material", sampling_strategy::material, "as the surface scatters: the first two books' behavior"},
     sampling_entry{"lights", sampling_strategy::lights,
                    "aims only at the lamps: low-noise direct light, but biased: indirect light is lost"},
+    sampling_entry{"mixture", sampling_strategy::mixture, "half material, half lamps: low noise and unbiased"},
 };
 
-// The strategy the camera really renders with. lights needs lamps to aim at: a scene without them, like those lit
-// by the sky, is sampled as the material scatters.
+// The strategy the camera really renders with. lights and mixture need lamps to aim at: a scene without them, like
+// those lit by the sky, is sampled as the material scatters.
 export inline sampling_strategy effective_sampling(sampling_strategy requested, const hittable_list& lights)
 {
-    return requested == sampling_strategy::lights && lights.empty() ? sampling_strategy::material : requested;
+    const bool aims_at_lamps = requested == sampling_strategy::lights || requested == sampling_strategy::mixture;
+    return aims_at_lamps && lights.empty() ? sampling_strategy::material : requested;
 }
 
 // Camera settings. They are convenient to set with designated initializers (C++20):
@@ -74,7 +77,7 @@ export struct camera_settings
     int max_depth = 10;         // how many times a ray may bounce before we give up on it
 
     // How a diffuse bounce chooses the next direction
-    sampling_strategy sampling = sampling_strategy::material;
+    sampling_strategy sampling = sampling_strategy::mixture;
 
     double vfov = 90;         // vertical field of view in degrees: a smaller angle means a stronger "zoom"
     point3 lookfrom{0, 0, 0}; // where the camera stands
@@ -139,7 +142,8 @@ public:
     }
 
     // Render: for each pixel average the colors of several rays and write the result into the image.
-    // Rows are computed in parallel on all CPU threads. lights are the objects the lights strategy aims at.
+    // Rows are computed in parallel on all CPU threads. lights are the objects the lights and mixture strategies
+    // aim at.
     image render(const hittable& world, const hittable_list& lights) const
     {
         const sampling_strategy strategy = effective_sampling(sampling_, lights);
@@ -340,9 +344,16 @@ private:
             // and p is 0 in every direction that misses the lamps. So only light arriving from the lamps'
             // directions counts: all of the direct light, plus what an object standing between the point and
             // a lamp reflects. All other indirect light (from walls, ceiling, blocks) is lost, so shadows and the
-            // Cornell box's ceiling go black, and so is the light of lamps missing from the list. Mixing this
-            // density with the material's (chapter 10) will fix it.
+            // Cornell box's ceiling go black, and so is the light of lamps missing from the list. The mixture
+            // below fixes this.
             return emitted + sample(hittable_pdf{lights, rec->p});
+        case sampling_strategy::mixture:
+            // Half of the directions toward the lamps, half as the material scatters (book 3, section 10.3). The
+            // lamps' half makes their direct light much less noisy, and nothing is lost: wherever the material
+            // scatters, p is at least half of pScatter, so p > 0 there (unbiased), and the weight pScatter / p is
+            // never more than 2. Light that only the material's half finds (from a lamp missing from the list, or
+            // a lamp seen in a mirror) is drawn half as often, with twice the weight: it gets noisier.
+            return emitted + sample(mixture_pdf{hittable_pdf{lights, rec->p}, diffuse.pdf});
         }
         std::unreachable(); // C++23: tells the compiler this point is never reached (every case returns)
     }

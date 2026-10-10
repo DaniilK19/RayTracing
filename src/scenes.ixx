@@ -21,7 +21,7 @@ export struct scene
     hittable_list world;
     camera_settings camera;
 
-    // What the lights sampling strategy aims at (book 3, chapter 9): a copy of each lamp's shape, without
+    // What the lights and mixture strategies aim at (book 3, chapter 9): a copy of each lamp's shape, without
     // a material, as only its pdf_value and random are used. If the copy drifted away from the lamp, rays would be
     // aimed where no light comes from, with no error anywhere. So each scene builds both from one function that
     // takes the material: the glowing one for world, nullptr for lights.
@@ -416,7 +416,7 @@ scene final_scene()
             {
                 .aspect_ratio = 1.0,
                 .image_width = 1080,
-                .samples_per_pixel = 1000, // ~5 minutes on all cores; the book uses 10,000 at 800×800
+                .samples_per_pixel = 1000, // ~3.5 minutes on all cores; the book uses 10,000 at 800×800
                 .max_depth = 40,
                 .vfov = 40,
                 .lookfrom = {478, 278, -600},
@@ -424,6 +424,24 @@ scene final_scene()
                 .vup = {0, 1, 0},
             },
             std::move(lights)};
+}
+
+// Book 3, section 12.2: the Cornell box, but the tall block is polished aluminum, a perfect mirror (fuzz 0). The
+// camera follows a mirror's ray as before (the law of reflection fixes its direction), and lamp sampling aims at the
+// lamp itself, not at its image in the mirror. So the lamp's light that the block's top reflects onto the ceiling is
+// found only by the ceiling's samples that happen to hit the mirror: that bright patch stays noisy, as in the book.
+scene aluminum()
+{
+    hittable_list world;
+    add_cornell_walls(world);
+    world.add(cornell_lamp(std::make_shared<diffuse_light>(color{15, 15, 15})));
+
+    world.add(tall_block(std::make_shared<metal>(color{0.8, 0.85, 0.88}, 0.0)));
+    world.add(short_block(std::make_shared<lambertian>(color{0.73, 0.73, 0.73})));
+
+    hittable_list lights;
+    lights.add(cornell_lamp(nullptr));
+    return {std::move(world), cornell_camera, std::move(lights)};
 }
 
 // All scenes, in the order they appear in the books.
@@ -438,6 +456,7 @@ export constexpr std::array scene_list{
     scene_entry{"cornell", "the Cornell box, a classic scene for testing lighting", cornell},
     scene_entry{"smoke", "the Cornell box with blocks of black and white smoke", smoke},
     scene_entry{"final", "the second book's final scene: everything together", final_scene},
+    scene_entry{"aluminum", "the Cornell box with a tall block of polished aluminum", aluminum},
 };
 
 export constexpr std::string_view default_scene = "final";
