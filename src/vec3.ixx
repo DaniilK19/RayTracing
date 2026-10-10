@@ -37,13 +37,6 @@ export struct vec3
     constexpr double length_squared() const { return x * x + y * y + z * z; }
     inline double length() const { return std::sqrt(length_squared()); }
 
-    // Is the vector close to zero in all coordinates?
-    inline bool near_zero() const
-    {
-        constexpr double s = 1e-8;
-        return std::fabs(x) < s && std::fabs(y) < s && std::fabs(z) < s;
-    }
-
     // Vector with random components in [0, 1) or in [min, max)
     inline static vec3 random() { return {random_double(), random_double(), random_double()}; }
     inline static vec3 random(double min, double max)

@@ -55,6 +55,7 @@ target_sources(raytracer PUBLIC  # PUBLIC: programs that link the library can `i
         src/instance.ixx
         src/interval.ixx
         src/material.ixx
+        src/onb.ixx
         src/perlin.ixx
         src/quad.ixx
         src/random.ixx

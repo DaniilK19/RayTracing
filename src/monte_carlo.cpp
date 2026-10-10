@@ -599,7 +599,7 @@ struct direction_sampler
 
 // The book's listing 16: random_unit_vector() and p = 1/(4π), the density of the directions it returns, named
 // uniform_sphere_density in vec3. (The ray tracer's isotropic scatters along them as they are, with this density;
-// lambertian adds one to the normal, and the sum has another density, cos θ/π, as chapter 5 shows.)
+// adding one to the normal gives another density, cos θ/π, which the first two books' lambertian used.)
 // By Archimedes' hat-box theorem the zone of the unit sphere between the planes z = a and z = b has the area
 // 2π(b - a), like that of the cylinder around the sphere, so the z of a uniform direction is uniform in [-1, 1].
 // A sample is f/p = 4π·z². E[z²] = 1/3 gives the mean 4π/3 once more, and E[z⁴] = 1/5 the variance

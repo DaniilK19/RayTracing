@@ -3,6 +3,7 @@ export module material;
 
 import std;
 import hittable;
+import onb;
 import random;
 import ray;
 import texture;
@@ -15,23 +16,21 @@ public:
     explicit lambertian(const color& albedo) : lambertian(std::make_shared<solid_color>(albedo)) {}
     explicit lambertian(std::shared_ptr<const texture> tex) : tex_(std::move(tex)) {}
 
-    // normal + random_unit_vector() is a uniformly random point of the unit sphere that touches the surface at p:
-    // its directions already have the Lambertian density. Seen from p, a patch dA of that sphere is 2 cos θ away and
-    // tilted by θ, so it covers the solid angle dω = dA · cos θ / (2 cos θ)² = dA / (4 cos θ): the points have
-    // the density 1/(4π) per unit of area, so the directions have 4 cos θ / (4π) = cos θ / π per steradian.
+    // A direction with the Lambertian density cos θ / π (book 3, chapter 8): random_cosine_direction() draws one
+    // around the z axis, and the orthonormal basis with w = normal turns the z axis into the normal. The first two
+    // books' normal + random_unit_vector() has the same density (a uniformly random point of the unit sphere that
+    // touches the surface at p), but it needs the rejection loop (1.9 tries of three random numbers on average),
+    // and the sum can be close to zero, which needed a guard. The inversion method takes two random numbers, and
+    // its direction has length 1, up to rounding.
     std::optional<scatter_record> scatter(const ray& r_in, const hit_record& rec) const override
     {
-        vec3 direction = rec.normal + random_unit_vector();
+        const onb uvw{rec.normal};
 
-        // If the random vector is almost opposite to the normal, the sum is close to zero: that would give
-        // a degenerate ray, then division by zero and NaN. In that case just reflect along the normal.
-        if (direction.near_zero())
-        {
-            direction = rec.normal;
-        }
-        // The scattered ray exists at the same moment in time as the incoming one. Its density is scattering_pdf
-        // itself: the same function on the same values, so the camera's pScatter is the same number to the last bit.
-        const ray scattered{rec.p, direction, r_in.time};
+        // Unlike the book, we don't normalize the direction: it is already unit length, and cosine_density doesn't
+        // need it. The scattered ray exists at the same moment in time as the incoming one. Its density is
+        // scattering_pdf itself: the same function on the same values, so the camera's pScatter is the same number
+        // to the last bit.
+        const ray scattered{rec.p, uvw.transform(random_cosine_direction()), r_in.time};
         return diffuse_scatter{tex_->value(rec.u, rec.v, rec.p), scattered, scattering_pdf(r_in, rec, scattered)};
     }
 
