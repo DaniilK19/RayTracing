@@ -4,6 +4,7 @@ export module texture;
 import std;
 import image;
 import interval;
+import perlin;
 import vec3;
 
 // A texture answers the question "what color is the surface at this point". The point can be given
@@ -86,4 +87,22 @@ public:
 
 private:
     image image_; // its colors are already linear: image::load converted them from sRGB
+};
+
+// Marble from Perlin noise: a sine wave along the z axis gives even stripes, and turbulence
+// bends them into veins. scale is the frequency: the larger it is, the narrower the stripes.
+export class noise_texture : public texture
+{
+public:
+    explicit noise_texture(double scale) : scale_(scale) {}
+
+    color value(double, double, const point3& p) const override
+    {
+        // sin is from -1 to 1, so 1 + sin is from 0 to 2, and with the 0.5 factor the brightness is from 0 to 1
+        return color{0.5, 0.5, 0.5} * (1 + std::sin(scale_ * p.z + 10 * noise_.turbulence(p, 7)));
+    }
+
+private:
+    perlin noise_;
+    double scale_;
 };

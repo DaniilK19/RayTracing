@@ -52,6 +52,7 @@ target_sources(RayTracing PRIVATE
         src/image.ixx
         src/interval.ixx
         src/material.ixx
+        src/perlin.ixx
         src/random.ixx
         src/ray.ixx
         src/scenes.ixx

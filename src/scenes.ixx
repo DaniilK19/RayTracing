@@ -168,12 +168,26 @@ scene earth()
     return {std::move(world), camera};
 }
 
+// Book 2, chapter 5: marble spheres, a texture made of Perlin noise.
+scene perlin_spheres()
+{
+    hittable_list world;
+    const auto marble = std::make_shared<lambertian>(std::make_shared<noise_texture>(4));
+    world.add(std::make_unique<sphere>(point3{0, -1000, 0}, 1000, marble));
+    world.add(std::make_unique<sphere>(point3{0, 2, 0}, 2, marble));
+
+    camera_settings camera = cover_camera;
+    camera.defocus_angle = 0;
+    return {std::move(world), camera};
+}
+
 // All scenes, in the order they appear in the books.
 export constexpr std::array scene_list{
     scene_entry{"weekend", "the first book's cover: spheres of three materials", weekend},
     scene_entry{"bouncing", "the same, but the matte spheres bounce: motion blur", bouncing},
     scene_entry{"checker", "two spheres with a solid checker texture", checker},
     scene_entry{"earth", "the Earth: an image wrapped around a sphere", earth},
+    scene_entry{"perlin", "marble spheres made of Perlin noise", perlin_spheres},
 };
 
 export constexpr std::string_view default_scene = "weekend";
