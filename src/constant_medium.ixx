@@ -68,7 +68,8 @@ public:
         hit_record rec;
         rec.t = t_in + hit_distance / ray_length;
         rec.p = r.at(rec.t);
-        rec.normal = vec3{1, 0, 0}; // a particle has no surface: the normal and the side don't matter, any values will do
+        // A particle has no surface: the normal and the side don't matter, any values will do
+        rec.normal = vec3{1, 0, 0};
         rec.front_face = true;
         rec.mat = phase_function_.get();
         return rec;

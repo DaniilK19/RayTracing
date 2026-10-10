@@ -87,7 +87,8 @@ export class hittable
 public:
     virtual ~hittable() = default;
 
-    // The nearest hit with parameter t strictly inside ray_t, or std::nullopt on a miss.
+    // The nearest hit with parameter t in ray_t (a sphere excludes its ends, a quad includes them),
+    // or std::nullopt on a miss.
     virtual std::optional<hit_record> hit(const ray& r, interval ray_t) const = 0;
 
     // A box that fully contains the object (for the BVH)

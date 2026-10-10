@@ -47,8 +47,8 @@ public:
 
     color value(double u, double v, const point3& p) const override
     {
-        // Cube index along each axis. It has to be floor, not static_cast<int>(...) right away: the cast
-        // drops the fractional part and would give 0 instead of -1 for -0.5, so the square at zero would be twice as wide.
+        // Cube index along each axis. It has to be floor, not static_cast<int>(...) right away: the cast drops
+        // the fractional part and would give 0 instead of -1 for -0.5, so the square at zero would be twice as wide.
         const int x = static_cast<int>(std::floor(inv_scale_ * p.x));
         const int y = static_cast<int>(std::floor(inv_scale_ * p.y));
         const int z = static_cast<int>(std::floor(inv_scale_ * p.z));

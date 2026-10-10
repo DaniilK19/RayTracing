@@ -6,9 +6,9 @@ import onb;
 import random;
 import vec3;
 
-// Densities of directions (book 3, chapters 4 and 5), used by the pdfs below, by the materials' scattering_pdf and
-// by MonteCarlo. A density of directions is per steradian (unit of solid angle): it integrates to 1 over the whole
-// sphere.
+// Densities of directions (book 3, chapters 4 and 5), used by the pdfs below, by the materials' scattering_pdf, by a
+// sphere lamp seen from inside and by MonteCarlo. A density of directions is per steradian (unit of solid angle): it
+// integrates to 1 over the whole sphere.
 
 // The density of random_unit_vector(): the same in every direction, 1 / (area of the unit sphere).
 export constexpr double uniform_sphere_density = 1 / (4 * std::numbers::pi);

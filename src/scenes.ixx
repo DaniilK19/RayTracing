@@ -52,7 +52,8 @@ std::filesystem::path find_asset(std::string_view name)
         }
         if (dir == dir.parent_path())
         {
-            return std::filesystem::path("assets") / name; // reached the drive root: the loading code will report the failure
+            // Reached the drive root: the loading code will report the failure
+            return std::filesystem::path("assets") / name;
         }
     }
 }
@@ -303,7 +304,7 @@ std::unique_ptr<hittable> cornell_lamp(std::shared_ptr<const material> mat)
 constexpr camera_settings cornell_camera{
     .aspect_ratio = 1.0,
     .image_width = 1080,
-    .samples_per_pixel = 1000, // a closed room with a small lamp is very noisy: more rays are needed
+    .samples_per_pixel = 1000, // a small lamp in a closed room: noisy unless rays are aimed at it (the default)
     .max_depth = 50,
     .vfov = 40,
     .lookfrom = {278, 278, -800},

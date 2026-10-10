@@ -10,8 +10,8 @@ import vec3;
 //   1. Every node of the integer lattice holds a random unit vector, the gradient.
 //   2. Point p lies in a lattice cube. Each of the cube's 8 corners contributes dot(gradient, p − corner):
 //      the noise grows in the gradient's direction and is zero at the nodes themselves.
-//   3. The contributions are blended by trilinear interpolation. The weights are smoothed by the Hermite curve 3t² − 2t³:
-//      with plain linear interpolation the grid would be visible at the cube boundaries.
+//   3. The contributions are blended by trilinear interpolation. The weights are smoothed by the Hermite curve
+//      3t² − 2t³: with plain linear interpolation the grid would be visible at the cube boundaries.
 // Storing a vector for every node of an infinite lattice is impossible, so there are only 256 vectors, and the vector
 // of node (i, j, k) is chosen via three random permutations of 0..255: perm_x[i] ^ perm_y[j] ^ perm_z[k].
 export class perlin

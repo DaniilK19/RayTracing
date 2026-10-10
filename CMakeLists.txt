@@ -30,7 +30,9 @@ add_compile_options(/utf-8 /Zc:__cplusplus /Zc:preprocessor)
 # cl.exe lives in <MSVC>/bin/Hostx64/x64/, module sources in <MSVC>/modules/.
 cmake_path(SET MSVC_MODULES_DIR NORMALIZE "${CMAKE_CXX_COMPILER}/../../../../modules")
 if(NOT EXISTS "${MSVC_MODULES_DIR}/std.ixx")
-    message(FATAL_ERROR "${MSVC_MODULES_DIR}/std.ixx not found: check the MSVC installation in the Visual Studio Installer.")
+    # message() joins its strings without a separator: one message on two lines of code
+    message(FATAL_ERROR "${MSVC_MODULES_DIR}/std.ixx not found: "
+                        "check the MSVC installation in the Visual Studio Installer.")
 endif()
 
 add_library(std_module STATIC)
@@ -41,8 +43,9 @@ target_sources(std_module PUBLIC
 
 # --- Ray tracer library ------------------------------------------------------
 # Two programs use the ray tracer's modules: RayTracing renders the scenes, and MonteCarlo runs
-# the third book's numerical experiments with the ray tracer's own random numbers. So the modules
-# are compiled once into a static library, and both programs link it.
+# the third book's numerical experiments with the ray tracer's own random numbers, directions and
+# densities, and tests its light sampling (light-pdfs). So the modules are compiled once into
+# a static library, and both programs link it.
 add_library(raytracer STATIC)
 target_sources(raytracer PUBLIC  # PUBLIC: programs that link the library can `import` its modules
     FILE_SET CXX_MODULES FILES   # our modules: files with `export module ...`

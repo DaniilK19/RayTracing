@@ -4,6 +4,7 @@ import camera;
 import hittable;
 import image;
 import scenes;
+import vec3; // color, below. image imports vec3 too, but an import is not passed on (only `export import` is)
 
 // Command-line options. Each scene sets its own width and number of rays;
 // std::optional tells "not given: take it from the scene" apart from any given value.
@@ -155,8 +156,8 @@ int main(int argc, char* argv[])
     }
 
 #ifndef NDEBUG // NDEBUG is defined in Release and RelWithDebInfo
-    std::println("This is a Debug build: rendering is about 8 times slower than in Release.\n"
-                 "For a final image choose the x64 Release preset; for a quick draft add -s 10.");
+    std::println("This is a Debug build: rendering is about 10 times slower than in Release.\n"
+                 "For a final image choose the x64 Release preset; for a quick draft add -s 16.");
 #endif
 
     // The scene name was already checked in parse_options, so find_scene will find it

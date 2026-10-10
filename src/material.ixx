@@ -9,7 +9,7 @@ import ray;
 import texture;
 import vec3;
 
-// Matte (diffuse) surface: scatters light in all directions, more often close to the normal.
+// Matte (diffuse) surface: scatters light into all directions above the surface, more often close to the normal.
 export class lambertian : public material
 {
 public:
@@ -101,8 +101,10 @@ private:
 };
 
 // Glowing surface: a light source. It emits light but reflects nothing.
-// Brightness can exceed 1: a lamp shines brighter than a white wall reflects. A small lamp
-// must be very bright to light a room: only a small fraction of the scattered rays reach it.
+// Brightness can exceed 1: a lamp shines brighter than a white wall reflects. A small lamp must be very bright to
+// light a room: seen from a point in the room, it covers only a small part of the directions light can come from.
+// (Aiming more rays at it, as the lights and mixture strategies do, changes the noise, not the brightness: each
+// such ray gets the small weight pScatter / p.)
 // It glows on the front side only, the side its outward normal points to (for a quad, u × v): a ceiling lamp
 // shines down into the room. Glowing on both sides, as in the second book, the Cornell box's lamp also lit the
 // ceiling 1 unit above it very brightly, and the rare paths that found that gap spread its light as fireflies

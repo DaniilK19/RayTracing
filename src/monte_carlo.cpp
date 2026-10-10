@@ -278,9 +278,10 @@ void stratified()
 // The mean of random samples y, with its standard error. For π a sample was 4 or 0, so σ followed from p = π/4.
 // Usually σ is unknown: σ² = E[y²] - E[y]², and E[y²] is another integral, as hard as the one we estimate. But the
 // same samples estimate it too, as the mean of their squares. (Two remarks for the curious. The subtraction loses
-// digits when σ is tiny next to the mean; Welford's algorithm avoids that, but the σ we estimate here are about as
-// large as the means. And this σ² comes out (N - 1)/N times too small on average, which dividing by N - 1 instead
-// of N would fix; at the N = 10⁴ and 10⁶ where we use it, that is negligible.)
+// digits when σ is tiny next to the mean; Welford's algorithm avoids that. The σ we estimate are about as large as
+// the means, except in light-pdfs, where every sample of check (b) for a sphere is the same number: σ is 0 there, and
+// the SE printed is only this rounding. And this σ² comes out (N - 1)/N times too small on average, which dividing
+// by N - 1 instead of N would fix; at the N = 10⁴ to 4·10⁶ where we use it, that is negligible.)
 class sample_mean
 {
 public:
@@ -1059,7 +1060,7 @@ int main(int argc, char* argv[])
     }
 
 #ifndef NDEBUG // NDEBUG is defined in Release and RelWithDebInfo
-    std::println("This is a Debug build: the experiments run about 10 times slower than in Release.\n");
+    std::println("This is a Debug build: the experiments run several times slower than in Release.\n");
 #endif
 
     if (chosen.empty())

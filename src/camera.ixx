@@ -26,7 +26,8 @@ export struct sky
 };
 
 // The daylight sky from the first book: white at the horizon, blue at the zenith. The second book uses
-// a flat blue background (0.7, 0.8, 1.0) instead, but the gradient is prettier and keeps the first book's scenes unchanged.
+// a flat blue background (0.7, 0.8, 1.0) instead, but the gradient is prettier and keeps the first book's scenes
+// unchanged.
 export constexpr sky daylight_sky{.bottom = {1.0, 1.0, 1.0}, .top = {0.5, 0.7, 1.0}};
 
 // How the camera chooses the next direction after a diffuse bounce (a matte surface or smoke): with what
@@ -296,7 +297,8 @@ private:
         const auto rec = world.hit(r, interval{0.001, infinity});
         if (!rec)
         {
-            return background_.in_direction(r.direction); // the ray went off to infinity and brought back the background color
+            // The ray went off to infinity and brought back the background color
+            return background_.in_direction(r.direction);
         }
 
         // The light from the hit point is the light the surface emits by itself plus the reflected light.
@@ -327,7 +329,8 @@ private:
             const double scattering_pdf = rec->mat->scattering_pdf(r, *rec, scattered);
 
             // A direction the material doesn't scatter into (below the surface) brings nothing: it isn't traced.
-            // Written as !(x > 0), the test also catches NaN, for which every comparison is false.
+            // Written as !(x > 0) rather than x <= 0, the test also catches NaN: <, <=, >, >= and == with a NaN
+            // are all false (only != is true), so x <= 0 would let a NaN through.
             if (!(pdf_value > 0) || !(scattering_pdf > 0))
             {
                 return color{0, 0, 0};
@@ -365,6 +368,9 @@ private:
             // scatters, p is at least half of pScatter, so p > 0 there (unbiased), and the weight pScatter / p is
             // never more than 2. Light that only the material's half finds (from a lamp missing from the list, or
             // a lamp seen in a mirror) is drawn half as often, with twice the weight: it gets noisier.
+            // The weights of a path's bounces multiply. In the white smoke of the smoke scene, which scatters
+            // light again and again without absorbing any, a few paths collect several weights near 2 in a row:
+            // there the error, about as large as with material, comes as rare bright specks instead of even grain.
             return emitted + sample(mixture_pdf{hittable_pdf{lights, rec->p}, diffuse.pdf});
         }
         std::unreachable(); // C++23: tells the compiler this point is never reached (every case returns)

@@ -44,7 +44,8 @@ public:
 
     // Loads an image from a file: JPEG, PNG and other formats stb_image understands.
     // Files store colors in gamma space (sRGB), while the tracer works in linear space.
-    // stbi_loadf converts them to linear right away by raising them to the power 2.2, the inverse of linear_to_gamma.
+    // stbi_loadf converts them to linear right away by raising them to the power 2.2 (stb's default), roughly
+    // the inverse of linear_to_gamma, which uses gamma 2.
     static std::expected<image, std::string> load(const std::filesystem::path& path)
     {
         std::ifstream file(path, std::ios::binary);
