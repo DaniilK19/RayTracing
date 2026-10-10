@@ -36,6 +36,16 @@ public:
 
     aabb bounding_box() const override { return bbox_; }
 
+    // Light sampling (book 3, chapter 9) the same way: move the origin back. Directions don't change, and neither
+    // do the solid angles they cover, so the density and the drawn direction are the original object's. (Beyond
+    // the book, whose instances keep hittable's defaults and can't be lights.)
+    double pdf_value(const point3& origin, const vec3& direction) const override
+    {
+        return object_->pdf_value(origin - offset_, direction);
+    }
+
+    vec3 random(const point3& origin) const override { return object_->random(origin - offset_); }
+
 private:
     std::unique_ptr<hittable> object_;
     vec3 offset_;
@@ -81,6 +91,15 @@ public:
     }
 
     aabb bounding_box() const override { return bbox_; }
+
+    // Light sampling: turn the origin and the direction into the object's coordinates, and the drawn direction
+    // back into the world's. A rotation keeps all angles, so solid angles, and densities per steradian, stay the same.
+    double pdf_value(const point3& origin, const vec3& direction) const override
+    {
+        return object_->pdf_value(to_object(origin), to_object(direction));
+    }
+
+    vec3 random(const point3& origin) const override { return to_world(object_->random(to_object(origin))); }
 
 private:
     std::unique_ptr<hittable> object_;

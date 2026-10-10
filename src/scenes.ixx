@@ -21,10 +21,10 @@ export struct scene
     hittable_list world;
     camera_settings camera;
 
-    // What the lights and mixture strategies aim at (book 3, chapter 9): a copy of each lamp's shape, without
-    // a material, as only its pdf_value and random are used. If the copy drifted away from the lamp, rays would be
-    // aimed where no light comes from, with no error anywhere. So each scene builds both from one function that
-    // takes the material: the glowing one for world, nullptr for lights.
+    // What the lights and mixture strategies aim at (book 3, chapter 9): a copy of each lamp's shape (or of another
+    // object worth aiming at, see glass), without a material, as only its pdf_value and random are used. If the copy
+    // drifted away from the original, rays would be aimed where no light comes from, with no error anywhere. So each
+    // scene builds both from one function that takes the material: the real one for world, nullptr for lights.
     // It comes last, so scenes lit by the sky can leave it out: return {std::move(world), camera}.
     hittable_list lights;
 };
@@ -231,17 +231,20 @@ scene simple_light()
     world.add(std::make_unique<sphere>(point3{0, -1000, 0}, 1000, marble));
     world.add(std::make_unique<sphere>(point3{0, 2, 0}, 2, marble));
 
-    const auto light = std::make_shared<diffuse_light>(color{4, 4, 4});
-    world.add(std::make_unique<sphere>(point3{0, 7, 0}, 2, light));
-    // The quad lamp faces +z. A lambda builds it for world and for lights (see scene::lights).
+    // Lambdas build the two lamps for world and for lights (see scene::lights). The quad lamp faces +z.
+    const auto sphere_lamp = [](std::shared_ptr<const material> mat) {
+        return std::make_unique<sphere>(point3{0, 7, 0}, 2, std::move(mat));
+    };
     const auto quad_lamp = [](std::shared_ptr<const material> mat) {
         return std::make_unique<quad>(point3{3, 1, -2}, vec3{2, 0, 0}, vec3{0, 2, 0}, std::move(mat));
     };
+    const auto light = std::make_shared<diffuse_light>(color{4, 4, 4});
+    world.add(sphere_lamp(light));
     world.add(quad_lamp(light));
 
-    // Only the quad so far: a sphere can't be aimed at yet
     hittable_list lights;
     lights.add(quad_lamp(nullptr));
+    lights.add(sphere_lamp(nullptr)); // a sphere can be aimed at since book 3, sections 12.3–12.4
 
     return {std::move(world),
             {
@@ -444,6 +447,31 @@ scene aluminum()
     return {std::move(world), cornell_camera, std::move(lights)};
 }
 
+// Book 3, sections 12.3–12.5, the book's last image: the Cornell box with a glass sphere instead of the short block.
+// The sphere gathers the lamp's light into a bright spot on the floor, a caustic. It is in the list of lights too,
+// although it doesn't glow: the list is what the mixture strategy aims at. Lamp light that reaches a surface by way
+// of the sphere is found only by rays that happen to enter it; with a quarter of the rays aimed at it, rare bright
+// dots (fireflies) turn into even grain. The price: rays aimed at the lamp end there, but those aimed at the sphere
+// go on through it, so a sample takes about twice as long.
+scene glass()
+{
+    hittable_list world;
+    add_cornell_walls(world);
+    world.add(cornell_lamp(std::make_shared<diffuse_light>(color{15, 15, 15})));
+    world.add(tall_block(std::make_shared<lambertian>(color{0.73, 0.73, 0.73})));
+
+    // A lambda builds the sphere for world and for lights (see scene::lights)
+    const auto ball = [](std::shared_ptr<const material> mat) {
+        return std::make_unique<sphere>(point3{190, 90, 190}, 90, std::move(mat));
+    };
+    world.add(ball(std::make_shared<dielectric>(1.5)));
+
+    hittable_list lights;
+    lights.add(cornell_lamp(nullptr));
+    lights.add(ball(nullptr));
+    return {std::move(world), cornell_camera, std::move(lights)};
+}
+
 // All scenes, in the order they appear in the books.
 export constexpr std::array scene_list{
     scene_entry{"weekend", "the first book's cover: spheres of three materials", weekend},
@@ -457,6 +485,7 @@ export constexpr std::array scene_list{
     scene_entry{"smoke", "the Cornell box with blocks of black and white smoke", smoke},
     scene_entry{"final", "the second book's final scene: everything together", final_scene},
     scene_entry{"aluminum", "the Cornell box with a tall block of polished aluminum", aluminum},
+    scene_entry{"glass", "the Cornell box with a glass sphere: the third book's last image", glass},
 };
 
 export constexpr std::string_view default_scene = "final";

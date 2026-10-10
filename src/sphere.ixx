@@ -5,6 +5,9 @@ import std;
 import aabb;
 import hittable;
 import interval;
+import onb;
+import pdf;
+import random;
 import ray;
 import vec3;
 
@@ -79,6 +82,42 @@ public:
         return rec;
     }
 
+    // Book 3, sections 12.3–12.4: a sphere as a light. A uniform point of its surface, as for a quad, would often
+    // lie on the back half, hidden behind the front one. But seen from a point outside, the sphere fills a cone of
+    // directions around the direction to its center, with sin θmax = radius / distance, and random() draws
+    // directions uniformly within that cone: the density is 1 / (its solid angle) = 1 / (2π·(1 - cos θmax)).
+    // A moving sphere is aimed at where it is at time 0. The two functions still describe one distribution, so the
+    // mixture strategy stays unbiased; its lamp half just aims less well.
+    double pdf_value(const point3& origin, const vec3& direction) const override
+    {
+        const double distance_squared = (center_.at(0) - origin).length_squared();
+        if (distance_squared < radius_ * radius_)
+        {
+            return uniform_sphere_density; // from inside: see random()
+        }
+        // Directions that miss the sphere have density 0: random() never draws them
+        if (!hit(ray{origin, direction}, interval{0.001, infinity}))
+        {
+            return 0;
+        }
+        return 1 / (2 * std::numbers::pi * one_minus_cos_theta_max(distance_squared));
+    }
+
+    vec3 random(const point3& origin) const override
+    {
+        const vec3 to_center = center_.at(0) - origin;
+        const double distance_squared = to_center.length_squared();
+        if (distance_squared < radius_ * radius_)
+        {
+            // From inside, every direction hits the sphere: draw them all, uniformly. (The book's formula takes
+            // the square root of 1 - radius² / distance², a negative number here, and gets NaN.)
+            return random_unit_vector();
+        }
+        // A direction in the cone around the z axis, turned so that the z axis points at the center (chapter 8)
+        const onb uvw{unit_vector(to_center)};
+        return uvw.transform(random_to_sphere(one_minus_cos_theta_max(distance_squared)));
+    }
+
 private:
     // The center's path is a ray too: center_.at(time) = start point + time × displacement over the exposure.
     // A stationary sphere has zero displacement.
@@ -86,4 +125,27 @@ private:
     double radius_;
     std::shared_ptr<const material> mat_; // several objects can share one material, so ownership is shared
     aabb bbox_;
+
+    // 1 - cos θmax of the cone seen from the distance √distance_squared, which is at least the radius. The book
+    // computes 1 - √(1 - sin²θmax), which loses digits when the sphere looks small: the root is then close to 1.
+    // Multiplied by (1 + cos θmax) / (1 + cos θmax), it becomes sin²θmax / (1 + cos θmax), which keeps them.
+    double one_minus_cos_theta_max(double distance_squared) const
+    {
+        const double sin_squared = radius_ * radius_ / distance_squared;
+        return sin_squared / (1 + std::sqrt(1 - sin_squared));
+    }
+
+    // A random direction, uniform within the cone of directions at most θmax away from the z axis, given
+    // one_minus_cos_max = 1 - cos θmax. The inversion method of chapter 7: φ = 2π·r1, and θ has the cumulative
+    // distribution (1 - cos θ) / (1 - cos θmax); setting it to r2 gives 1 - cos θ = r2·(1 - cos θmax).
+    static vec3 random_to_sphere(double one_minus_cos_max)
+    {
+        const double r1 = random_double();
+        const double r2 = random_double();
+        const double phi = 2 * std::numbers::pi * r1;
+        const double one_minus_z = r2 * one_minus_cos_max; // 1 - cos θ
+        // sin θ = √(1 - z²), and 1 - z² = (1 - z)(1 + z): again without subtracting numbers close to 1
+        const double sin_theta = std::sqrt(one_minus_z * (2 - one_minus_z));
+        return {std::cos(phi) * sin_theta, std::sin(phi) * sin_theta, 1 - one_minus_z};
+    }
 };

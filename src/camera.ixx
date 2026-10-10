@@ -37,7 +37,7 @@ export enum class sampling_strategy
 {
     uniform,  // the same density, 1/(4π), in every direction
     material, // with the material's own density, p = pScatter
-    lights,   // toward a random point of a random lamp, with the lamps' density p
+    lights,   // toward a random object of the scene's lights list, usually a lamp, with the list's density p
     mixture,  // half of the time as material, half as lights: p is the average of the two densities
 };
 
@@ -175,7 +175,8 @@ public:
                     color pixel_color{0, 0, 0};
                     for (const auto [s_j, s_i] : strata)
                     {
-                        pixel_color += ray_color(get_ray(i, j, s_i, s_j), max_depth_, world, lights, strategy);
+                        const color sample = ray_color(get_ray(i, j, s_i, s_j), max_depth_, world, lights, strategy);
+                        pixel_color += without_nan(sample);
                     }
                     img[i, j] = pixel_samples_scale_ * pixel_color;
                 }
@@ -268,6 +269,17 @@ private:
         return center_ + p.x * defocus_disk_u_ + p.y * defocus_disk_v_;
     }
 
+    // A safety net (book 3, section 12.6): a sample that came out as NaN ("not a number", e.g. from 0/0 or 0·∞)
+    // counts as black in that channel. Left in, one NaN would make the pixel's whole sum NaN, which is saved as black.
+    // The book replaces NaN in the finished pixel, which loses all its samples in that channel; here only the bad
+    // sample is lost. It is just in case: ray_color doesn't trace a direction whose p isn't above 0 (NaN included),
+    // and the sphere's light sampling has a branch for points inside it, so no NaN is expected.
+    static color without_nan(const color& c)
+    {
+        // The book tests x != x instead of std::isnan: NaN is the only value that isn't equal to itself
+        return {std::isnan(c.x) ? 0.0 : c.x, std::isnan(c.y) ? 0.0 : c.y, std::isnan(c.z) ? 0.0 : c.z};
+    }
+
     // The color a ray "brings back". Having hit an object, the ray is reflected or refracted,
     // and we recursively ask what color comes from there. depth is how many more bounces are allowed.
     color ray_color(const ray& r, int depth, const hittable& world, const hittable_list& lights,
@@ -339,13 +351,13 @@ private:
         case sampling_strategy::material:
             return emitted + sample(diffuse.pdf);
         case sampling_strategy::lights:
-            // Aim at a random point of a random lamp (book 3, chapter 9). Direct light gets much less noisy, but
-            // the estimate is biased: importance sampling is unbiased only if p > 0 wherever the integrand isn't 0,
-            // and p is 0 in every direction that misses the lamps. So only light arriving from the lamps'
-            // directions counts: all of the direct light, plus what an object standing between the point and
-            // a lamp reflects. All other indirect light (from walls, ceiling, blocks) is lost, so shadows and the
-            // Cornell box's ceiling go black, and so is the light of lamps missing from the list. The mixture
-            // below fixes this.
+            // Aim at a random object of the lights list, usually a lamp (book 3, chapters 9 and 12). Direct light
+            // gets much less noisy, but the estimate is biased: importance sampling is unbiased only if p > 0
+            // wherever the integrand isn't 0, and p is 0 in every direction that misses the list's objects. So only
+            // light arriving from their directions counts: all of the direct light, plus what an object standing
+            // between the point and a lamp reflects. All other indirect light (from walls, ceiling, blocks) is lost,
+            // so shadows and the Cornell box's ceiling go black, and so is the light of lamps missing from the list.
+            // The mixture below fixes this.
             return emitted + sample(hittable_pdf{lights, rec->p});
         case sampling_strategy::mixture:
             // Half of the directions toward the lamps, half as the material scatters (book 3, section 10.3). The

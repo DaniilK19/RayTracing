@@ -5,9 +5,11 @@
 // MonteCarlo pi stratified
 import std;
 import hittable;
+import instance;
 import pdf;
 import quad;
 import random;
+import sphere;
 import vec3;
 
 // An experiment in the list: a name for the command line, where it is in the book, a description for the help
@@ -633,7 +635,7 @@ constexpr direction_sampler polar_directions{
     pi * pi * pi * pi / 4 - cos_squared_integral * cos_squared_integral};
 
 // The same directions with the sin θ forgotten: 1/(2π²) taken for a density per steradian. Then f/p = 2π²·cos²θ, and
-// E[(f/p)²] = (1/π)·4π⁴·∫₀^π cos⁴θ dθ = 3π⁴/2, while its mean is π² (see sphere() below): variance π⁴/2.
+// E[(f/p)²] = (1/π)·4π⁴·∫₀^π cos⁴θ dθ = 3π⁴/2, while its mean is π² (see sphere_of_directions() below): variance π⁴/2.
 constexpr direction_sampler polar_directions_without_sin{
     "no sin θ", random_polar_direction, [](const vec3& /*d*/) { return 1 / (2 * pi * pi); }, pi * pi * pi * pi / 2};
 
@@ -651,7 +653,8 @@ double estimate_direction_integral(double (*f)(const vec3& d), const direction_s
 
 // Book 3, chapter 4 (listing 16): ∫ cos²θ dω over the sphere of directions, as the mean of f(d)/p(d) over random
 // directions: the book's uniform ones, then uniform θ and φ, with the right p and with a wrong one.
-void sphere()
+// (Not named sphere: a function hides a class of the same name, and light_pdfs below needs the class sphere.)
+void sphere_of_directions()
 {
     seed_random(7);
     constexpr int n = 1'000'000;
@@ -858,8 +861,9 @@ double square_solid_angle(const point3& o)
     return f(x2, y2) - f(x1, y2) - f(x2, y1) + f(x1, y1);
 }
 
-// Light sampling: section 9.1's density of a quad lamp, checked from two points. Seen from the middle, the square
-// covers 2π/3 steradians, a third of the hemisphere (6 such squares make a cube around o).
+// Light sampling: the densities of section 9.1's quad lamp, checked from two points, and of section 12.3's sphere,
+// a list of lights (section 12.5) and an instance. Seen from the middle, the square covers 2π/3 steradians, a third
+// of the hemisphere (6 such squares make a cube around o).
 void light_pdfs()
 {
     seed_random(10);
@@ -870,7 +874,10 @@ void light_pdfs()
                  "      misses the lamp (\"uniform\"); h(d) = max(0, cos θ)/π, θ the angle between d and (1, 2, 3)",
                  n);
     // A lamp needs no material here: only its shape is used, as in a scene's list of lights
-    const quad square{point3{-1, -1, 1}, vec3{2, 0, 0}, vec3{0, 2, 0}, nullptr};
+    const point3 corner{-1, -1, 1};
+    const vec3 side_u{2, 0, 0};
+    const vec3 side_v{0, 2, 0};
+    const quad square{corner, side_u, side_v, nullptr};
     for (const point3& o : {point3{0, 0, 0}, point3{0.5, 0.25, -0.5}})
     {
         const double solid_angle = square_solid_angle(o);
@@ -878,6 +885,72 @@ void light_pdfs()
                      solid_angle);
         check_light_pdf(square, o, solid_angle, n);
     }
+
+    // Seen from the distance d, a sphere of radius r fills a cone with sin θmax = r/d, Ω = 2π(1 - cos θmax): for
+    // r = 1 and d = 2 that is 2π(1 - √3/2), for d = 1.25 cos θmax = 0.6 and Ω = 0.8π; from inside it is 4π. The
+    // density is the same, 1/Ω, for all the directions random() draws, so every sample of (b) is Ω: its tiny error
+    // and SE are rounding in the sums (see sample_mean), and only (d) shows how the directions spread in the cone.
+    // From inside, every sample of (a) is 1 as well: SE = 0.
+    const sphere ball{point3{0, 0, 0}, 1, nullptr};
+    struct view
+    {
+        double distance;
+        double solid_angle;
+    };
+    for (const auto [distance, solid_angle] : {view{2, 2 * pi * (1 - std::sqrt(3.0) / 2)}, view{1.25, 0.8 * pi},
+                                                view{0.5, 4 * pi}})
+    {
+        std::println("\n  A sphere of radius 1 seen from the distance {}{}: Ω = {:.6f} sr", distance,
+                     distance < 1 ? ", from inside" : "", solid_angle);
+        check_light_pdf(ball, point3{0, 0, -distance}, solid_angle, n);
+    }
+
+    // A list draws toward one of its objects, chosen at random, and averages their densities. Behind the square,
+    // the sphere at (0, 0, 3) fills a cone inside the square's: its directions get both densities, and the two
+    // together cover the square's solid angle.
+    hittable_list square_and_sphere;
+    square_and_sphere.add(std::make_unique<quad>(corner, side_u, side_v, nullptr));
+    square_and_sphere.add(std::make_unique<sphere>(point3{0, 0, 3}, 1, nullptr));
+    const double square_angle = square_solid_angle(point3{0, 0, 0});
+    std::println("\n  A list of the square and a sphere of radius 1 behind it at (0, 0, 3), seen from (0, 0, 0):\n"
+                 "  Ω = {:.6f} sr, the square's", square_angle);
+    check_light_pdf(square_and_sphere, point3{0, 0, 0}, square_angle, n);
+
+    // An instance: the square turned by rotate_y and moved by translate. Seen from a point turned and moved with
+    // it, it covers the same solid angle as the square from the original point. rotate turns a vector as rotate_y
+    // turns the object.
+    constexpr double angle = 30;
+    const vec3 offset{2, 3, 4};
+    const double sin_theta = std::sin(degrees_to_radians(angle));
+    const double cos_theta = std::cos(degrees_to_radians(angle));
+    const auto rotate = [=](const vec3& v) {
+        return vec3{cos_theta * v.x + sin_theta * v.z, v.y, -sin_theta * v.x + cos_theta * v.z};
+    };
+    const translate instance{std::make_unique<rotate_y>(std::make_unique<quad>(corner, side_u, side_v, nullptr), angle),
+                             offset};
+    const point3 square_o{0.5, 0.25, -0.5};
+    const point3 o = rotate(square_o) + offset;
+    std::println("\n  The square turned by {}° around the y axis and moved by ({}, {}, {}), seen from ({}, {}, {})\n"
+                 "  turned and moved along with it: Ω = {:.6f} sr", angle, offset.x, offset.y, offset.z, square_o.x,
+                 square_o.y, square_o.z, square_solid_angle(square_o));
+    check_light_pdf(instance, o, square_solid_angle(square_o), n);
+
+    // The instance must also have the same density as a quad built in place from the turned and moved vectors
+    const quad in_place{rotate(corner) + offset, rotate(side_u), rotate(side_v), nullptr};
+    double largest_difference = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        const vec3 d = random_unit_vector();
+        const double p_instance = instance.pdf_value(o, d);
+        const double p_in_place = in_place.pdf_value(o, d);
+        if (p_instance > 0 || p_in_place > 0)
+        {
+            largest_difference =
+                std::max(largest_difference, std::fabs(p_instance - p_in_place) / std::max(p_instance, p_in_place));
+        }
+    }
+    std::println("  p of the instance vs a quad built in place, over N uniform d: largest relative difference {:.1e}",
+                 largest_difference);
 }
 
 // --- The list of experiments and the command line --------------------------------------------------------------
@@ -892,7 +965,8 @@ constexpr std::array experiments{
     experiment{"halfway", "3.5", "the point that halves the area under a curve, found by sorting the samples",
                halfway},
     experiment{"importance", "3.7", "∫ x² dx with four PDFs: the closer p is to f, the smaller the error", importance},
-    experiment{"sphere", "4", "∫ cos²θ dω over the sphere of directions, with densities per steradian", sphere},
+    experiment{"sphere", "4", "∫ cos²θ dω over the sphere of directions, with densities per steradian",
+               sphere_of_directions},
     // Designated initializers (C++20) name the members: .in_all = false says what the false is for
     experiment{.name = "sphere-plot",
                .section = "7.1",
@@ -902,7 +976,8 @@ constexpr std::array experiments{
     experiment{"cos-cubed", "7.2", "∫ cos³θ dω over the hemisphere: uniform vs cosine-distributed directions",
                hemisphere},
     experiment{"light-pdfs", "9.1",
-               "beyond the book: does a lamp's pdf_value() describe the directions its random() draws?", light_pdfs},
+               "beyond the book: do pdf_value() and random() agree for quads, spheres, lists and instances?",
+               light_pdfs},
 };
 
 void print_usage()
