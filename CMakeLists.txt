@@ -54,6 +54,7 @@ target_sources(RayTracing PRIVATE
         src/material.ixx
         src/random.ixx
         src/ray.ixx
+        src/scenes.ixx
         src/sphere.ixx
         src/vec3.ixx)
 
