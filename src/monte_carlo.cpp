@@ -4,13 +4,15 @@
 // Without arguments all experiments run in the book's order; or name the ones to run: MonteCarlo pi stratified
 import std;
 import random;
+import vec3;
 
 // An experiment in the list: a name for the command line, where it is in the book, a description for the help
 // and the header, and the function that runs it (the same kind of table as scene_list in the scenes module).
 struct experiment
 {
     std::string_view name;
-    std::string_view section; // of the third book, e.g. "2.1" (chapter 2, its first section)
+    std::string_view section; // of the third book, e.g. "2.1" (chapter 2, its first section), or "4" (chapter 4,
+                              // which has no sections)
     std::string_view description;
     void (*run)();
 };
@@ -563,6 +565,110 @@ void importance()
     }
 }
 
+// --- Monte Carlo integration on the sphere of directions (book 3, chapter 4) -----------------------------------
+
+// A direction in 3D is a point on the unit sphere, and a set of directions is a patch of the sphere's surface. The
+// patch's area is the set's solid angle, measured in steradians (sr); all directions together make 4π sr, the area
+// of the sphere. So a PDF of directions is a density per steradian, and it integrates to 1 over the sphere: the
+// uniform one is 1/(4π) everywhere. An integral over directions (like the light that reaches a point from all
+// around) is estimated as before, as the mean of f(d)/p(d), only now with random directions d.
+
+constexpr double pi = std::numbers::pi; // a short name for the formulas below
+
+// The integrand of chapter 4: f(d) = cos²θ, where θ is the angle between the direction d and the z axis.
+// For a unit vector d, cos θ = d·(0, 0, 1) = d.z, so f(d) = d.z², without computing θ.
+double cos_squared(const vec3& d) { return d.z * d.z; }
+
+// Its exact integral: the book gives 4π/3 and asks the reader to check it ("check me!"). In spherical coordinates
+// (θ from the z axis, φ around it) a small patch dθ × dφ covers the solid angle dω = sin θ dθ dφ: near the poles
+// the circles of constant θ are small. So
+// ∫ cos²θ dω = ∫₀^2π dφ · ∫₀^π cos²θ sin θ dθ = 2π · [-cos³θ/3]₀^π = 2π · 2/3 = 4π/3.
+constexpr double cos_squared_integral = 4 * pi / 3;
+
+// A way to draw random directions: the function that draws them and their density p(d) per steradian, which must
+// describe exactly how that function spreads them. (Section 10.1 makes such a pair a class, pdf.)
+struct direction_sampler
+{
+    std::string_view name;
+    vec3 (*generate)();
+    double (*density)(const vec3& d);
+    double variance; // of one sample f(d)/p(d), worked out below
+};
+
+// The book's listing 16: random_unit_vector() and p = 1/(4π), the density of the directions it returns. (The ray
+// tracer's isotropic scatters along them as they are; lambertian adds one to the normal, and the sum has another
+// density, cos θ/π, as chapter 5 shows.)
+// By Archimedes' hat-box theorem the zone of the unit sphere between the planes z = a and z = b has the area
+// 2π(b - a), like that of the cylinder around the sphere, so the z of a uniform direction is uniform in [-1, 1].
+// A sample is f/p = 4π·z². E[z²] = 1/3 gives the mean 4π/3 once more, and E[z⁴] = 1/5 the variance
+// (4π)²·(1/5 - 1/9) = 64π²/45: σ ≈ 3.747.
+constexpr direction_sampler uniform_directions{"uniform", random_unit_vector,
+                                               [](const vec3& /*d*/) { return 1 / (4 * pi); }, 64 * pi * pi / 45};
+
+// θ uniform in [0, π) and φ uniform in [0, 2π): a uniform point (θ, φ) of a π × 2π rectangle, turned into a unit
+// vector. The directions are not uniform: the whole edge θ = 0 of the rectangle goes to a single point, the pole.
+vec3 random_polar_direction()
+{
+    const double theta = pi * random_double();
+    const double phi = 2 * pi * random_double();
+    const double sin_theta = std::sin(theta);
+    return {sin_theta * std::cos(phi), sin_theta * std::sin(phi), std::cos(theta)};
+}
+
+// Beyond the book, which says any coordinates will do, as long as p is a density over the sphere. With θ and φ
+// uniform the density is 1/π · 1/(2π) = 1/(2π²) per unit of θ·φ, and a patch dθ × dφ covers sin θ dθ dφ steradians,
+// so per steradian p = 1/(2π²·sin θ), where sin θ = √(x² + y²) for d = (x, y, z): high near the poles, where the
+// directions crowd. f/p = 2π²·sin θ·cos²θ averages to (1/π)·2π²·∫₀^π cos²θ sin θ dθ = 4π/3, the right answer, and
+// with ∫₀^π sin²θ·cos⁴θ dθ = π/16 (Wallis: ∫ cos⁴ - ∫ cos⁶ over [0, π] = 3π/8 - 5π/16)
+// E[(f/p)²] = (1/π)·4π⁴·π/16 = π⁴/4: variance π⁴/4 - (4π/3)², σ ≈ 2.609.
+constexpr direction_sampler polar_directions{
+    "θ, φ", random_polar_direction,
+    [](const vec3& d) { return 1 / (2 * pi * pi * std::sqrt(d.x * d.x + d.y * d.y)); },
+    pi * pi * pi * pi / 4 - cos_squared_integral * cos_squared_integral};
+
+// The same directions with the sin θ forgotten: 1/(2π²) taken for a density per steradian. Then f/p = 2π²·cos²θ, and
+// E[(f/p)²] = (1/π)·4π⁴·∫₀^π cos⁴θ dθ = 3π⁴/2, while its mean is π² (see sphere() below): variance π⁴/2.
+constexpr direction_sampler polar_directions_without_sin{
+    "no sin θ", random_polar_direction, [](const vec3& /*d*/) { return 1 / (2 * pi * pi); }, pi * pi * pi * pi / 2};
+
+// The mean of n samples f(d)/p(d), with the directions d drawn by the sampler.
+double estimate_cos_squared_integral(const direction_sampler& sampler, int n)
+{
+    double sum = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        const vec3 d = sampler.generate();
+        sum += cos_squared(d) / sampler.density(d);
+    }
+    return sum / n;
+}
+
+// Book 3, chapter 4 (listing 16): ∫ cos²θ dω over the sphere of directions, as the mean of f(d)/p(d) over random
+// directions: the book's uniform ones, then uniform θ and φ, with the right p and with a wrong one.
+void sphere()
+{
+    seed_random(7);
+    constexpr int n = 1'000'000;
+    std::println("  ∫ cos²θ dω over the unit sphere as the mean of f(d)/p(d) = d.z²/p(d), p per steradian, N = {}:", n);
+    for (const direction_sampler& sampler : {uniform_directions, polar_directions})
+    {
+        print_estimate(sampler.name, estimate_cos_squared_integral(sampler, n), cos_squared_integral,
+                       std::sqrt(sampler.variance / n));
+    }
+    std::println("  Uniform θ and φ crowd the directions at the poles, where cos²θ is large, so σ is smaller:\n"
+                 "  more samples where f is large, as with importance sampling in section 3.7.\n");
+
+    // With a wrong p the estimate still converges, only to another number. Here the samples 2π²·cos²θ, with θ
+    // uniform in [0, π), average to 2π²·1/2 = π² = ∫∫ cos²θ dθ dφ over the θ-φ rectangle.
+    std::println("  Without the sin θ, p = 1/(2π²) is not a density per steradian: "
+                 "over the sphere it integrates to 2/π.\n"
+                 "  The estimate still converges, but to π² = ∫∫ cos²θ dθ dφ, the integral over the θ-φ rectangle:");
+    const double estimate = estimate_cos_squared_integral(polar_directions_without_sin, n);
+    const double standard_error = std::sqrt(polar_directions_without_sin.variance / n);
+    print_estimate(polar_directions_without_sin.name, estimate, cos_squared_integral, standard_error);
+    print_estimate("vs π²", estimate, pi * pi, standard_error);
+}
+
 // --- The list of experiments and the command line --------------------------------------------------------------
 
 constexpr std::array experiments{
@@ -575,6 +681,7 @@ constexpr std::array experiments{
     experiment{"halfway", "3.5", "the point that halves the area under a curve, found by sorting the samples",
                halfway},
     experiment{"importance", "3.7", "∫ x² dx with four PDFs: the closer p is to f, the smaller the error", importance},
+    experiment{"sphere", "4", "∫ cos²θ dω over the sphere of directions, with densities per steradian", sphere},
 };
 
 void print_usage()
