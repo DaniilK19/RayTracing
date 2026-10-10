@@ -2,6 +2,8 @@
 export module texture;
 
 import std;
+import image;
+import interval;
 import vec3;
 
 // A texture answers the question "what color is the surface at this point". The point can be given
@@ -59,4 +61,29 @@ private:
     double inv_scale_; // 1 / scale: multiplying is faster than dividing
     std::shared_ptr<const texture> even_;
     std::shared_ptr<const texture> odd_;
+};
+
+// An image wrapped around a surface by texture coordinates: u is horizontal,
+// v is vertical, both from 0 to 1. This is how the Earth map is wrapped around a sphere, like on a globe.
+export class image_texture : public texture
+{
+public:
+    explicit image_texture(image img) : image_(std::move(img)) {}
+
+    color value(double u, double v, const point3&) const override
+    {
+        // Coordinates outside [0, 1] are clamped to the image edge. v is flipped:
+        // in texture coordinates v grows from bottom to top, while image rows go from top to bottom.
+        constexpr interval unit{0, 1};
+        u = unit.clamp(u);
+        v = 1.0 - unit.clamp(v);
+
+        // Pixel index; u = 1 would give width, past the image edge, hence min
+        const int i = std::min(static_cast<int>(u * image_.width()), image_.width() - 1);
+        const int j = std::min(static_cast<int>(v * image_.height()), image_.height() - 1);
+        return image_[i, j];
+    }
+
+private:
+    image image_; // its colors are already linear: image::load converted them from sRGB
 };

@@ -61,6 +61,7 @@ target_sources(RayTracing PRIVATE
 
 # Third-party code lives in external/. SYSTEM keeps the compiler from showing its warnings.
 #   stb/stb_image_write.h - v1.16, github.com/nothings/stb, commit 2c980bb (PNG writing)
+#   stb/stb_image.h       - v2.30, same source, same commit (JPEG/PNG reading for textures)
 target_include_directories(RayTracing SYSTEM PRIVATE external/stb)
 
 target_link_libraries(RayTracing PRIVATE std_module)

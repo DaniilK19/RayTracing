@@ -1,4 +1,4 @@
-// Module image: an in-memory image and saving it as PNG.
+// Module image: an in-memory image, loading it from a file and saving it as PNG.
 module;
 
 // The global module fragment (between `module;` and `export module`) is the place for ordinary #includes.
@@ -7,6 +7,10 @@ module;
 #define STB_IMAGE_WRITE_IMPLEMENTATION // the stb implementation is compiled right in this file
 #define STBI_WRITE_NO_STDIO            // we open files ourselves, via std::ofstream
 #include <stb_image_write.h>
+
+#define STB_IMAGE_IMPLEMENTATION // the same for reading images
+#define STBI_NO_STDIO            // we read the file ourselves, via std::ifstream
+#include <stb_image.h>
 
 export module image;
 
@@ -38,8 +42,48 @@ public:
     {
     }
 
-    int width() const { return width_; }
-    int height() const { return height_; }
+    // Loads an image from a file: JPEG, PNG and other formats stb_image understands.
+    // Files store colors in gamma space (sRGB), while the tracer works in linear space.
+    // stbi_loadf converts them to linear right away by raising them to the power 2.2, the inverse of linear_to_gamma.
+    static std::expected<image, std::string> load(const std::filesystem::path& path)
+    {
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+        {
+            return std::unexpected("could not open the file");
+        }
+        const std::vector<char> bytes{std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+
+        // Ask for exactly 3 channels (R, G, B), even if the file has a different number, e.g. a PNG with transparency
+        int width = 0;
+        int height = 0;
+        int channels_in_file = 0;
+        float* const data = stbi_loadf_from_memory(reinterpret_cast<const stbi_uc*>(bytes.data()),
+                                                   static_cast<int>(bytes.size()), &width, &height,
+                                                   &channels_in_file, 3);
+        if (!data)
+        {
+            return std::unexpected(std::format("could not read the image ({})", stbi_failure_reason()));
+        }
+        // The memory was allocated by a C library and must be returned with stbi_image_free. We hand this
+        // to a std::unique_ptr with a custom "deleter": it will call that function however we leave this one.
+        const std::unique_ptr<float, decltype(&stbi_image_free)> owner(data, &stbi_image_free);
+
+        image img(width, height);
+        for (int y = 0; y < height; ++y)
+        {
+            for (int x = 0; x < width; ++x)
+            {
+                const float* const pixel = data + 3 * (static_cast<std::size_t>(y) * width + x);
+                img[x, y] = color{pixel[0], pixel[1], pixel[2]};
+            }
+        }
+        return img;
+    }
+
+    // inline so that calls from other modules (a texture reads pixels millions of times) get inlined
+    inline int width() const { return width_; }
+    inline int height() const { return height_; }
 
     // Pixel color: img[x, y]. Multiple arguments to operator[] are allowed since C++23.
     // `this auto& self` is C++23 too ("deducing this"): one function instead of a const/non-const pair.

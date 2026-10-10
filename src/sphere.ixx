@@ -71,8 +71,9 @@ public:
         // Texture coordinates work like longitude and latitude on a globe, both from 0 to 1.
         // The normal is a point on the unit sphere centered at the origin; we find the angles from it:
         // φ around the Y axis, measured from the -X direction; θ from the south pole (-Y) to the north one (+Y).
+        // Due to rounding |y| can slightly exceed 1, and acos would return NaN, hence std::clamp.
         const double phi = std::atan2(-outward_normal.z, outward_normal.x) + std::numbers::pi;
-        const double theta = std::acos(-outward_normal.y);
+        const double theta = std::acos(std::clamp(-outward_normal.y, -1.0, 1.0));
         rec.u = phi / (2 * std::numbers::pi);
         rec.v = theta / std::numbers::pi;
         return rec;

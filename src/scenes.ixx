@@ -4,6 +4,7 @@ export module scenes;
 import std;
 import camera;
 import hittable;
+import image;
 import material;
 import random;
 import sphere;
@@ -25,6 +26,38 @@ export struct scene_entry
     std::string_view description;
     scene (*build)();
 };
+
+// A file from the project's assets folder. We look for the folder in the current one and up the tree:
+// the program is run both from the project root (out\build\x64-release\RayTracing.exe) and from Visual Studio,
+// where the current folder is out\build\x64-release and assets lies three levels up.
+std::filesystem::path find_asset(std::string_view name)
+{
+    for (std::filesystem::path dir = std::filesystem::current_path();; dir = dir.parent_path())
+    {
+        const std::filesystem::path candidate = dir / "assets" / name;
+        if (std::filesystem::exists(candidate))
+        {
+            return candidate;
+        }
+        if (dir == dir.parent_path())
+        {
+            return std::filesystem::path("assets") / name; // reached the drive root: the loading code will report the failure
+        }
+    }
+}
+
+// A texture from an image in assets. If the file doesn't load, rendering still happens:
+// the image is replaced with bright cyan, which immediately shows that the texture is missing.
+std::shared_ptr<texture> load_texture(std::string_view name)
+{
+    auto img = image::load(find_asset(name));
+    if (!img)
+    {
+        std::println("Texture {}: {}. Using cyan instead.", name, img.error());
+        return std::make_shared<solid_color>(color{0, 1, 1});
+    }
+    return std::make_shared<image_texture>(std::move(*img));
+}
 
 // The first book's cover: three big spheres and a scatter of small ones with random materials.
 // The main thread's random number generator always starts from the same seed, so the scene
@@ -121,11 +154,26 @@ scene checker()
     return {std::move(world), camera};
 }
 
+// Book 2, chapter 4: the Earth, an image wrapped around a sphere.
+// assets/earthmap.jpg comes from the book's repository (github.com/RayTracing/raytracing.github.io, CC0 license).
+scene earth()
+{
+    hittable_list world;
+    const auto earth_surface = std::make_shared<lambertian>(load_texture("earthmap.jpg"));
+    world.add(std::make_unique<sphere>(point3{0, 0, 0}, 2, earth_surface));
+
+    camera_settings camera = cover_camera;
+    camera.lookfrom = {0, 0, 12};
+    camera.defocus_angle = 0;
+    return {std::move(world), camera};
+}
+
 // All scenes, in the order they appear in the books.
 export constexpr std::array scene_list{
     scene_entry{"weekend", "the first book's cover: spheres of three materials", weekend},
     scene_entry{"bouncing", "the same, but the matte spheres bounce: motion blur", bouncing},
     scene_entry{"checker", "two spheres with a solid checker texture", checker},
+    scene_entry{"earth", "the Earth: an image wrapped around a sphere", earth},
 };
 
 export constexpr std::string_view default_scene = "weekend";
