@@ -25,10 +25,11 @@ export struct scene_entry
     scene (*build)();
 };
 
-// The scene from the first book's cover: three big spheres and a scatter of small ones with random materials.
+// The first book's cover: three big spheres and a scatter of small ones with random materials.
 // The main thread's random number generator always starts from the same seed, so the scene
 // is the same on every run.
-scene weekend()
+// bouncing is the second book's variant: the matte spheres bounce while the shutter is open.
+hittable_list random_spheres(bool bouncing)
 {
     hittable_list world;
 
@@ -47,9 +48,14 @@ scene weekend()
             }
 
             std::shared_ptr<material> sphere_material;
-            if (choose_mat < 0.8) // 80% matte
+            point3 center2 = center; // where the sphere will be by the end of the exposure
+            if (choose_mat < 0.8)    // 80% matte
             {
                 sphere_material = std::make_shared<lambertian>(color::random() * color::random());
+                if (bouncing)
+                {
+                    center2 = center + vec3{0, random_double(0, 0.5), 0}; // jumps up by a random height of up to 0.5
+                }
             }
             else if (choose_mat < 0.95) // 15% metal
             {
@@ -59,32 +65,45 @@ scene weekend()
             {
                 sphere_material = std::make_shared<dielectric>(1.5);
             }
-            world.add(std::make_unique<sphere>(center, 0.2, std::move(sphere_material)));
+            world.add(std::make_unique<sphere>(center, center2, 0.2, std::move(sphere_material)));
         }
     }
 
     world.add(std::make_unique<sphere>(point3{0, 1, 0}, 1.0, std::make_shared<dielectric>(1.5)));
     world.add(std::make_unique<sphere>(point3{-4, 1, 0}, 1.0, std::make_shared<lambertian>(color{0.4, 0.2, 0.1})));
     world.add(std::make_unique<sphere>(point3{4, 1, 0}, 1.0, std::make_shared<metal>(color{0.7, 0.6, 0.5}, 0.0)));
+    return world;
+}
 
-    return {std::move(world),
-            {
-                .aspect_ratio = 16.0 / 9.0,
-                .image_width = 1920, // Full HD: with a 16:9 aspect ratio the height will be 1080
-                .samples_per_pixel = 500,
-                .max_depth = 50,
-                .vfov = 20,
-                .lookfrom = {13, 2, 3},
-                .lookat = {0, 0, 0},
-                .vup = {0, 1, 0},
-                .defocus_angle = 0.6,
-                .focus_dist = 10.0,
-            }};
+// Camera for both covers
+constexpr camera_settings cover_camera{
+    .aspect_ratio = 16.0 / 9.0,
+    .image_width = 1920, // Full HD: with a 16:9 aspect ratio the height will be 1080
+    .samples_per_pixel = 500,
+    .max_depth = 50,
+    .vfov = 20,
+    .lookfrom = {13, 2, 3},
+    .lookat = {0, 0, 0},
+    .vup = {0, 1, 0},
+    .defocus_angle = 0.6,
+    .focus_dist = 10.0,
+};
+
+scene weekend()
+{
+    return {random_spheres(false), cover_camera};
+}
+
+// Book 2, chapter 2: motion blur
+scene bouncing()
+{
+    return {random_spheres(true), cover_camera};
 }
 
 // All scenes, in the order they appear in the books.
 export constexpr std::array scene_list{
     scene_entry{"weekend", "the first book's cover: spheres of three materials", weekend},
+    scene_entry{"bouncing", "the same, but the matte spheres bounce: motion blur", bouncing},
 };
 
 export constexpr std::string_view default_scene = "weekend";

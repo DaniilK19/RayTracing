@@ -13,7 +13,7 @@ export class lambertian : public material
 public:
     explicit lambertian(const color& albedo) : albedo_(albedo) {}
 
-    std::optional<scatter_result> scatter(const ray&, const hit_record& rec) const override
+    std::optional<scatter_result> scatter(const ray& r_in, const hit_record& rec) const override
     {
         vec3 direction = rec.normal + random_unit_vector();
 
@@ -23,7 +23,8 @@ public:
         {
             direction = rec.normal;
         }
-        return scatter_result{albedo_, ray{rec.p, direction}};
+        // The scattered ray exists at the same moment in time as the incoming one
+        return scatter_result{albedo_, ray{rec.p, direction, r_in.time}};
     }
 
 private:
@@ -46,7 +47,7 @@ public:
         {
             return std::nullopt;
         }
-        return scatter_result{albedo_, ray{rec.p, reflected}};
+        return scatter_result{albedo_, ray{rec.p, reflected, r_in.time}};
     }
 
 private:
@@ -81,7 +82,7 @@ public:
                                    ? reflect(unit_direction, rec.normal)
                                    : refract(unit_direction, rec.normal, ri);
 
-        return scatter_result{color{1.0, 1.0, 1.0}, ray{rec.p, direction}};
+        return scatter_result{color{1.0, 1.0, 1.0}, ray{rec.p, direction, r_in.time}};
     }
 
 private:

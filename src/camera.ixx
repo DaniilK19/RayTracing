@@ -149,13 +149,16 @@ private:
     // A ray through a random point of pixel (i, j). If all rays went exactly through the center,
     // object edges would look like "staircases"; random points inside the pixel smooth them out.
     // The ray starts at a random point of the lens (or at the camera center if defocus is off).
+    // The emission moment is random too: the shutter is open from time 0 to 1, and the pixel averages
+    // everything a moving object managed to "sweep" in that time, which gives motion blur.
     ray get_ray(int i, int j) const
     {
         const vec3 offset = sample_square();
         const point3 pixel_sample =
             pixel00_loc_ + ((i + offset.x) * pixel_delta_u_) + ((j + offset.y) * pixel_delta_v_);
         const point3 ray_origin = defocus_angle_ <= 0 ? center_ : defocus_disk_sample();
-        return ray{ray_origin, pixel_sample - ray_origin};
+        const double ray_time = random_double();
+        return ray{ray_origin, pixel_sample - ray_origin, ray_time};
     }
 
     // Random point in the square [-0.5, 0.5] × [-0.5, 0.5]: an offset from the pixel center.
