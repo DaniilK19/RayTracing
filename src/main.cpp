@@ -185,7 +185,7 @@ int main(int argc, char* argv[])
     std::println("Render time: {:.1f} s", elapsed.count());
 
     // How much work that was. Rays per sample is the average length of a path, the camera ray included; rays per second
-    // is the renderer's speed.
+    // is the renderer's speed. The GPU program prints the same line, so the two renderers can be compared ray for ray.
     const camera_frame frame = cam.frame();
     const double samples =
         static_cast<double>(frame.image_width) * frame.image_height * frame.sqrt_spp * frame.sqrt_spp;

@@ -17,11 +17,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT
     "$<$<CONFIG:Debug>:EditAndContinue>$<$<CONFIG:RelWithDebInfo>:ProgramDatabase>")
 
-# Flags for all targets (the std module and our code must use the same ones):
+# Flags for all C++ sources (the std module and our code must use the same ones):
 #   /utf-8           - sources and strings are UTF-8: non-ASCII text in code and output works
 #   /Zc:__cplusplus  - __cplusplus reports the real standard version instead of 199711L
 #   /Zc:preprocessor - a standard-conforming preprocessor
-add_compile_options(/utf-8 /Zc:__cplusplus /Zc:preprocessor)
+# They are flags of cl.exe, MSVC's compiler. The GPU renderer's .cu file is compiled by nvcc, NVIDIA's CUDA compiler,
+# which doesn't accept them: it compiles the GPU code itself and hands the rest of the file to cl.exe, with the flags
+# given after -Xcompiler. $<COMPILE_LANGUAGE:...> is a generator expression, which CMake works out for each source file
+# when it writes the build files, so each kind of source gets the flags in its compiler's form.
+add_compile_options(
+    "$<$<COMPILE_LANGUAGE:CXX>:/utf-8;/Zc:__cplusplus;/Zc:preprocessor>"
+    "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8,/Zc:__cplusplus,/Zc:preprocessor>")
 
 # --- import std; -------------------------------------------------------------
 # The standard library as a module (C++23). MSVC ships its source, std.ixx,
@@ -42,10 +48,11 @@ target_sources(std_module PUBLIC
     FILES "${MSVC_MODULES_DIR}/std.ixx")
 
 # --- Ray tracer library ------------------------------------------------------
-# Three programs use the ray tracer's modules: RayTracing renders the scenes; MonteCarlo runs the third book's
-# numerical experiments with the ray tracer's own random numbers, directions and densities, and tests its light
-# sampling (light-pdfs); and ImageCompare reads and compares renders with the image module. So the modules are compiled
-# once into a static library, and the programs link it.
+# Four programs use the ray tracer's modules: RayTracing renders the scenes; MonteCarlo runs the third book's numerical
+# experiments with the ray tracer's own random numbers, directions and densities, and tests its light sampling
+# (light-pdfs); ImageCompare reads and compares renders with the image module; and RayTracingGPU, the GPU program
+# (below), builds its scenes with the very same code. So the modules are compiled once into a static library, and the
+# programs link it.
 add_library(raytracer STATIC)
 target_sources(raytracer PUBLIC  # PUBLIC: programs that link the library can `import` its modules
     FILE_SET CXX_MODULES FILES   # our modules: files with `export module ...`
@@ -95,3 +102,53 @@ target_compile_options(MonteCarlo PRIVATE /W4)
 add_executable(ImageCompare src/image_compare.cpp src/utf8.manifest)
 target_link_libraries(ImageCompare PRIVATE raytracer)
 target_compile_options(ImageCompare PRIVATE /W4)
+
+# --- GPU program (optional) --------------------------------------------------
+# RayTracingGPU renders the first book's scenes on an NVIDIA graphics card. It needs the CUDA Toolkit (nvcc and the
+# CUDA libraries); without it, everything else builds as before. CMake looks for nvcc in the folder named by the
+# CUDA_PATH environment variable and on the PATH, both set by the toolkit's installer: a program started before the
+# installation, such as Visual Studio or a terminal, keeps its old environment until it is restarted.
+# check_language tries the CUDA compiler on a small test project and caches the answer, "not found" too, so after
+# installing the toolkit the CMake cache must go as well (in Visual Studio: Project > Delete Cache and Reconfigure;
+# on the command line: cmake --fresh).
+include(CheckLanguage)
+check_language(CUDA)
+if(CMAKE_CUDA_COMPILER)
+    # The GPUs to compile the kernels for: by default the one in this computer ("native"; with no
+    # GPU, nvcc warns and takes its default). Choose others with -DCMAKE_CUDA_ARCHITECTURES=89 or the CUDAARCHS
+    # environment variable. It must be set before enable_language(CUDA), which would otherwise take nvcc's default.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
+        set(CMAKE_CUDA_ARCHITECTURES native)
+    endif()
+    enable_language(CUDA)
+
+    # C++20, not 23: with cl.exe as its host compiler, nvcc ignores -std=c++23 ("not supported with the configured host
+    # compiler... Flag will be ignored") and falls back to C++14, and CMake refuses CUDA_STANDARD 23 for this pair. nvcc
+    # can't import modules either, so the GPU code is written in ordinary headers. C++20 still gives it concepts.
+    set(CMAKE_CUDA_STANDARD 20)
+    set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+    # The CUDA runtime library (GPU memory, kernel launches...) is the static one, cudart_static.lib: the program
+    # needs only the graphics driver, no CUDA DLL. CUDA 13's nvcc links a "hybrid" cudart.lib by default, which on
+    # Windows holds the same code, but CMake counts that default as the shared runtime; naming Static keeps the
+    # choice explicit and the same with every CUDA version.
+    set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+
+    # The renderer: kernels (functions that run on the GPU) and the host code that launches them. nvcc splits a .cu
+    # file in two: it compiles the device code itself and hands the host code to cl.exe with the flags given after
+    # -Xcompiler: those of our C++ code (at the top of this file), and /W4 as for our programs.
+    # Device code is optimized in every configuration, Debug too: -G (debug information for device code) would turn its
+    # optimizations off and make the kernels hundreds of times slower (400-600 times, measured on the test GPU), so a
+    # render of a second would take ten minutes. -lineinfo, in Debug and RelWithDebInfo, only maps the GPU's machine
+    # code to source lines, for profilers such as Nsight Compute.
+    add_library(gpu_renderer STATIC src/gpu/renderer.cu)
+    target_compile_options(gpu_renderer PRIVATE -Xcompiler=/W4 $<$<CONFIG:Debug,RelWithDebInfo>:-lineinfo>)
+
+    add_executable(RayTracingGPU src/main_gpu.cpp src/utf8.manifest)
+    target_link_libraries(RayTracingGPU PRIVATE raytracer gpu_renderer)
+    target_compile_options(RayTracingGPU PRIVATE /W4)
+else()
+    message(STATUS "No working CUDA compiler found: RayTracingGPU, the GPU program, is skipped")
+    message(STATUS "After installing the CUDA Toolkit, restart Visual Studio (or the terminal) and delete the CMake "
+                   "cache: Project > Delete Cache and Reconfigure (or cmake --fresh)")
+endif()

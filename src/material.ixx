@@ -28,6 +28,9 @@ public:
         return cosine_density(rec.normal, scattered.direction);
     }
 
+    // For code that copies a scene into its own format (the GPU program); the same for the other materials below
+    inline const texture& albedo_texture() const { return *tex_; }
+
 private:
     // Fraction of light reflected per channel: the surface's "color". A texture lets it vary
     // from point to point; a single color for the whole surface is solid_color.
@@ -52,6 +55,9 @@ public:
         }
         return specular_scatter{albedo_, ray{rec.p, reflected, r_in.time}};
     }
+
+    inline const color& albedo() const { return albedo_; }
+    inline double fuzz() const { return fuzz_; }
 
 private:
     color albedo_;
@@ -87,6 +93,8 @@ public:
 
         return specular_scatter{color{1.0, 1.0, 1.0}, ray{rec.p, direction, r_in.time}};
     }
+
+    inline double refraction_index() const { return refraction_index_; }
 
 private:
     double refraction_index_;

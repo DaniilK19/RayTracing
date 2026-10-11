@@ -26,6 +26,9 @@ public:
 
     color value(double, double, const point3&) const override { return albedo_; }
 
+    // For code that copies a scene into its own format: the GPU program
+    inline const color& albedo() const { return albedo_; }
+
 private:
     color albedo_;
 };

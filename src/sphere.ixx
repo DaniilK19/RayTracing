@@ -34,6 +34,12 @@ public:
 
     aabb bounding_box() const override { return bbox_; }
 
+    // The sphere as plain numbers, for code that copies a scene into its own format: the GPU program.
+    inline point3 center_at(double time) const { return center_.at(time); }
+    inline bool is_moving() const { return center_.direction.length_squared() > 0; }
+    inline double radius() const { return radius_; }
+    inline const material* mat() const { return mat_.get(); } // nullptr for a shape in a scene's lights list
+
     std::optional<hit_record> hit(const ray& r, interval ray_t) const override
     {
         // Where the sphere's center was when the ray was emitted
@@ -41,6 +47,9 @@ public:
 
         // |P(t) - center|² = radius² is a quadratic equation a·t² + b·t + c = 0.
         // Writing b = -2h simplifies the root formula to (h ± √(h² - a·c)) / a.
+        // In double this is accurate for every scene of the books. h² and a·c are both about a·|oc|², though, so for a
+        // sphere ten million times smaller than its distance their difference loses most of its digits; the GPU, which
+        // computes in float, gets the same number another way (see src/gpu/sphere.cuh).
         const vec3 oc = center - r.origin;
         const double a = r.direction.length_squared();
         const double h = dot(r.direction, oc);

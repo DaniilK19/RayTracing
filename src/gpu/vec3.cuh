@@ -1,0 +1,146 @@
+// The GPU's vec3 (see vec3.ixx): a 3D vector for points, directions and colors, and a ray (see ray.ixx).
+//
+// The GPU renders in float or in double (see precision in renderer.h) from one source: the device code is made of
+// templates on Real, which is one of the two, and nvcc compiles each of them twice. The float version must compute
+// nothing in double but the pixel sums (see render_kernel in renderer.cu). A GeForce card does double arithmetic 64
+// times slower than float, so one forgotten double in the inner loop would cost more than all the float math around it.
+// That is why literals are written as Real(0.5), not 0.5 (a double), and why the math functions below have a GPU
+// overload for each type.
+#pragma once
+
+#include <concepts>
+#include <limits>
+
+namespace gpu
+{
+// float or double. A concept (C++20) names the requirement, and a template constrained by it rejects other types at
+// compile time (long double, for one, which CUDA doesn't have on the GPU).
+template <typename T>
+concept real_number = std::same_as<T, float> || std::same_as<T, double>;
+
+// A variable template (C++14): infinity<float> and infinity<double> are two constants. constexpr makes them
+// compile-time values, which GPU code may read although they are defined for the CPU.
+template <real_number Real>
+constexpr Real infinity = std::numeric_limits<Real>::infinity();
+
+// The math functions the device code uses, in both precisions. CUDA overloads most of them for float, as C++'s <cmath>
+// does, so sqrt of a float already computes in float. But not every overload it finds works on the GPU: with MSVC,
+// copysign(float, float) is the standard library's CPU-only function, and calling it from GPU code only draws a
+// warning, while the GPU code compiled from it is wrong. These overloads name exactly the functions the device code
+// needs, each with its GPU version for float and for double, and hide the global ones inside namespace gpu: template
+// code that writes sqrt(x) gets the GPU function of x's own type, and an int argument is a compile error (float or
+// double? ambiguous) instead of a quiet conversion.
+// __device__ marks a function that runs on the GPU and is called from GPU code; nvcc compiles it for the GPU only.
+__device__ inline float sqrt(float x) { return ::sqrtf(x); }
+__device__ inline double sqrt(double x) { return ::sqrt(x); }
+// 1 / √x: the GPU has an instruction for it, so this is cheaper than a square root and a division
+__device__ inline float rsqrt(float x) { return ::rsqrtf(x); }
+__device__ inline double rsqrt(double x) { return ::rsqrt(x); }
+__device__ inline float fabs(float x) { return ::fabsf(x); }
+__device__ inline double fabs(double x) { return ::fabs(x); }
+__device__ inline float fmin(float x, float y) { return ::fminf(x, y); }
+__device__ inline double fmin(double x, double y) { return ::fmin(x, y); }
+__device__ inline float fmax(float x, float y) { return ::fmaxf(x, y); }
+__device__ inline double fmax(double x, double y) { return ::fmax(x, y); }
+__device__ inline float copysign(float x, float y) { return ::copysignf(x, y); }
+__device__ inline double copysign(double x, double y) { return ::copysign(x, y); }
+// x·y + z with a single rounding (a fused multiply-add), one GPU instruction
+__device__ inline float fma(float x, float y, float z) { return ::fmaf(x, y, z); }
+__device__ inline double fma(double x, double y, double z) { return ::fma(x, y, z); }
+// sin(π·x) and cos(π·x) in one call. More accurate than sin(π * x), whose argument π * x is already rounded.
+__device__ inline void sincospi(float x, float* sine, float* cosine) { ::sincospif(x, sine, cosine); }
+__device__ inline void sincospi(double x, double* sine, double* cosine) { ::sincospi(x, sine, cosine); }
+
+// Functions marked __host__ __device__ are compiled for both the CPU and the GPU. These simple ones can serve both,
+// while the math functions above are for the GPU only (__device__): they call CUDA's GPU functions.
+template <real_number Real>
+struct vec3
+{
+    Real x = 0;
+    Real y = 0;
+    Real z = 0;
+
+    __host__ __device__ vec3 operator-() const { return {-x, -y, -z}; }
+
+    // Component by component, as colors mix: the throughput of a path is multiplied by each surface's albedo
+    __host__ __device__ vec3& operator*=(const vec3& v)
+    {
+        x *= v.x;
+        y *= v.y;
+        z *= v.z;
+        return *this;
+    }
+
+    __host__ __device__ Real length_squared() const { return x * x + y * y + z * z; }
+};
+
+template <real_number Real>
+using point3 = vec3<Real>;
+template <real_number Real>
+using color = vec3<Real>;
+
+template <real_number Real>
+__host__ __device__ vec3<Real> operator+(const vec3<Real>& u, const vec3<Real>& v)
+{
+    return {u.x + v.x, u.y + v.y, u.z + v.z};
+}
+
+template <real_number Real>
+__host__ __device__ vec3<Real> operator-(const vec3<Real>& u, const vec3<Real>& v)
+{
+    return {u.x - v.x, u.y - v.y, u.z - v.z};
+}
+
+template <real_number Real>
+__host__ __device__ vec3<Real> operator*(const vec3<Real>& u, const vec3<Real>& v)
+{
+    return {u.x * v.x, u.y * v.y, u.z * v.z};
+}
+
+// Real is deduced from both arguments, so 2 * v doesn't compile (2 is an int): the number must be a Real(2), which
+// keeps the float version free of doubles by construction
+template <real_number Real>
+__host__ __device__ vec3<Real> operator*(Real t, const vec3<Real>& v)
+{
+    return {t * v.x, t * v.y, t * v.z};
+}
+
+template <real_number Real>
+__host__ __device__ Real dot(const vec3<Real>& u, const vec3<Real>& v)
+{
+    return u.x * v.x + u.y * v.y + u.z * v.z;
+}
+
+template <real_number Real>
+__device__ vec3<Real> unit_vector(const vec3<Real>& v)
+{
+    return rsqrt(v.length_squared()) * v;
+}
+
+// Mirror reflection of v off a surface with unit normal n (see vec3.ixx)
+template <real_number Real>
+__device__ vec3<Real> reflect(const vec3<Real>& v, const vec3<Real>& n)
+{
+    return v - (Real(2) * dot(v, n)) * n;
+}
+
+// Refraction of the unit vector uv at a surface with unit normal n (Snell's law, see vec3.ixx)
+template <real_number Real>
+__device__ vec3<Real> refract(const vec3<Real>& uv, const vec3<Real>& n, Real etai_over_etat)
+{
+    const Real cos_theta = fmin(dot(-uv, n), Real(1));
+    const vec3<Real> r_out_perp = etai_over_etat * (uv + cos_theta * n);
+    const vec3<Real> r_out_parallel = -sqrt(fabs(Real(1) - r_out_perp.length_squared())) * n;
+    return r_out_perp + r_out_parallel;
+}
+
+// A ray (see ray.ixx), without the time: the GPU renders only stationary spheres so far
+template <real_number Real>
+struct ray
+{
+    point3<Real> origin;
+    vec3<Real> direction; // not normalized: t is measured in lengths of the direction, as on the CPU
+
+    __device__ point3<Real> at(Real t) const { return origin + t * direction; }
+};
+}

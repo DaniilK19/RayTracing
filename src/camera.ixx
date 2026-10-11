@@ -101,7 +101,8 @@ export struct camera_settings
 };
 
 // What the camera computes from its settings, as plain numbers: the pixel grid its rays aim at and the lens disk they
-// start from. main reads the grid's size from it to count the samples of a render.
+// start from. The GPU program hands it to its own renderer, so both renderers shoot the same rays (up to their random
+// numbers) without repeating this math.
 export struct camera_frame
 {
     int image_width;
@@ -349,7 +350,8 @@ private:
     // and we recursively ask what color comes from there. depth is how many more bounces are allowed.
     // Each bounce is one more call on the thread's stack (1 MB for a std::jthread on Windows), so a max_depth of about
     // 2000 would overflow it in a scene whose paths really get that long, such as light trapped inside a glass ball.
-    // The book's scenes stop at 50.
+    // The book's scenes stop at 50. The GPU's version (trace_ray in src/gpu/camera.cuh) is a loop and has no such
+    // limit.
     color ray_color(const ray& r, int depth, const hittable& world, const hittable_list& lights,
                     sampling_strategy strategy) const
     {
