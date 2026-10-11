@@ -420,7 +420,7 @@ scene final_scene()
             {
                 .aspect_ratio = 1.0,
                 .image_width = 1080,
-                .samples_per_pixel = 1000, // ~3.5 minutes on all cores; the book uses 10,000 at 800×800
+                .samples_per_pixel = 1000, // ~4 minutes on all cores; the book uses 10,000 at 800×800
                 .max_depth = 40,
                 .vfov = 40,
                 .lookfrom = {478, 278, -600},
