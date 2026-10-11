@@ -76,10 +76,15 @@ export struct camera_settings
     double aspect_ratio = 1.0;  // image width to height ratio
     int image_width = 100;      // image width in pixels
     int samples_per_pixel = 10; // how many random rays to average per pixel (rounded to a square, see camera)
-    int max_depth = 10;         // how many times a ray may bounce before we give up on it
+    int max_depth = 10;         // at most this many rays per path, the camera ray included: max_depth - 1 bounces
 
     // How a diffuse bounce chooses the next direction
     sampling_strategy sampling = sampling_strategy::mixture;
+
+    // Which random numbers the render draws (see render). Another seed renders the same scene with independent noise:
+    // the same expected value in every pixel, so a difference between two such images that is larger than their noise
+    // explains is a real one. That is how two renderers, or two versions of one, can be compared.
+    std::uint32_t seed = 0;
 
     double vfov = 90;         // vertical field of view in degrees: a smaller angle means a stronger "zoom"
     point3 lookfrom{0, 0, 0}; // where the camera stands
@@ -95,6 +100,37 @@ export struct camera_settings
     sky background; // what is visible where a ray hits nothing
 };
 
+// What the camera computes from its settings, as plain numbers: the pixel grid its rays aim at and the lens disk they
+// start from. main reads the grid's size from it to count the samples of a render.
+export struct camera_frame
+{
+    int image_width;
+    int image_height;
+    int sqrt_spp;          // rays per pixel: a sqrt_spp × sqrt_spp grid
+    int max_depth;
+    point3 center;         // camera position
+    point3 pixel00_loc;    // center of pixel (0, 0)
+    vec3 pixel_delta_u;    // step to the next pixel to the right
+    vec3 pixel_delta_v;    // step to the next pixel below
+    double defocus_angle;  // 0: every ray starts at the center; otherwise on the lens disk
+    vec3 defocus_disk_u;   // horizontal radius of the lens disk
+    vec3 defocus_disk_v;   // vertical radius of the lens disk
+    sky background;
+};
+
+// What camera::render returns: the image and how much work it took.
+export struct render_result
+{
+    image img;
+    std::uint64_t rays = 0; // rays traced: the camera rays and all their bounces (see ray_color)
+};
+
+// How many rays the current thread has traced. Each worker thread counts its own, just as it has its own random number
+// generator. A single atomic counter, changed by all threads tens of millions of times a second, would make them wait
+// for each other: every change needs the counter in its own core's cache, taken away from the core that changed it
+// last. render adds up the threads' counts, one addition per thread.
+thread_local std::uint64_t rays_traced_by_this_thread = 0;
+
 export class camera
 {
 public:
@@ -108,6 +144,7 @@ public:
           recip_sqrt_spp_(1.0 / sqrt_spp_),
           max_depth_(settings.max_depth),
           sampling_(settings.sampling),
+          seed_(settings.seed),
           defocus_angle_(settings.defocus_angle),
           background_(settings.background)
     {
@@ -143,10 +180,27 @@ public:
         defocus_disk_v_ = defocus_radius * v;
     }
 
+    // The pixel grid and the lens as numbers, for a renderer outside this class (see camera_frame)
+    camera_frame frame() const
+    {
+        return {.image_width = image_width_,
+                .image_height = image_height_,
+                .sqrt_spp = sqrt_spp_,
+                .max_depth = max_depth_,
+                .center = center_,
+                .pixel00_loc = pixel00_loc_,
+                .pixel_delta_u = pixel_delta_u_,
+                .pixel_delta_v = pixel_delta_v_,
+                .defocus_angle = defocus_angle_,
+                .defocus_disk_u = defocus_disk_u_,
+                .defocus_disk_v = defocus_disk_v_,
+                .background = background_};
+    }
+
     // Render: for each pixel average the colors of several rays and write the result into the image.
     // Rows are computed in parallel on all CPU threads. lights are the objects the lights and mixture strategies
-    // aim at.
-    image render(const hittable& world, const hittable_list& lights) const
+    // aim at. Returns the image and the number of rays traced.
+    render_result render(const hittable& world, const hittable_list& lights) const
     {
         const sampling_strategy strategy = effective_sampling(sampling_, lights);
         const unsigned thread_count = std::max(1u, std::thread::hardware_concurrency());
@@ -160,6 +214,7 @@ public:
         // only to its own rows), so the image needs no protection.
         std::atomic<int> next_row = 0;
         std::atomic<int> rows_done = 0;
+        std::atomic<std::uint64_t> rays = 0;
 
         // All cells (s_j, s_i) of the pixel's grid, row by row. std::views::cartesian_product (C++23) gives every
         // pair of an element of the first range with one of the second: one loop instead of two nested ones.
@@ -167,11 +222,15 @@ public:
             std::views::cartesian_product(std::views::iota(0, sqrt_spp_), std::views::iota(0, sqrt_spp_));
 
         auto render_rows = [&] {
+            rays_traced_by_this_thread = 0; // the count belongs to the thread, not to this render: start it afresh
             for (int j = next_row++; j < image_height_; j = next_row++)
             {
                 // Each row has its own random number sequence: the image doesn't depend
                 // on which thread computed the row or when, and is the same on every run.
-                seed_random(static_cast<std::uint64_t>(j));
+                // The seed setting fills the upper 32 bits of the generator's 64-bit seed and the row number the lower
+                // ones, so each (seed, row) pair gets a sequence of its own. Seed 0 seeds row j with j, as the camera
+                // did before it had a seed setting, and renders the same images as then, bit for bit.
+                seed_random((std::uint64_t{seed_} << 32) | static_cast<std::uint64_t>(j));
                 for (int i = 0; i < image_width_; ++i)
                 {
                     color pixel_color{0, 0, 0};
@@ -185,6 +244,7 @@ public:
                 ++rows_done;
                 rows_done.notify_one(); // wake the main thread: time to update the progress
             }
+            rays += rays_traced_by_this_thread;
         };
 
         {
@@ -205,7 +265,9 @@ public:
             }
         }
         std::print("\r{:30}\r", ""); // erase the progress line
-        return img;
+
+        // Every worker has added its count by now: the jthreads' destructors waited for them to finish
+        return {std::move(img), rays.load()};
     }
 
 private:
@@ -219,6 +281,7 @@ private:
     double recip_sqrt_spp_;      // 1 / sqrt_spp: the side of one grid cell, in pixel widths
     int max_depth_;
     sampling_strategy sampling_;
+    std::uint32_t seed_;
     double defocus_angle_;
     sky background_;
     point3 center_;              // camera position
@@ -284,6 +347,9 @@ private:
 
     // The color a ray "brings back". Having hit an object, the ray is reflected or refracted,
     // and we recursively ask what color comes from there. depth is how many more bounces are allowed.
+    // Each bounce is one more call on the thread's stack (1 MB for a std::jthread on Windows), so a max_depth of about
+    // 2000 would overflow it in a scene whose paths really get that long, such as light trapped inside a glass ball.
+    // The book's scenes stop at 50.
     color ray_color(const ray& r, int depth, const hittable& world, const hittable_list& lights,
                     sampling_strategy strategy) const
     {
@@ -296,6 +362,10 @@ private:
         // ends up slightly below the surface, and the ray would immediately "hit" the same surface. In the image
         // this would give dark spots ("shadow acne").
         const auto rec = world.hit(r, interval{0.001, infinity});
+
+        // A search of the whole scene for the nearest hit: one ray traced. (The lights and mixture strategies also test
+        // directions against single lamps, in hittable_pdf, but those tests don't search the scene and don't count.)
+        ++rays_traced_by_this_thread;
         if (!rec)
         {
             // The ray went off to infinity and brought back the background color

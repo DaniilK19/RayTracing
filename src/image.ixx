@@ -1,4 +1,4 @@
-// Module image: an in-memory image, loading it from a file and saving it as PNG.
+// Module image: an in-memory image, loading it from a file, and saving it as PNG or PFM.
 module;
 
 // The global module fragment (between `module;` and `export module`) is the place for ordinary #includes.
@@ -95,6 +95,14 @@ public:
         return std::ranges::fold_left(pixels_, color{0, 0, 0}, std::plus{}) / static_cast<double>(pixels_.size());
     }
 
+    // The mean radiance: the average of all three channels of all pixels, (r + g + b) / 3 in average(). The renderers
+    // print it after every render (see main.cpp), and ImageCompare prints it for both of its images.
+    double mean_radiance() const
+    {
+        const color mean = average();
+        return (mean.x + mean.y + mean.z) / 3;
+    }
+
     // Pixel color: img[x, y]. Multiple arguments to operator[] are allowed since C++23.
     // `this auto& self` is C++23 too ("deducing this"): one function instead of a const/non-const pair.
     // For a const image, self is a const image&, and a const color& is returned.
@@ -139,7 +147,155 @@ public:
         return {};
     }
 
+    // Saves the image as PFM (Portable Float Map), the simplest format that keeps the tracer's own numbers: three
+    // 32-bit floats per pixel, linear, before gamma correction and clamping. A PNG keeps 8 bits per channel after
+    // both, so it can't tell a lamp of brightness 15 from plain white, or a difference of 0.1% from none; a PFM can,
+    // which is why ImageCompare compares PFMs. HDR viewers such as tev open them.
+    // The format: three lines of text, "PF", then the width and the height separated by a space, then a scale whose
+    // sign gives the byte order of the floats (negative: little-endian); then the rows from the BOTTOM of the image to
+    // its top, each from left to right.
+    std::expected<void, std::string> save_pfm(const std::filesystem::path& path) const
+    {
+        // Binary mode matters for the header too: in text mode Windows would write each "\n" as "\r\n"
+        std::ofstream file(path, std::ios::binary);
+        if (!file)
+        {
+            return std::unexpected("could not open the file");
+        }
+        std::print(file, "PF\n{} {}\n-1.0\n", width_, height_); // C++23: std::print into a stream
+
+        std::vector<std::uint32_t> row(static_cast<std::size_t>(width_) * 3);
+        for (int y = height_ - 1; y >= 0; --y)
+        {
+            for (int x = 0; x < width_; ++x)
+            {
+                const color& pixel = (*this)[x, y];
+                const std::size_t i = static_cast<std::size_t>(x) * 3;
+                row[i] = to_little_endian(static_cast<float>(pixel.x));
+                row[i + 1] = to_little_endian(static_cast<float>(pixel.y));
+                row[i + 2] = to_little_endian(static_cast<float>(pixel.z));
+            }
+            file.write(reinterpret_cast<const char*>(row.data()),
+                       static_cast<std::streamsize>(row.size() * sizeof(std::uint32_t)));
+        }
+
+        file.close();
+        if (!file)
+        {
+            return std::unexpected("could not write the PFM");
+        }
+        return {};
+    }
+
+    // Saves the image in the format the file's extension names: .png or .pfm, in any letter case.
+    std::expected<void, std::string> save(const std::filesystem::path& path) const
+    {
+        switch (format_of(path))
+        {
+        case file_format::png:
+            return save_png(path);
+        case file_format::pfm:
+            return save_pfm(path);
+        case file_format::unknown:
+            break;
+        }
+        return std::unexpected("unknown image format: the file name must end in .png or .pfm");
+    }
+
+    // Whether save() knows the format of a file with this name. The programs check their output names with it before
+    // rendering, so that a mistake is reported at once, not after a render that may take minutes.
+    static bool can_save(const std::filesystem::path& path) { return format_of(path) != file_format::unknown; }
+
+    // Loads a color PFM, such as those save_pfm writes.
+    static std::expected<image, std::string> load_pfm(const std::filesystem::path& path)
+    {
+        std::ifstream file(path, std::ios::binary);
+        if (!file)
+        {
+            return std::unexpected("could not open the file");
+        }
+
+        std::string magic;
+        int width = 0;
+        int height = 0;
+        double scale = 0;
+        file >> magic >> width >> height >> scale;
+        // A limit on the size keeps a damaged header from asking for terabytes of memory
+        constexpr int max_side = 1 << 16;
+        if (!file || magic != "PF" || width <= 0 || height <= 0 || width > max_side || height > max_side ||
+            scale == 0)
+        {
+            return std::unexpected("not a color PFM file (it must start with PF, the width, the height and a scale)");
+        }
+        file.get(); // the single whitespace character that ends the header; the floats follow it
+        const bool little_endian = scale < 0;
+
+        std::vector<std::uint32_t> data(static_cast<std::size_t>(width) * height * 3);
+        const auto bytes = static_cast<std::streamsize>(data.size() * sizeof(std::uint32_t));
+        file.read(reinterpret_cast<char*>(data.data()), bytes);
+        if (file.gcount() != bytes)
+        {
+            return std::unexpected("the file is shorter than its header says");
+        }
+
+        image img(width, height);
+        for (int y = 0; y < height; ++y)
+        {
+            for (int x = 0; x < width; ++x)
+            {
+                // The file's rows go from the bottom up
+                const std::size_t i = (static_cast<std::size_t>(height - 1 - y) * width + x) * 3;
+                img[x, y] = color{from_pfm(data[i], little_endian), from_pfm(data[i + 1], little_endian),
+                                  from_pfm(data[i + 2], little_endian)};
+            }
+        }
+        return img;
+    }
+
 private:
+    enum class file_format
+    {
+        png,
+        pfm,
+        unknown,
+    };
+
+    // The format a file name's extension names, in any letter case: one rule for save() and can_save()
+    static file_format format_of(const std::filesystem::path& path)
+    {
+        const auto to_lower = [](char8_t c) {
+            return u8'A' <= c && c <= u8'Z' ? static_cast<char8_t>(c - u8'A' + u8'a') : c;
+        };
+        // std::ranges::to (C++23) collects a range into a container: here the lowercase letters into a string
+        const std::u8string extension =
+            path.extension().u8string() | std::views::transform(to_lower) | std::ranges::to<std::u8string>();
+        if (extension == u8".png")
+        {
+            return file_format::png;
+        }
+        if (extension == u8".pfm")
+        {
+            return file_format::pfm;
+        }
+        return file_format::unknown;
+    }
+
+    // A float's bits in little-endian byte order, the order of x86 and ARM processors: for them this is just
+    // std::bit_cast (C++20), which reinterprets the float's 4 bytes as an integer. std::byteswap (C++23) reverses
+    // them on the rare big-endian machine.
+    static std::uint32_t to_little_endian(float value)
+    {
+        const auto bits = std::bit_cast<std::uint32_t>(value);
+        return std::endian::native == std::endian::little ? bits : std::byteswap(bits);
+    }
+
+    // The float stored in a PFM's 4 bytes, read as an integer, in the byte order the file's header declares
+    static double from_pfm(std::uint32_t bits, bool little_endian)
+    {
+        const bool native_order = little_endian == (std::endian::native == std::endian::little);
+        return std::bit_cast<float>(native_order ? bits : std::byteswap(bits));
+    }
+
     int width_;
     int height_;
     std::vector<color> pixels_; // row by row, top to bottom: pixel (x, y) is at [y * width + x]

@@ -1,10 +1,10 @@
 import std;
 import bvh;
 import camera;
+import cli;
 import hittable;
 import image;
 import scenes;
-import vec3; // color, below. image imports vec3 too, but an import is not passed on (only `export import` is)
 
 // Command-line options. Each scene sets its own width and number of rays;
 // std::optional tells "not given: take it from the scene" apart from any given value.
@@ -14,7 +14,8 @@ struct options
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
     std::optional<sampling_strategy> sampling;
-    std::optional<std::filesystem::path> output; // defaults to <scene name>.png
+    std::optional<std::uint32_t> seed;
+    std::vector<std::filesystem::path> outputs; // one per -o; parse_options adds <scene name>.png if there is none
     bool help = false;
 };
 
@@ -35,30 +36,21 @@ Options:
                        because the rays form a k×k grid in the pixel
   -p, --sampling NAME  how a diffuse bounce chooses the next direction ("p" as in pdf,
                        probability density function): one of the strategies below
-  -o, --output FILE    where to save the PNG (default <scene>.png)
+      --seed N         which random numbers to draw, from 0 (the default) to {}:
+                       another seed renders the same image with independent noise
+  -o, --output FILE    where to save the image (default <scene>.png): a .png, or a .pfm that
+                       keeps the linear values as floats, before gamma correction and clamping;
+                       give it several times to save several files: -o out.png -o out.pfm
   -h, --help           show this help
 
 Sampling (-p):)",
-                 default_scene);
+                 default_scene, std::numeric_limits<std::uint32_t>::max());
     for (const sampling_entry& entry : sampling_list)
     {
         // camera_settings{} holds the camera's defaults
         const bool is_default = entry.strategy == camera_settings{}.sampling;
         std::println("  {:10} {}{}", entry.name, entry.description, is_default ? " (default)" : "");
     }
-}
-
-// An integer greater than zero. std::from_chars (C++17) is strict and fast parsing: no exceptions
-// and no locales, and the end pointer shows whether the whole string was parsed (not just "12" of "12abc").
-std::optional<int> parse_positive_int(std::string_view text)
-{
-    int value = 0;
-    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-    if (error != std::errc{} || end != text.data() + text.size() || value <= 0)
-    {
-        return std::nullopt;
-    }
-    return value;
 }
 
 std::expected<options, std::string> parse_options(std::span<char* const> args)
@@ -87,8 +79,9 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         const bool is_width = arg == "-w" || arg == "--width";
         const bool is_samples = arg == "-s" || arg == "--samples";
         const bool is_sampling = arg == "-p" || arg == "--sampling";
+        const bool is_seed = arg == "--seed";
         const bool is_output = arg == "-o" || arg == "--output";
-        if (!is_width && !is_samples && !is_sampling && !is_output)
+        if (!is_width && !is_samples && !is_sampling && !is_seed && !is_output)
         {
             return std::unexpected(std::format("unknown option '{}'", arg));
         }
@@ -100,7 +93,22 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
 
         if (is_output)
         {
-            opts.output = value;
+            std::filesystem::path output = value;
+            if (const auto checked = check_output(output); !checked)
+            {
+                return std::unexpected(std::format("{}: {}", arg, checked.error()));
+            }
+            opts.outputs.push_back(std::move(output));
+            continue;
+        }
+        if (is_seed)
+        {
+            opts.seed = parse_number<std::uint32_t>(value);
+            if (!opts.seed)
+            {
+                return std::unexpected(std::format("{}: expected an integer from 0 to {}, not '{}'", arg,
+                                                   std::numeric_limits<std::uint32_t>::max(), value));
+            }
             continue;
         }
         if (is_sampling)
@@ -127,17 +135,11 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             opts.samples_per_pixel = number;
         }
     }
+    if (opts.outputs.empty())
+    {
+        opts.outputs.emplace_back(std::format("{}.png", opts.scene));
+    }
     return opts;
-}
-
-// On Windows std::filesystem::path stores the path in UTF-16, and path.string() converts it to the process
-// code page. The manifest (utf8.manifest) makes it UTF-8, but only on Windows 10 1903+; on older systems
-// Cyrillic in the path would turn into mojibake. u8string() always returns UTF-8, which is exactly
-// what std::print expects (we compile with /utf-8).
-std::string to_utf8(const std::filesystem::path& path)
-{
-    const std::u8string utf8 = path.u8string();
-    return std::string(utf8.begin(), utf8.end());
 }
 
 int main(int argc, char* argv[])
@@ -165,7 +167,7 @@ int main(int argc, char* argv[])
     s.camera.image_width = opts->image_width.value_or(s.camera.image_width);
     s.camera.samples_per_pixel = opts->samples_per_pixel.value_or(s.camera.samples_per_pixel);
     s.camera.sampling = opts->sampling.value_or(s.camera.sampling);
-    const std::filesystem::path output = opts->output.value_or(std::format("{}.png", opts->scene));
+    s.camera.seed = opts->seed.value_or(s.camera.seed);
 
     // Put the scene's objects into a BVH: each ray is then tested against a few objects, not all of them
     const std::unique_ptr<hittable> world = build_bvh(std::move(s.world));
@@ -178,21 +180,36 @@ int main(int argc, char* argv[])
     std::println("Scene: {}, sampling: {}{}", opts->scene, entry->name,
                  sampling != s.camera.sampling ? " (no lights: the sky is the light)" : "");
     const auto start = std::chrono::steady_clock::now();
-    const image img = cam.render(*world, s.lights);
+    const auto [img, rays] = cam.render(*world, s.lights); // a structured binding (C++17) names the result's members
     const std::chrono::duration<double> elapsed = std::chrono::steady_clock::now() - start;
     std::println("Render time: {:.1f} s", elapsed.count());
+
+    // How much work that was. Rays per sample is the average length of a path, the camera ray included; rays per second
+    // is the renderer's speed.
+    const camera_frame frame = cam.frame();
+    const double samples =
+        static_cast<double>(frame.image_width) * frame.image_height * frame.sqrt_spp * frame.sqrt_spp;
+    const double million_rays = static_cast<double>(rays) / 1e6;
+    std::println("Rays traced: {:.1f} million ({:.2f} per sample), {:.1f} million per second", million_rays,
+                 static_cast<double>(rays) / samples, million_rays / elapsed.count());
 
     // Not in the book: a diagnostic for comparing ways of sampling. Every pixel is a Monte Carlo estimate;
     // an unbiased one may be noisier or less noisy, but its expected value is the same, so the image mean
     // of every unbiased method converges to the same number as the rays per pixel grow. The PNG can't show
     // this: it keeps 8 bits per channel and nothing brighter than white, so a lamp of brightness 15 is just white.
-    const color mean = img.average();
-    std::println("Mean radiance (linear, before clamping): {:.6f}", (mean.x + mean.y + mean.z) / 3);
+    std::println("Mean radiance (linear, before clamping): {:.6f}", img.mean_radiance());
 
-    if (const auto saved = img.save_png(output); !saved)
+    // Each file is tried even if an earlier one failed: one bad path shouldn't throw the whole render away
+    int exit_code = 0;
+    for (const std::filesystem::path& output : opts->outputs)
     {
-        std::println("Error: {} ({})", saved.error(), to_utf8(output));
-        return 1;
+        if (const auto saved = img.save(output); !saved)
+        {
+            std::println("Error: {} ({})", saved.error(), to_utf8(output));
+            exit_code = 1;
+            continue;
+        }
+        std::println("Image saved: {}", to_utf8(std::filesystem::absolute(output)));
     }
-    std::println("Image saved: {}", to_utf8(std::filesystem::absolute(output)));
+    return exit_code;
 }

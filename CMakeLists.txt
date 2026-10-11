@@ -42,16 +42,17 @@ target_sources(std_module PUBLIC
     FILES "${MSVC_MODULES_DIR}/std.ixx")
 
 # --- Ray tracer library ------------------------------------------------------
-# Two programs use the ray tracer's modules: RayTracing renders the scenes, and MonteCarlo runs
-# the third book's numerical experiments with the ray tracer's own random numbers, directions and
-# densities, and tests its light sampling (light-pdfs). So the modules are compiled once into
-# a static library, and both programs link it.
+# Three programs use the ray tracer's modules: RayTracing renders the scenes; MonteCarlo runs the third book's
+# numerical experiments with the ray tracer's own random numbers, directions and densities, and tests its light
+# sampling (light-pdfs); and ImageCompare reads and compares renders with the image module. So the modules are compiled
+# once into a static library, and the programs link it.
 add_library(raytracer STATIC)
 target_sources(raytracer PUBLIC  # PUBLIC: programs that link the library can `import` its modules
     FILE_SET CXX_MODULES FILES   # our modules: files with `export module ...`
         src/aabb.ixx
         src/bvh.ixx
         src/camera.ixx
+        src/cli.ixx
         src/constant_medium.ixx
         src/hittable.ixx
         src/image.ixx
@@ -88,3 +89,9 @@ target_compile_options(RayTracing PRIVATE /W4)
 add_executable(MonteCarlo src/monte_carlo.cpp src/utf8.manifest)
 target_link_libraries(MonteCarlo PRIVATE raytracer)
 target_compile_options(MonteCarlo PRIVATE /W4)
+
+# ImageCompare: are two renders (PFM files) the same picture up to Monte Carlo noise? It uses the image module
+# to read them and write its map, so it links the library too.
+add_executable(ImageCompare src/image_compare.cpp src/utf8.manifest)
+target_link_libraries(ImageCompare PRIVATE raytracer)
+target_compile_options(ImageCompare PRIVATE /W4)
