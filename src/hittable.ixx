@@ -79,6 +79,11 @@ public:
     // the side the ray came from (book 3, chapter 9: a lamp may glow on one side only).
     // Most materials don't glow, so for them this is black; light sources override the function.
     virtual color emitted(const hit_record& /*rec*/) const { return color{0, 0, 0}; }
+
+    // Whether the camera's mixture strategy aims half of this material's diffuse bounces at the lights (book 3,
+    // section 10.3). That pays off where much of the light comes straight from a lamp, as on a surface. Beyond
+    // the book, smoke and fog say no: see isotropic.
+    virtual bool mixes_in_lights() const { return true; }
 };
 
 // Interface of everything a ray can hit: spheres, object lists and so on.

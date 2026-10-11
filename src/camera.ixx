@@ -40,6 +40,7 @@ export enum class sampling_strategy
     material, // with the material's own density, p = pScatter
     lights,   // toward a random object of the scene's lights list, usually a lamp, with the list's density p
     mixture,  // half of the time as material, half as lights: p is the average of the two densities
+              // (smoke and fog: as material, see isotropic)
 };
 
 // The strategies for the command line: a name, the value and a description for the help. Every strategy must have
@@ -368,9 +369,11 @@ private:
             // scatters, p is at least half of pScatter, so p > 0 there (unbiased), and the weight pScatter / p is
             // never more than 2. Light that only the material's half finds (from a lamp missing from the list, or
             // a lamp seen in a mirror) is drawn half as often, with twice the weight: it gets noisier.
-            // The weights of a path's bounces multiply. In the white smoke of the smoke scene, which scatters
-            // light again and again without absorbing any, a few paths collect several weights near 2 in a row:
-            // there the error, about as large as with material, comes as rare bright specks instead of even grain.
+            // Smoke and fog opt out and sample with their own density (beyond the book, see isotropic).
+            if (!rec->mat->mixes_in_lights())
+            {
+                return emitted + sample(diffuse.pdf);
+            }
             return emitted + sample(mixture_pdf{hittable_pdf{lights, rec->p}, diffuse.pdf});
         }
         std::unreachable(); // C++23: tells the compiler this point is never reached (every case returns)

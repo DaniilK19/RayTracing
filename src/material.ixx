@@ -146,6 +146,17 @@ public:
         return uniform_sphere_density;
     }
 
+    // Beyond the book: under the mixture strategy smoke and fog keep sampling with their own density, unmixed.
+    // A particle deep in a volume gets most of its light from other particles, not straight from a lamp (inside the
+    // final scene's glass ball, rays aimed at the lamp are even bent away by the glass). Mixing the lamps in would
+    // still weigh the directions the particle's own half draws by up to 2, and in a volume that scatters light
+    // again and again, losing little of it, these weights multiply along a path: rare paths get huge weights and
+    // show up as bright specks. In the final scene's blue fog that more than doubled the error; with its own
+    // density every weight is exactly 1. The price: a thin haze, where light mostly scatters once, straight from
+    // the lamp, gets no help from aiming at it, so the final scene's hazy back wall is a little noisier (but evenly
+    // so). Telling thin and dense volumes apart, or sending separate rays to the lamps, is left for later.
+    bool mixes_in_lights() const override { return false; }
+
 private:
     std::shared_ptr<const texture> tex_;
 };
