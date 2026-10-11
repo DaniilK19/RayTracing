@@ -141,6 +141,33 @@ constexpr camera_settings cover_camera{
     .background = daylight_sky,
 };
 
+// The first book's chapters 9–13 in one picture, as chapter 13 leaves it: a matte sphere in the middle, a hollow glass
+// sphere on the left, a very fuzzy metal one on the right, all standing on a big matte sphere, the ground. The glass is
+// hollow because a smaller sphere inside it has the refractive index of air relative to glass, 1 / 1.5. The lens is
+// wide open (a 10° cone of rays through each pixel), so only what is 3.4 units from the camera comes out sharp.
+scene materials()
+{
+    hittable_list world;
+    const auto material_ground = std::make_shared<lambertian>(color{0.8, 0.8, 0.0});
+    const auto material_center = std::make_shared<lambertian>(color{0.1, 0.2, 0.5});
+    const auto material_left = std::make_shared<dielectric>(1.50);
+    const auto material_bubble = std::make_shared<dielectric>(1.00 / 1.50);
+    const auto material_right = std::make_shared<metal>(color{0.8, 0.6, 0.2}, 1.0);
+
+    world.add(std::make_unique<sphere>(point3{0.0, -100.5, -1.0}, 100.0, material_ground));
+    world.add(std::make_unique<sphere>(point3{0.0, 0.0, -1.2}, 0.5, material_center));
+    world.add(std::make_unique<sphere>(point3{-1.0, 0.0, -1.0}, 0.5, material_left));
+    world.add(std::make_unique<sphere>(point3{-1.0, 0.0, -1.0}, 0.4, material_bubble)); // the air inside the glass
+    world.add(std::make_unique<sphere>(point3{1.0, 0.0, -1.0}, 0.5, material_right));
+
+    camera_settings camera = cover_camera;
+    camera.lookfrom = {-2, 2, 1};
+    camera.lookat = {0, 0, -1};
+    camera.defocus_angle = 10.0;
+    camera.focus_dist = 3.4;
+    return {std::move(world), camera};
+}
+
 scene weekend()
 {
     return {random_spheres(false), cover_camera};
@@ -475,6 +502,7 @@ scene glass()
 
 // All scenes, in the order they appear in the books.
 export constexpr std::array scene_list{
+    scene_entry{"materials", "the first book's three materials up close: matte, fuzzy metal, hollow glass", materials},
     scene_entry{"weekend", "the first book's cover: spheres of three materials", weekend},
     scene_entry{"bouncing", "the same, but the matte spheres bounce: motion blur", bouncing},
     scene_entry{"checker", "two spheres with a solid checker texture", checker},
