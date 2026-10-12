@@ -28,12 +28,12 @@ import vec3;
 // --- The command line ------------------------------------------------------------------------------------------
 
 // The scenes of RayTracing that the GPU can render so far. The others need features of the second and third books
-// that the GPU doesn't have yet (quads, smoke, lamps...), and to_gpu below says which one is missing.
+// that the GPU doesn't have yet (lamps, smoke...), and to_gpu below says which one is missing.
 // In the end to_gpu decides: any scene it can translate renders, listed here or not. (earth renders without its
 // texture's file too, as the plain cyan sphere that the CPU renders then.)
 // std::to_array (C++20) counts the names itself, so the array's size can't disagree with the list.
 constexpr auto supported_scenes =
-    std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker", "earth", "perlin"});
+    std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker", "earth", "perlin", "quads"});
 constexpr std::string_view default_gpu_scene = "weekend";
 
 // The options are RayTracing's without -p (the GPU samples as the material scatters, as the CPU does in a scene lit
@@ -230,7 +230,7 @@ class scene_translator
 public:
     explicit scene_translator(const camera_frame& frame) { desc_.camera = to_gpu(frame); }
 
-    // Every sphere of the world, wherever it is in the world's lists
+    // Every shape of the world (spheres and quads), wherever it is in the world's lists
     std::expected<void, std::string> add_world(const hittable_list& world)
     {
         return for_each_shape(world, [this](const hittable& shape) { return add_shape(shape); });
@@ -269,9 +269,16 @@ std::expected<void, std::string> scene_translator::add_shape(const hittable& sha
                                  .displacement = to_gpu(ball->center_at(1) - ball->center_at(0))});
         return {};
     }
-    if (dynamic_cast<const quad*>(&shape))
+    if (const auto* face = dynamic_cast<const quad*>(&shape))
     {
-        return std::unexpected("it has quadrilaterals");
+        const auto mat = material_index(face->mat());
+        if (!mat)
+        {
+            return std::unexpected(mat.error());
+        }
+        desc_.quads.push_back(
+            {.q = to_gpu(face->q()), .u = to_gpu(face->u()), .v = to_gpu(face->v()), .material = *mat});
+        return {};
     }
     if (dynamic_cast<const translate*>(&shape) || dynamic_cast<const rotate_y*>(&shape))
     {
@@ -397,8 +404,8 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
     return index;
 }
 
-// The whole scene, or why the GPU can't render it yet. So far the GPU renders spheres, standing still or moving, with
-// matte surfaces of solid, checker, image or marble textures, metal and glass, lit by the sky.
+// The whole scene, or why the GPU can't render it yet. So far the GPU renders spheres, standing still or moving, and
+// quads, with matte surfaces of solid, checker, image or marble textures, metal and glass, lit by the sky.
 std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame)
 {
     if (!s.lights.empty())

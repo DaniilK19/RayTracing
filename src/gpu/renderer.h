@@ -99,7 +99,7 @@ struct material_desc
     int texture = -1;            // lambertian: an index into scene_desc::textures (a single color is a solid texture)
 };
 
-// --- Shapes, in world coordinates (sphere.ixx) ----------------------------------------------------------------------
+// --- Shapes, in world coordinates (sphere.ixx, quad.ixx) ------------------------------------------------------------
 
 // A sphere, standing still or moving
 struct sphere_desc
@@ -111,6 +111,15 @@ struct sphere_desc
     // (sphere::center_at(1) - center_at(0)), and at time t it is center + t·displacement. Exactly 0 for a sphere that
     // stands still.
     vec3d displacement;
+};
+
+// A parallelogram: the points q + α·u + β·v with α and β from 0 to 1. Its front side is the one u × v points to.
+struct quad_desc
+{
+    vec3d q;
+    vec3d u;
+    vec3d v;
+    int material = 0; // an index into scene_desc::materials
 };
 
 // --- The camera (camera.ixx) ----------------------------------------------------------------------------------------
@@ -148,6 +157,7 @@ struct scene_desc
     std::vector<texture_desc> textures;
     std::vector<image_desc> images;
     std::vector<perlin_desc> perlins;
+    std::vector<quad_desc> quads;
 };
 
 // The number type the GPU computes with. A GeForce card does arithmetic on 32-bit floats about

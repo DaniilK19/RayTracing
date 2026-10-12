@@ -56,6 +56,11 @@ __device__ inline double copysign(double x, double y) { return ::copysign(x, y);
 // x·y + z with a single rounding (a fused multiply-add), one GPU instruction
 __device__ inline float fma(float x, float y, float z) { return ::fmaf(x, y, z); }
 __device__ inline double fma(double x, double y, double z) { return ::fma(x, y, z); }
+// x·y and x + y, each rounded on its own: CUDA's intrinsics that nvcc never fuses into an fma (see ray::at_unfused)
+__device__ inline float mul_rn(float x, float y) { return __fmul_rn(x, y); }
+__device__ inline double mul_rn(double x, double y) { return __dmul_rn(x, y); }
+__device__ inline float add_rn(float x, float y) { return __fadd_rn(x, y); }
+__device__ inline double add_rn(double x, double y) { return __dadd_rn(x, y); }
 // The largest whole number not above x (the checker texture's cubes)
 __device__ inline float floor(float x) { return ::floorf(x); }
 __device__ inline double floor(double x) { return ::floor(x); }
@@ -132,6 +137,23 @@ __host__ __device__ Real dot(const vec3<Real>& u, const vec3<Real>& v)
     return u.x * v.x + u.y * v.y + u.z * v.z;
 }
 
+// Host code: the arithmetic that the host does in double on the interface's vectors (a quad's normal and axes), with
+// the CPU's formulas (vec3.ixx)
+inline double dot(const vec3d& u, const vec3d& v)
+{
+    return u.x * v.x + u.y * v.y + u.z * v.z;
+}
+
+inline vec3d cross(const vec3d& u, const vec3d& v)
+{
+    return {u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x};
+}
+
+inline vec3d scale(double s, const vec3d& v)
+{
+    return {s * v.x, s * v.y, s * v.z};
+}
+
 // Host code: a vector of the interface (renderer.h), which is in double, rounded to the precision the GPU computes in.
 // It lives in this header, not in renderer.cu, because templates in the other headers (the BVH builder) call it too.
 template <real_number Real>
@@ -174,5 +196,14 @@ struct ray
     Real time = 0;
 
     __device__ point3<Real> at(Real t) const { return origin + t * direction; }
+
+    // The same point computed as the CPU computes it: the product t·direction rounded, then the sum. In at(), nvcc may
+    // fuse the two into one fma, rounded once: more accurate, but not the same number, and where a point's last bit
+    // decides a color (see surface_at in camera.cuh), the GPU takes the CPU's.
+    __device__ point3<Real> at_unfused(Real t) const
+    {
+        return {add_rn(origin.x, mul_rn(t, direction.x)), add_rn(origin.y, mul_rn(t, direction.y)),
+                add_rn(origin.z, mul_rn(t, direction.z))};
+    }
 };
 }

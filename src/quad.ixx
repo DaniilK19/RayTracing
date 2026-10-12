@@ -29,6 +29,12 @@ public:
 
     aabb bounding_box() const override { return bbox_; }
 
+    // The quad as plain numbers, for code that copies a scene into its own format: the GPU program
+    inline const point3& q() const { return q_; }
+    inline const vec3& u() const { return u_; }
+    inline const vec3& v() const { return v_; }
+    inline const material* mat() const { return mat_.get(); } // nullptr for a shape in a scene's lights list
+
     // Book 3, section 9.1. random() picks a point uniformly on the quad: its density per unit of area is 1/A.
     // Seen from origin, a small patch dA at distance r, tilted by the angle θ between its normal and the direction,
     // covers the solid angle dω = dA·cos θ / r². Both describe the same event, so p(ω)·dω = dA / A, and the

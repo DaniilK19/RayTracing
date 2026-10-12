@@ -3,6 +3,7 @@
 
 #include "bvh.cuh"
 #include "material.cuh"
+#include "quad.cuh"
 #include "random.cuh"
 #include "scene.cuh"
 #include "sphere.cuh"
@@ -151,7 +152,7 @@ template <real_number Real>
 struct surface
 {
     hit_record<Real> rec;
-    vec3<Real> outward;         // the sphere's outward unit normal, before it is turned to face the ray
+    vec3<Real> outward;         // the outward unit normal, before it is turned to face the ray (a quad's: u × v)
     point3<Real> texture_point; // where the texture is read: rec.p, or for a checker on a sphere rec.p moved exactly
                                 // onto the sphere (onto_sphere). The next ray starts at rec.p either way.
     Real u;                     // the texture coordinates, computed only when the material's texture reads them
@@ -160,32 +161,55 @@ struct surface
     int texture_index;          // the material's texture_index (material_texture): -1 for one solid color
 };
 
-// The hit as the materials and textures need it (the CPU's hit_record, which sphere::hit fills)
+// The hit as the materials and textures need it (the CPU's hit_record, which sphere::hit and quad::hit fill)
 template <real_number Real>
 __device__ surface<Real> surface_at(const scene_view<Real>& scene, const ray<Real>& r, const bvh_hit<Real>& hit)
 {
     surface<Real> s{};
-    // A sphere that stands still, or a moving one where it is at the ray's time. Then Step 46's lines (see
-    // trace_first_book_ray above): the side from the root.
-    const bvh_view<Real>& tree = scene.tree;
-    const sphere<Real> ball = hit.index < tree.moving_base
-                                  ? tree.spheres[hit.index]
-                                  : tree.moving_spheres[hit.index - tree.moving_base].at(r.time);
     s.rec.p = r.at(hit.t);
-    s.outward = (Real(1) / ball.radius) * (s.rec.p - ball.center);
-    s.rec.front_face = hit.entering;
-    s.rec.normal = s.rec.front_face ? s.outward : -s.outward;
-
+    s.rec.front_face = hit.entering; // from the root for a sphere, from the sign of normal·direction for a quad
+    s.texture_point = s.rec.p;
     s.material = scene.primitive_materials[hit.index];
     const material_texture shading = scene.material_textures[s.material];
     s.texture_index = shading.texture_index;
+    const bvh_view<Real>& tree = scene.tree;
+    if (hit.index >= tree.quad_base)
+    {
+        const quad<Real> face = tree.quads[hit.index - tree.quad_base];
+        s.outward = face.normal;
+        s.rec.normal = s.rec.front_face ? s.outward : -s.outward;
+        if (shading.needs_uv)
+        {
+            quad_uv(face, r, hit.t, s.u, s.v);
+        }
+        if (shading.needs_exact_point)
+        {
+            // A checker's colors jump across the faces of its cubes, and a quad can lie in one (a floor at y = 0):
+            // there the point's rounding error alone decides the side it falls on, and so its color. The CPU rounds
+            // t·direction, then the sum: for rays from above, the floor's points come out at y = 0 or just above, the
+            // color of the cubes above. at() lets nvcc fuse the two into one rounding, and then about half of the
+            // points fell below: a floor of mixed colors. Computed as the CPU computes them, the points fall on the
+            // CPU's side as often as the CPU's do in float, and exactly where they do in double (an axis-aligned quad's
+            // t is the CPU's own number there).
+            s.texture_point = r.at_unfused(hit.t);
+        }
+        return s;
+    }
+    // A sphere that stands still, or a moving one where it is at the ray's time. Then Step 46's lines (see
+    // trace_first_book_ray above).
+    const sphere<Real> ball = hit.index < tree.moving_base
+                                  ? tree.spheres[hit.index]
+                                  : tree.moving_spheres[hit.index - tree.moving_base].at(r.time);
+    s.outward = (Real(1) / ball.radius) * (s.rec.p - ball.center);
+    s.rec.normal = s.rec.front_face ? s.outward : -s.outward;
     if (shading.needs_uv)
     {
         sphere_uv(s.outward, s.u, s.v);
     }
-    s.texture_point = shading.needs_exact_point
-                          ? onto_sphere(s.rec.p, s.outward, ball, scene.sphere_frames[hit.index])
-                          : s.rec.p;
+    if (shading.needs_exact_point)
+    {
+        s.texture_point = onto_sphere(s.rec.p, s.outward, ball, scene.sphere_frames[hit.index]);
+    }
     return s;
 }
 
@@ -246,7 +270,7 @@ __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const ca
     // A bounce keeps the ray's time (material.ixx for metal and glass, ray_color in camera.ixx for a diffuse bounce)
     p.r = {s.rec.p, direction, p.r.time};
     p.from = hit.index;
-    p.inward = dot(direction, s.outward) < Real(0);
+    p.inward = dot(direction, s.outward) < Real(0); // read only when the ray leaves a sphere (see closest_hit)
     return false;
 }
 

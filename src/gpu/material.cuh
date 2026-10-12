@@ -33,7 +33,8 @@ struct material_texture
     bool needs_uv;          // its texture reads the texture coordinates (an image, also inside a checker): only then
                             // does the hit compute them
     bool needs_exact_point; // its texture is a checker, whose colors jump across the faces of its cubes: on a sphere
-                            // it reads the hit point moved exactly onto the surface (onto_sphere in sphere.cuh)
+                            // it reads the hit point moved exactly onto the surface (onto_sphere in sphere.cuh), on
+                            // a quad the point computed as the CPU computes it (see surface_at in camera.cuh)
 };
 
 // Where a ray hit, as the materials need it (the CPU's hit_record without the texture coordinates)
@@ -42,7 +43,7 @@ struct hit_record
 {
     point3<Real> p;
     vec3<Real> normal; // unit length, facing against the ray
-    bool front_face;   // the ray came from outside the sphere
+    bool front_face;   // the ray hit the outside of a sphere, or the front of a quad (the side u × v points to)
 };
 
 // onb(n).transform(v) of onb.ixx: v is given in an orthonormal basis whose z axis is the unit vector n, and the result

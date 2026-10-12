@@ -60,14 +60,14 @@ constexpr int block_height = 8;
 // A warp is 32 threads, so a block should be a whole number of warps; warp_sum below also relies on it
 static_assert(block_width * block_height % 32 == 0);
 
-// The BVH's leaves hold one sphere, as the CPU's do: on the weekend scene that was faster than leaves of up to 2, 4 or
-// 8 spheres (by 5, 7 and 20%). But for a handful of spheres a tree costs more than it saves: testing them all was
-// faster in every scene of 8 spheres measured (parts of the weekend scene, with and without its ground) and about as
-// fast at 16, and the materials scene renders 1.7 times faster as a single leaf. So a scene of at most 8 spheres gets
-// a single leaf (one per kind under a root when some of its spheres move and others don't: see add_subtree in
-// bvh.cuh).
+// The BVH's leaves hold one primitive, as the CPU's hold one object: on the weekend scene that was faster than leaves
+// of up to 2, 4 or 8 spheres (by 5, 7 and 20%). But for a handful of spheres a tree costs more than it saves: testing
+// them all was faster in every scene of 8 spheres measured (parts of the weekend scene, with and without its ground)
+// and about as fast at 16, and the materials scene renders 1.7 times faster as a single leaf. So a scene of at most 8
+// shapes (spheres and quads) gets a single leaf (one per kind under a root when it has shapes of several kinds: see
+// add_subtree in bvh.cuh).
 constexpr int bvh_leaf_size = 1;
-constexpr int small_scene_spheres = 8;
+constexpr int small_scene_shapes = 8;
 
 // How long one kernel launch should take (see launch_planner): 100 ms would render 2.5% faster, 25 ms 5% slower
 constexpr double launch_seconds = 0.05;
@@ -715,6 +715,18 @@ void validate(const scene_desc& scene)
             throw std::runtime_error("a sphere refers to a material that doesn't exist");
         }
     }
+    for (const quad_desc& q : scene.quads)
+    {
+        if (q.material < 0 || q.material >= std::ssize(scene.materials))
+        {
+            throw std::runtime_error("a quad refers to a material that doesn't exist");
+        }
+    }
+    // Global ids are ints (see bvh in bvh.cuh)
+    if (scene.spheres.size() + scene.quads.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    {
+        throw std::runtime_error("the scene has too many shapes for the GPU renderer");
+    }
 }
 
 // Whether a sphere moves while the shutter is open
@@ -723,12 +735,12 @@ bool moves(const sphere_desc& s)
     return s.displacement.x != 0 || s.displacement.y != 0 || s.displacement.z != 0;
 }
 
-// Whether the first book's kernel can render the scene (see first_book_kernel): its spheres stand still, and every
-// material is a lambertian of one color, a metal or a dielectric. (Every scene the GPU renders so far is lit by the
-// sky.)
+// Whether the first book's kernel can render the scene (see first_book_kernel): it has spheres that stand still and no
+// other shapes, and every material is a lambertian of one color, a metal or a dielectric. (Every scene the GPU renders
+// so far is lit by the sky.)
 bool first_book_scene(const scene_desc& scene)
 {
-    return std::ranges::none_of(scene.spheres, moves) &&
+    return scene.quads.empty() && std::ranges::none_of(scene.spheres, moves) &&
            std::ranges::all_of(scene.materials, [&](const material_desc& m) {
                return m.kind != material_kind::lambertian || solid_lambertian(scene, m);
            });
@@ -741,7 +753,7 @@ class device_scene
 {
 public:
     explicit device_scene(const scene_desc& scene)
-        : device_scene(scene, build_bvh<Real>(scene.spheres, leaf_size(scene)), to_images(scene.images))
+        : device_scene(scene, build_bvh<Real>(scene.spheres, scene.quads, leaf_size(scene)), to_images(scene.images))
     {
     }
 
@@ -752,7 +764,9 @@ public:
                          .spheres = spheres_.data(),
                          .node_count = node_count_,
                          .moving_spheres = moving_spheres_.data(),
-                         .moving_base = moving_base_},
+                         .moving_base = moving_base_,
+                         .quads = quads_.data(),
+                         .quad_base = quad_base_},
                 .primitive_materials = primitive_materials_.data(),
                 .sphere_frames = sphere_frames_.data(),
                 .materials = materials_.data(),
@@ -770,6 +784,8 @@ private:
           spheres_(tree.spheres),
           moving_spheres_(tree.moving_spheres),
           moving_base_(tree.moving_base),
+          quads_(tree.quads),
+          quad_base_(tree.quad_base),
           primitive_materials_(tree.primitive_materials),
           sphere_frames_(tree.sphere_frames),
           materials_(to_materials<Real>(scene)),
@@ -784,7 +800,8 @@ private:
 
     static int leaf_size(const scene_desc& scene)
     {
-        return std::ssize(scene.spheres) <= small_scene_spheres ? small_scene_spheres : bvh_leaf_size;
+        const std::size_t shapes = scene.spheres.size() + scene.quads.size();
+        return shapes <= static_cast<std::size_t>(small_scene_shapes) ? small_scene_shapes : bvh_leaf_size;
     }
 
     device_array<bvh_node<Real>> nodes_;
@@ -792,6 +809,8 @@ private:
     device_array<sphere<Real>> spheres_;
     device_array<moving_sphere<Real>> moving_spheres_;
     int moving_base_;
+    device_array<quad<Real>> quads_;
+    int quad_base_;
     device_array<int> primitive_materials_;
     device_array<sphere_frame<Real>> sphere_frames_;
     device_array<material<Real>> materials_;

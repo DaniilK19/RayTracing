@@ -17,6 +17,7 @@
 #include <type_traits>
 #include <vector>
 
+#include "quad.cuh"
 #include "renderer.h"
 #include "sphere.cuh"
 
@@ -44,6 +45,7 @@ enum class primitive_kind
     sphere,        // a sphere that stands still. 0, so that a leaf of n of them has count n: a tree of spheres that
                    // stand still is exactly the first book's
     moving_sphere, // a sphere that moves while the shutter is open
+    quad,          // a parallelogram
 };
 
 // A leaf's count holds two numbers, n | kind << 8: how many primitives it has in the low 8 bits (the builder makes at
@@ -63,8 +65,9 @@ __host__ __device__ primitive_kind leaf_kind(const bvh_node<Real>& node)
 }
 
 // The traversal keeps the nodes it has yet to visit on a stack in each thread's memory. A median split halves the
-// spheres at every level, so a tree over n spheres is about log2(n) levels deep, and the stack never holds more nodes
-// than there are levels. build_bvh checks that the stack is deep enough (it is for any scene that fits in memory).
+// primitives at every level, so a tree over n primitives is about log2(n) levels deep, and the stack never holds more
+// nodes than there are levels. build_bvh checks that the stack is deep enough (it is for any scene that fits in
+// memory).
 inline constexpr int bvh_stack_size = 32;
 
 // Which kernel renders (see the kernels in renderer.cu): the first book's, for scenes that need nothing beyond the
@@ -77,17 +80,19 @@ enum class kernel_kind
 
 // The tree for the GPU: the nodes, each kind's primitives in the order of the leaves, and what only the closest hit
 // reads about each primitive, its material and (a sphere's) frame. Every primitive has a global id, one number that
-// tells the kernel which it is: the spheres that stand still are 0, 1, 2... in their array's order, and the moving
-// spheres follow them from moving_base on. The arrays of what the hit reads are indexed by it.
+// tells the kernel which it is: the spheres that stand still are 0, 1, 2... in their array's order, the moving spheres
+// follow them from moving_base on, and the quads from quad_base on. The arrays of what the hit reads are indexed by it.
 template <real_number Real>
 struct bvh
 {
     std::vector<bvh_node<Real>> nodes;
     std::vector<sphere<Real>> spheres;
     std::vector<moving_sphere<Real>> moving_spheres;
+    std::vector<quad<Real>> quads;
     std::vector<int> primitive_materials;          // by global id: its material's index in scene_desc::materials
-    std::vector<sphere_frame<Real>> sphere_frames; // by global id
+    std::vector<sphere_frame<Real>> sphere_frames; // by global id, for the spheres of both kinds
     int moving_base = 0;                           // the global id of moving_spheres[0]: how many spheres stand still
+    int quad_base = 0;                             // the global id of quads[0]: how many spheres there are
 };
 
 // Host code (it runs on the CPU, once, before the render) from here to build_bvh.
@@ -141,7 +146,8 @@ template <real_number Real>
 class bvh_builder
 {
 public:
-    bvh_builder(std::span<const sphere_desc> spheres, int max_leaf_size) : max_leaf_size_(max_leaf_size)
+    bvh_builder(std::span<const sphere_desc> spheres, std::span<const quad_desc> quads, int max_leaf_size)
+        : max_leaf_size_(max_leaf_size)
     {
         // The spheres that stand still first, in the scene's order, then the moving ones. A scene whose spheres all
         // stand still then gives the builder the input of the first book's renderer, and so the same tree.
@@ -160,12 +166,17 @@ public:
                 add_moving_sphere(s);
             }
         }
+        tree_.quad_base = static_cast<int>(inputs_.size());
+        for (const quad_desc& q : quads)
+        {
+            add_quad(q);
+        }
     }
 
     bvh<Real> build() &&
     {
         tree_.primitive_materials.resize(inputs_.size());
-        tree_.sphere_frames.resize(inputs_.size());
+        tree_.sphere_frames.resize(static_cast<std::size_t>(tree_.quad_base));
         std::vector<int> order(inputs_.size());
         std::iota(order.begin(), order.end(), 0); // 0, 1, 2, ...: indices into inputs_, sorted below
         if (!order.empty())
@@ -181,9 +192,9 @@ private:
     struct input
     {
         primitive_kind kind;
-        int index; // in spheres_ or moving_spheres_
+        int index; // in spheres_, moving_spheres_ or quads_
         int material;
-        sphere_frame<Real> frame;
+        sphere_frame<Real> frame; // a sphere's
         build_box box;
     };
 
@@ -191,6 +202,7 @@ private:
     std::vector<input> inputs_;
     std::vector<sphere<Real>> spheres_;
     std::vector<moving_sphere<Real>> moving_spheres_;
+    std::vector<quad<Real>> quads_;
     bvh<Real> tree_;
 
     static bool is_stationary(const sphere_desc& s)
@@ -254,6 +266,51 @@ private:
         moving_spheres_.push_back(converted);
     }
 
+    void add_quad(const quad_desc& desc)
+    {
+        // The box of the four corners, in double. The GPU tests the quad in Real, whose rounded axes accept points up
+        // to ~10^-7 of the coordinates beyond the exact edges, so the box is widened by 10^-6 of them on every side:
+        // this margin, which grows with the coordinates, is what keeps the slab test from missing the box by rounding.
+        // And as the CPU pads a flat box to 0.0001 (aabb::axis_span), an axis still thinner than that after the margin
+        // gets 0.0001 more: the flat side of a quad in a plane x = c, 2·10^-6·(1 + the largest coordinate) thick,
+        // while the largest coordinate is below 49 (in the Cornell box the margin alone makes it 0.0011).
+        const vec3d corners[4] = {desc.q,
+                                  {desc.q.x + desc.u.x, desc.q.y + desc.u.y, desc.q.z + desc.u.z},
+                                  {desc.q.x + desc.v.x, desc.q.y + desc.v.y, desc.q.z + desc.v.z},
+                                  {desc.q.x + desc.u.x + desc.v.x, desc.q.y + desc.u.y + desc.v.y,
+                                   desc.q.z + desc.u.z + desc.v.z}};
+        build_box box;
+        double largest = 0;
+        for (const vec3d& c : corners)
+        {
+            const std::array<double, 3> xyz{c.x, c.y, c.z};
+            for (std::size_t axis = 0; axis < 3; ++axis)
+            {
+                box.min[axis] = std::min(box.min[axis], xyz[axis]);
+                box.max[axis] = std::max(box.max[axis], xyz[axis]);
+                largest = std::max(largest, std::fabs(xyz[axis]));
+            }
+        }
+        const double margin = 1e-6 * (1 + largest);
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            box.min[axis] -= margin;
+            box.max[axis] += margin;
+            constexpr double min_size = 0.0001;
+            if (box.max[axis] - box.min[axis] < min_size)
+            {
+                box.min[axis] -= min_size / 2;
+                box.max[axis] += min_size / 2;
+            }
+        }
+        inputs_.push_back({.kind = primitive_kind::quad,
+                           .index = static_cast<int>(quads_.size()),
+                           .material = desc.material,
+                           .frame = {},
+                           .box = box});
+        quads_.push_back(make_quad<Real>(desc));
+    }
+
     // Puts the input's primitive at the end of its kind's array in the tree, and its material and frame at its global
     // id
     void add_to_leaf(const input& in)
@@ -269,6 +326,11 @@ private:
             id = tree_.moving_base + static_cast<int>(tree_.moving_spheres.size());
             tree_.moving_spheres.push_back(moving_spheres_[static_cast<std::size_t>(in.index)]);
             break;
+        case primitive_kind::quad:
+            id = tree_.quad_base + static_cast<int>(tree_.quads.size());
+            tree_.quads.push_back(quads_[static_cast<std::size_t>(in.index)]);
+            tree_.primitive_materials[static_cast<std::size_t>(id)] = in.material;
+            return; // a quad has no frame
         }
         tree_.primitive_materials[static_cast<std::size_t>(id)] = in.material;
         tree_.sphere_frames[static_cast<std::size_t>(id)] = in.frame;
@@ -277,7 +339,15 @@ private:
     // How many primitives of a kind the tree's array has so far: where a new leaf of that kind starts
     int tree_size(primitive_kind kind) const
     {
-        return static_cast<int>(kind == primitive_kind::sphere ? tree_.spheres.size() : tree_.moving_spheres.size());
+        switch (kind)
+        {
+        case primitive_kind::sphere:
+            return static_cast<int>(tree_.spheres.size());
+        case primitive_kind::moving_sphere:
+            return static_cast<int>(tree_.moving_spheres.size());
+        default:
+            return static_cast<int>(tree_.quads.size());
+        }
     }
 
     // Adds the subtree over the inputs in `indices` to the nodes, depth first, and returns its root's index. Recursion
@@ -341,9 +411,9 @@ private:
 // Builds the tree with leaves of at most max_leaf_size primitives. The CPU's leaves are single objects; renderer.cu
 // explains the sizes the GPU uses.
 template <real_number Real>
-bvh<Real> build_bvh(std::span<const sphere_desc> spheres, int max_leaf_size)
+bvh<Real> build_bvh(std::span<const sphere_desc> spheres, std::span<const quad_desc> quads, int max_leaf_size)
 {
-    return bvh_builder<Real>(spheres, max_leaf_size).build();
+    return bvh_builder<Real>(spheres, quads, max_leaf_size).build();
 }
 
 // Device code (it runs on the GPU) from here on.
@@ -355,8 +425,10 @@ struct bvh_view
     const bvh_node<Real>* nodes;
     const sphere<Real>* spheres;               // global ids [0, moving_base)
     int node_count;                            // 0 for an empty scene
-    const moving_sphere<Real>* moving_spheres; // global ids from moving_base on
+    const moving_sphere<Real>* moving_spheres; // global ids [moving_base, quad_base)
     int moving_base;
+    const quad<Real>* quads;                   // global ids from quad_base on
+    int quad_base;
 };
 
 // The tree as the first book's kernel sees it: Step 46's arrays, in a struct that never grows (see first_book_scene in
@@ -408,8 +480,9 @@ __device__ Real box_entry(const bvh_node<Real>& node, const vec3<Real>& inverse_
     return enter <= exit ? enter : infinity<Real>;
 }
 
-// What closest_hit found: the primitive's global id (-1: none), the distance to it, and whether the ray enters the
-// sphere there (see hit_sphere)
+// What closest_hit found: the primitive's global id (-1: none), the distance to it, and whether the ray hits the front
+// of the surface there: for a sphere, whether it enters it (see hit_sphere), for a quad, whether it hits the side its
+// normal u × v points to (see hit_quad)
 template <real_number Real>
 struct bvh_hit
 {
@@ -419,8 +492,12 @@ struct bvh_hit
 };
 
 // The closest primitive the ray hits at a distance t in (0.001, ∞): the CPU's world.hit(r, interval{0.001, infinity}),
-// except for the sphere the ray starts on, `from` (its global id; -1 for a camera ray), which follows the
-// self-intersection rule:
+// except for the primitive the ray starts on, `from` (its global id; -1 for a camera ray), which follows the
+// self-intersection rule. For a quad the rule is simple: a ray never hits the quad it leaves. A line meets a plane
+// only once, and this ray met it at its start, at t = 0 (or lies in it, which the parallel test rejects anyway). In
+// float that is needed: a hit point lies off its quad's plane by a float step of the coordinates (6·10^-5 in the
+// Cornell box), so a bounce at a grazing angle would meet its own quad again beyond t = 0.001, from the wrong side,
+// and its light would be lost. For a sphere:
 //
 // In float, a point on the ground sphere (radius 1000, centered at y = -1000) is known relative to that center only to
 // about 3·10^-5, half the distance between neighboring floats near 1000, and a computed hit point is often further off
@@ -498,6 +575,27 @@ __device__ bvh_hit<Real> closest_hit(const kernel_tree<Real, Kind>& tree, const 
                     if (hit_sphere(tree.spheres[i], r, inverse_a, t_min, closest.t, own, t, entering))
                     {
                         closest = {.index = i, .t = t, .entering = entering};
+                    }
+                }
+            }
+            else if (leaf_kind(node) == primitive_kind::quad)
+            {
+                const int end = node.index + leaf_size(node);
+                for (int i = node.index; i < end; ++i)
+                {
+                    const int id = tree.quad_base + i;
+                    if (id == from)
+                    {
+                        continue; // the self-intersection rule: a ray never hits the quad it leaves
+                    }
+                    // The whole record first: three 16-byte loads in float (six in double), rather than reads scattered
+                    // over hit_quad's steps
+                    const quad<Real> face = tree.quads[i];
+                    Real t;
+                    bool front_face;
+                    if (hit_quad(face, r, t_min, closest.t, t, front_face))
+                    {
+                        closest = {.index = id, .t = t, .entering = front_face};
                     }
                 }
             }
