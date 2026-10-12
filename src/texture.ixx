@@ -61,6 +61,11 @@ public:
         return is_even ? even_->value(u, v, p) : odd_->value(u, v, p);
     }
 
+    // For code that copies a scene into its own format: the GPU program
+    inline double inv_scale() const { return inv_scale_; }
+    inline const texture& even() const { return *even_; }
+    inline const texture& odd() const { return *odd_; }
+
 private:
     double inv_scale_; // 1 / scale: multiplying is faster than dividing
     std::shared_ptr<const texture> even_;

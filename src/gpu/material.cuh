@@ -18,9 +18,20 @@ template <real_number Real>
 struct material
 {
     material_kind kind;
-    color<Real> albedo;    // lambertian and metal
+    color<Real> albedo;    // metal; lambertian: its color when its texture is one solid color (see material_texture)
     Real fuzz;             // metal
     Real refraction_index; // dielectric
+};
+
+// What the kernel for all three books needs to know about a material besides the struct above, in an array of its own
+// (scene_view::material_textures), so that the first book's kernel, which never reads it, loads exactly what it loaded
+// before
+struct material_texture
+{
+    int texture_index;      // lambertian: an index into the textures, or -1 when its texture is one solid color,
+                            // which material::albedo then holds: no texture to look up at the hit
+    bool needs_exact_point; // its texture is a checker, whose colors jump across the faces of its cubes: on a sphere
+                            // it reads the hit point moved exactly onto the surface (onto_sphere in sphere.cuh)
 };
 
 // Where a ray hit, as the materials need it (the CPU's hit_record without the texture coordinates)
@@ -62,7 +73,8 @@ __device__ Real reflectance(Real cosine, Real refraction_index)
 // The material's scatter(): what happens to a ray with the given direction at the hit. Returns false if the light is
 // absorbed: the sample is then 0. Otherwise sets the direction of the next ray and multiplies the path's throughput by
 // the attenuation. As on the CPU, a matte bounce is sampled with the material's own density (the camera's material
-// strategy: the sky scenes have no lamps to aim at), so its weight pScatter / p is exactly 1.
+// strategy: the sky scenes have no lamps to aim at), so its weight pScatter / p is exactly 1. (The first book's kernel
+// calls it for every material; the kernel for all three books for metal and glass, see trace_ray in camera.cuh.)
 template <real_number Real>
 __device__ bool scatter(const material<Real>& mat, const vec3<Real>& direction, const hit_record<Real>& rec,
                         pcg32& rng, vec3<Real>& scattered, color<Real>& throughput)

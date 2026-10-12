@@ -15,11 +15,20 @@ struct alignas(4 * sizeof(Real)) sphere
     Real radius;
 };
 
+// What only the closest hit reads about a sphere besides its material (see bvh): the two numbers that let a checker
+// texture read a point exactly on the sphere (see onto_sphere). 8 bytes in float: one load.
+template <real_number Real>
+struct alignas(2 * sizeof(Real)) sphere_frame
+{
+    Real k;     // |center|² - radius², computed in double on the host from the sphere the GPU tests, then rounded
+    Real limit; // 2·radius·|center|: onto_sphere helps only where its own rounding stays below this
+};
+
 // The distance t (in lengths of the ray's direction) at which the ray hits the sphere, if a hit lies in (t_min, t_max),
 // and which root that is: `entering` is true for the near root, where the ray enters the sphere, and false for the far
-// one, where it leaves (see trace_ray for why that matters). inverse_a is 1 / |direction|², the same for every sphere,
-// so the caller computes it once per ray. far_only takes only the far root: for a ray that starts on this very sphere
-// and goes inside it (see closest_hit).
+// one, where it leaves (see trace_first_book_ray in camera.cuh for why that matters). inverse_a is 1 / |direction|²,
+// the same for every sphere, so the caller computes it once per ray. far_only takes only the far root: for a ray that
+// starts on this very sphere and goes inside it (see closest_hit).
 //
 // The CPU's sphere::hit returns a std::optional, but GPU code can't call the standard library's functions: they are
 // compiled for the CPU only. (nvcc rejects std::optional in GPU code unless an experimental flag,
@@ -64,5 +73,38 @@ __device__ bool hit_sphere(const sphere<Real>& s, const ray<Real>& r, Real inver
         t = h_over_a + half_chord;
     }
     return t_min < t && t < t_max;
+}
+
+// A point computed near the sphere, moved onto it, for a checker texture to read. A float hit point is known relative
+// to the sphere's center only to about a float step of the center's coordinates: on the ground of radius 1000 it lies
+// ~3·10^-5 above or below the surface, as hit_sphere rounds center - origin at 1000 (see closest_hit in bvh.cuh).
+// Mostly that doesn't matter, but a checker's colors jump where the surface crosses a face of its cubes, and the ground
+// of the bouncing scene touches the face y = 0 at the origin, right under the glass ball in the middle of the image.
+// Near there the ground is at y = -(x² + z²)/2000, a little below 0, so the CPU, whose points are good to 10^-13, takes
+// the cubes below y = 0. The float point's error is as large as that height out to x² + z² ≈ 0.06, so there it often
+// lands above 0 and takes the cubes above, of the other color: a patch of wrong colors, a bias no number of samples
+// removes.
+//
+// One step of Newton's method for f(p) = |p - c|² - radius² = 0 along the outward normal: p - (f / (2·radius))·outward,
+// as f / (2·radius) is how far p lies outside the sphere (to first order). f must not be computed as |p - c|² - r²:
+// p - c is a vector of the size of c, rounded as in hit_sphere. Multiplied out, f = |p|² - 2·p·c + k with
+// k = |c|² - r² from the host (sphere_frame, computed in double): near the world's origin every term is small, for the
+// ground k is exactly 0, and p·c is -1000·p.y. f is then good to about a float step of |p|² + 2|p·c| + |k|, so the
+// moved point is good to ~10^-11 near the origin instead of 3·10^-5, and the checker's colors come out wrong only
+// within ~10^-4 of the contact. Far from the origin those terms grow, and the step would add more rounding than it
+// removes, so it is taken only while that bound is below 2·radius·|c| (frame.limit). The point moves only for the
+// texture: the next ray still starts at the hit point itself.
+template <real_number Real>
+__device__ point3<Real> onto_sphere(const point3<Real>& p, const vec3<Real>& outward, const sphere<Real>& s,
+                                    const sphere_frame<Real>& frame)
+{
+    const Real p_p = dot(p, p);
+    const Real p_c = dot(p, s.center);
+    if (!(p_p + Real(2) * fabs(p_c) + fabs(frame.k) < frame.limit))
+    {
+        return p; // where the step wouldn't help
+    }
+    const Real f = p_p - Real(2) * p_c + frame.k;
+    return p - (f / (Real(2) * s.radius)) * outward;
 }
 }

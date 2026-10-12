@@ -40,13 +40,23 @@ struct alignas(16) bvh_node
 // than there are levels. build_bvh checks that the stack is deep enough (it is for any scene that fits in memory).
 inline constexpr int bvh_stack_size = 32;
 
-// The tree for the GPU: the nodes, and the spheres and their material indices in the order of the leaves
+// Which kernel renders (see the kernels in renderer.cu): the first book's, for scenes that need nothing beyond the
+// first book, or the one for all three books
+enum class kernel_kind
+{
+    first_book, // spheres that stand still; lambertian with one color, metal, dielectric; the sky
+    all_books,  // everything else too
+};
+
+// The tree for the GPU: the nodes and the spheres in the order of the leaves, and in the same order what only the
+// closest hit reads about each sphere, its material and its frame. A sphere's index in these arrays identifies it.
 template <real_number Real>
 struct bvh
 {
     std::vector<bvh_node<Real>> nodes;
     std::vector<sphere<Real>> spheres;
-    std::vector<int> sphere_materials; // the index of each sphere's material in scene_desc::materials
+    std::vector<int> primitive_materials; // the index of each sphere's material in scene_desc::materials
+    std::vector<sphere_frame<Real>> sphere_frames;
 };
 
 // Host code (it runs on the CPU, once, before the render) from here to build_bvh.
@@ -106,9 +116,7 @@ public:
         // center ± radius may round inward, so each bound moves out by one step of double (std::nextafter).
         for (const sphere_desc& s : spheres)
         {
-            const sphere<Real> converted{
-                {static_cast<Real>(s.center.x), static_cast<Real>(s.center.y), static_cast<Real>(s.center.z)},
-                static_cast<Real>(s.radius)};
+            const sphere<Real> converted{to_real<Real>(s.center), static_cast<Real>(s.radius)};
             const double radius = converted.radius;
             const std::array<double, 3> center{converted.center.x, converted.center.y, converted.center.z};
             build_box box;
@@ -117,8 +125,14 @@ public:
                 box.min[axis] = std::nextafter(center[axis] - radius, -infinity<double>);
                 box.max[axis] = std::nextafter(center[axis] + radius, infinity<double>);
             }
+            // The frame's numbers (see onto_sphere), in double from the sphere in Real: the squares of floats are
+            // exact in double, so for the ground (center (0, -1000, 0), radius 1000) k comes out exactly 0
+            const double center_squared = center[0] * center[0] + center[1] * center[1] + center[2] * center[2];
+            const sphere_frame<Real> frame{.k = static_cast<Real>(center_squared - radius * radius),
+                                           .limit = static_cast<Real>(2 * radius * std::sqrt(center_squared))};
             spheres_.push_back(converted);
-            sphere_materials_.push_back(s.material);
+            materials_.push_back(s.material);
+            frames_.push_back(frame);
             boxes_.push_back(box);
         }
     }
@@ -137,7 +151,8 @@ public:
 private:
     int max_leaf_size_;
     std::vector<sphere<Real>> spheres_;
-    std::vector<int> sphere_materials_;
+    std::vector<int> materials_;
+    std::vector<sphere_frame<Real>> frames_;
     std::vector<build_box> boxes_;
     bvh<Real> tree_;
 
@@ -170,7 +185,8 @@ private:
             for (const int i : indices)
             {
                 tree_.spheres.push_back(spheres_[static_cast<std::size_t>(i)]);
-                tree_.sphere_materials.push_back(sphere_materials_[static_cast<std::size_t>(i)]);
+                tree_.primitive_materials.push_back(materials_[static_cast<std::size_t>(i)]);
+                tree_.sphere_frames.push_back(frames_[static_cast<std::size_t>(i)]);
             }
             return index;
         }

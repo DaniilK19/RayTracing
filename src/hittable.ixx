@@ -131,6 +131,10 @@ public:
 
     inline bool empty() const { return objects_.empty(); }
 
+    // The objects, to look at without taking them, for code that copies a scene into its own format (the GPU program).
+    // A span (C++20) is a view of elements stored elsewhere: here of the list's own vector, read-only.
+    inline std::span<const std::unique_ptr<hittable>> objects() const { return objects_; }
+
     // A list of lamps draws a direction toward a randomly chosen one of them, each with probability 1/n. So the
     // density of a direction is the average of all the objects' densities: it could have been drawn toward any
     // of them whose solid angle contains it.

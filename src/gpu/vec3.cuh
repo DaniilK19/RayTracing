@@ -2,7 +2,7 @@
 //
 // The GPU renders in float or in double (see precision in renderer.h) from one source: the device code is made of
 // templates on Real, which is one of the two, and nvcc compiles each of them twice. The float version must compute
-// nothing in double but the pixel sums (see render_kernel in renderer.cu). A GeForce card does double arithmetic 64
+// nothing in double but the pixel sums (see render_pixel in renderer.cu). A GeForce card does double arithmetic 64
 // times slower than float, so one forgotten double in the inner loop would cost more than all the float math around it.
 // That is why literals are written as Real(0.5), not 0.5 (a double), and why the math functions below have a GPU
 // overload for each type.
@@ -10,6 +10,8 @@
 
 #include <concepts>
 #include <limits>
+
+#include "renderer.h"
 
 namespace gpu
 {
@@ -29,7 +31,9 @@ constexpr Real infinity = std::numeric_limits<Real>::infinity();
 // warning, while the GPU code compiled from it is wrong. These overloads name exactly the functions the device code
 // needs, each with its GPU version for float and for double, and hide the global ones inside namespace gpu: template
 // code that writes sqrt(x) gets the GPU function of x's own type, and an int argument is a compile error (float or
-// double? ambiguous) instead of a quiet conversion.
+// double? ambiguous) instead of a quiet conversion. The other side of this: host code in namespace gpu (the BVH
+// builder, the conversions in renderer.cu) must name the standard library's functions in full, std::sqrt or
+// std::floor, as an unqualified call would find these GPU-only functions first.
 // __device__ marks a function that runs on the GPU and is called from GPU code; nvcc compiles it for the GPU only.
 __device__ inline float sqrt(float x) { return ::sqrtf(x); }
 __device__ inline double sqrt(double x) { return ::sqrt(x); }
@@ -47,6 +51,9 @@ __device__ inline double copysign(double x, double y) { return ::copysign(x, y);
 // x·y + z with a single rounding (a fused multiply-add), one GPU instruction
 __device__ inline float fma(float x, float y, float z) { return ::fmaf(x, y, z); }
 __device__ inline double fma(double x, double y, double z) { return ::fma(x, y, z); }
+// The largest whole number not above x (the checker texture's cubes)
+__device__ inline float floor(float x) { return ::floorf(x); }
+__device__ inline double floor(double x) { return ::floor(x); }
 // sin(π·x) and cos(π·x) in one call. More accurate than sin(π * x), whose argument π * x is already rounded.
 __device__ inline void sincospi(float x, float* sine, float* cosine) { ::sincospif(x, sine, cosine); }
 __device__ inline void sincospi(double x, double* sine, double* cosine) { ::sincospi(x, sine, cosine); }
@@ -109,6 +116,14 @@ template <real_number Real>
 __host__ __device__ Real dot(const vec3<Real>& u, const vec3<Real>& v)
 {
     return u.x * v.x + u.y * v.y + u.z * v.z;
+}
+
+// Host code: a vector of the interface (renderer.h), which is in double, rounded to the precision the GPU computes in.
+// It lives in this header, not in renderer.cu, because templates in the other headers (the BVH builder) call it too.
+template <real_number Real>
+vec3<Real> to_real(const vec3d& v)
+{
+    return {static_cast<Real>(v.x), static_cast<Real>(v.y), static_cast<Real>(v.z)};
 }
 
 template <real_number Real>

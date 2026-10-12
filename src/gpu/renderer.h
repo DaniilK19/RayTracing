@@ -6,6 +6,10 @@
 // (the same scene, the same camera) and translates it into the structures below. Only plain data crosses over: no
 // virtual functions and no pointers into the CPU's objects.
 //
+// The scene is a set of tables that refer to each other by index, as the CPU's objects refer to each other by pointer:
+// a sphere names its material, a material its texture, a checker two other textures. Each struct mirrors a CPU class,
+// with plain fields in double; how the GPU stores them is the renderer's own business.
+//
 // A file that also has `import std;` must include this header BEFORE that line: MSVC accepts standard headers ahead of
 // the std module in one file, but not after it.
 #pragma once
@@ -26,10 +30,31 @@ struct vec3d
     double z = 0;
 };
 
-// The first book's three materials (see material.ixx).
+// --- Textures (texture.ixx) -----------------------------------------------------------------------------------------
+
+enum class texture_kind
+{
+    solid,   // solid_color: one color everywhere
+    checker, // checker_texture: the cubes of space alternate between two other textures
+};
+
+// A texture: its kind and the numbers of that kind (the other fields keep their defaults). Textures refer to each
+// other by their index in scene_desc::textures, and a checker's two textures always come before it: following them
+// leads to smaller and smaller indices, so the GPU's loop down nested checkers must end (renderer.cu checks it).
+struct texture_desc
+{
+    texture_kind kind = texture_kind::solid;
+    vec3d rgb;            // solid: its color (solid_color::albedo)
+    double inv_scale = 1; // checker: 1 / the side of its cubes, the number the CPU multiplies by (inv_scale())
+    int even = -1;        // checker: the texture of the cubes whose x + y + z is even, an index into textures
+    int odd = -1;         // checker: the texture of the other cubes
+};
+
+// --- Materials (material.ixx) ---------------------------------------------------------------------------------------
+
 enum class material_kind
 {
-    lambertian, // matte: albedo
+    lambertian, // matte: `texture` is its albedo
     metal,      // a blurred mirror: albedo and fuzz
     dielectric, // glass: refraction_index
 };
@@ -37,10 +62,13 @@ enum class material_kind
 struct material_desc
 {
     material_kind kind = material_kind::lambertian;
-    vec3d albedo;                // lambertian and metal: the fraction of light kept in each channel
+    vec3d albedo;                // metal: the fraction of light kept in each channel
     double fuzz = 0;             // metal: 0 is a perfect mirror; at most 1 (the metal class caps it)
     double refraction_index = 1; // dielectric: relative to the medium around it (1 / 1.5 for an air bubble in glass)
+    int texture = -1;            // lambertian: an index into scene_desc::textures (a single color is a solid texture)
 };
+
+// --- Shapes, in world coordinates (sphere.ixx) ----------------------------------------------------------------------
 
 // A stationary sphere
 struct sphere_desc
@@ -49,6 +77,8 @@ struct sphere_desc
     double radius = 0;
     int material = 0; // an index into scene_desc::materials
 };
+
+// --- The camera (camera.ixx) ----------------------------------------------------------------------------------------
 
 // The camera as the CPU's camera class has set it up from its settings (see camera_frame in camera.ixx). The sample of
 // pixel (i, j) in cell (s_i, s_j) of the pixel's sqrt_spp × sqrt_spp grid is the ray from the camera center, or from a
@@ -73,11 +103,14 @@ struct camera_desc
     vec3d sky_top;
 };
 
+// --- The scene, and how to render it --------------------------------------------------------------------------------
+
 struct scene_desc
 {
     std::vector<sphere_desc> spheres;
     std::vector<material_desc> materials;
     camera_desc camera;
+    std::vector<texture_desc> textures;
 };
 
 // The number type the GPU computes with. A GeForce card does arithmetic on 32-bit floats about
@@ -97,6 +130,22 @@ struct render_options
     // and one kernel launch may complete several), with the number of passes done so far and their total. May be
     // empty.
     std::function<void(int done, int total)> progress;
+    // Render with the kernel for all three books even where the first book's kernel would do (see the kernels in
+    // renderer.cu): a check that the general code computes the first book's paths as Step 46 does, and a measure of
+    // what its generality costs
+    bool all_books_kernel = false;
+};
+
+// The kernel that rendered, as the CUDA runtime describes it: the numbers that decide how many of its threads a
+// multiprocessor keeps in flight (its occupancy, see blocks_per_multiprocessor in renderer.cu)
+struct kernel_info
+{
+    std::string name;                       // "first book" or "all books"
+    int registers = 0;                      // per thread
+    int local_bytes = 0;                    // per thread: the BVH stack, and registers spilled to memory, if any
+    int blocks_per_multiprocessor = 0;      // as many as fit at once
+    int threads_per_block = 0;              // 128
+    int max_threads_per_multiprocessor = 0; // 1536 on the test GPU
 };
 
 struct render_result
@@ -106,6 +155,7 @@ struct render_result
     double seconds = 0;         // the whole render() call: the BVH, copying to the GPU, all passes, copying back
     double kernel_seconds = 0;  // the passes alone, timed on the GPU
     std::uint64_t rays = 0;     // rays traced: camera rays and all their bounces
+    kernel_info kernel;
 };
 
 struct device_info
@@ -123,6 +173,7 @@ struct device_info
 // times only the rendering. Throws std::runtime_error if there is no device (no NVIDIA GPU, or no driver).
 device_info query_device();
 
-// Renders the scene on the first CUDA device. Throws std::runtime_error with CUDA's message if something fails.
+// Renders the scene on the first CUDA device. Throws std::runtime_error with CUDA's message if something fails, or if
+// the scene is inconsistent (an index out of range, a checker before its textures...).
 render_result render(const scene_desc& scene, const render_options& options);
 }

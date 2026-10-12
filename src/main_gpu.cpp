@@ -1,4 +1,4 @@
-// RayTracingGPU: the first book's scenes rendered on an NVIDIA graphics card with CUDA.
+// RayTracingGPU: RayTracing's scenes rendered on an NVIDIA graphics card with CUDA (so far those in supported_scenes).
 // The scene comes from the CPU ray tracer's own modules: the same objects and the same camera as in RayTracing.
 // This program translates them into the plain data of the GPU renderer's interface (gpu/renderer.h), and saves the
 // image with the CPU's image class. So the two programs differ only in how they render, and the CPU stays the
@@ -13,9 +13,12 @@
 import std;
 import camera;
 import cli;
+import constant_medium;
 import hittable;
 import image;
+import instance;
 import material;
+import quad;
 import scenes;
 import sphere;
 import texture;
@@ -23,16 +26,17 @@ import vec3;
 
 // --- The command line ------------------------------------------------------------------------------------------
 
-// The scenes of RayTracing that the GPU can render so far: the first book's. The others need the second and third
-// books' features (textures, quads, moving spheres, smoke, lamps), and to_gpu below says which one is missing.
+// The scenes of RayTracing that the GPU can render so far. The others need features of the second and third books
+// that the GPU doesn't have yet (quads, moving spheres, smoke, lamps...), and to_gpu below says which one is missing.
 // In the end to_gpu decides, so any scene it can translate renders: earth, for one, when its texture's file is
 // missing, as the plain cyan sphere that the CPU renders then too.
 // std::to_array (C++20) counts the names itself, so the array's size can't disagree with the list.
-constexpr auto supported_scenes = std::to_array<std::string_view>({"materials", "weekend"});
+constexpr auto supported_scenes = std::to_array<std::string_view>({"materials", "weekend", "checker"});
 constexpr std::string_view default_gpu_scene = "weekend";
 
-// The options are RayTracing's, except -p (the GPU samples as the material scatters, as the CPU does in a scene lit
-// by the sky) and --fp64. std::optional tells "not given: take it from the scene" apart from any given value.
+// The options are RayTracing's without -p (the GPU samples as the material scatters, as the CPU does in a scene lit
+// by the sky), plus two of the GPU's own: --fp64 and --all-books-kernel. std::optional tells "not given: take it from
+// the scene" apart from any given value.
 struct options
 {
     std::string_view scene = default_gpu_scene;
@@ -41,6 +45,7 @@ struct options
     std::uint32_t seed = 0;
     std::vector<std::filesystem::path> outputs; // one per -o; parse_options adds <scene name>-gpu.png if there is none
     bool fp64 = false;
+    bool all_books_kernel = false;
     bool help = false;
 };
 
@@ -48,7 +53,7 @@ void print_usage()
 {
     std::println("Usage: RayTracingGPU [scene] [options]\n\n"
                  "Renders RayTracing's scenes on an NVIDIA graphics card with CUDA. So far it can render\n"
-                 "the first book's scenes:");
+                 "these scenes:");
     for (const std::string_view name : supported_scenes)
     {
         std::println("  {:10} {}", name, find_scene(name)->description);
@@ -63,6 +68,9 @@ Options:
                        because the rays form a k×k grid in the pixel
       --fp64           compute in 64-bit doubles like the CPU instead of 32-bit floats:
                        a check of the floats, many times slower on a GeForce card
+      --all-books-kernel
+                       render with the kernel for all three books, also the first book's scenes
+                       (a check: the same image, bit for bit expected; and the price of generality)
       --seed N         which random numbers to draw, from 0 (the default) to {}:
                        another seed renders the same image with independent noise
   -o, --output FILE    where to save the image (default <scene>-gpu.png): a .png, or a .pfm that
@@ -86,6 +94,11 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         if (arg == "--fp64")
         {
             opts.fp64 = true;
+            continue;
+        }
+        if (arg == "--all-books-kernel")
+        {
+            opts.all_books_kernel = true;
             continue;
         }
 
@@ -186,38 +199,173 @@ gpu::camera_desc to_gpu(const camera_frame& frame)
             .sky_top = to_gpu(frame.background.top)};
 }
 
-// One of the first book's three materials, or why the GPU can't render the material. dynamic_cast asks an object
-// what it really is: dynamic_cast<const metal*>(mat) gives a pointer to the metal if mat points to one, and nullptr
-// if it points to another kind of material (or is nullptr itself).
-std::expected<gpu::material_desc, std::string> to_gpu(const material* mat)
+// Calls on_shape(shape) for every object in the lists under `object` that isn't a list itself (or for `object`, if it
+// isn't a list). Only lists are opened so far, the world among them: an object that holds others in another way goes
+// to on_shape whole, and add_shape says the GPU can't render it yet. Stops at the first error that on_shape returns.
+// (An abbreviated function template, C++20: on_shape may be any callable that takes a hittable, here a lambda.)
+std::expected<void, std::string> for_each_shape(const hittable& object, const auto& on_shape)
 {
-    if (const auto* matte = dynamic_cast<const lambertian*>(mat))
+    // dynamic_cast asks an object what it really is: dynamic_cast<const hittable_list*>(&object) gives a pointer to
+    // the list if object is one, and nullptr if it is another kind of hittable
+    if (const auto* list = dynamic_cast<const hittable_list*>(&object))
     {
-        // The GPU has no textures yet, only one color for the whole surface
-        const auto* solid = dynamic_cast<const solid_color*>(&matte->albedo_texture());
-        if (!solid)
+        for (const std::unique_ptr<hittable>& child : list->objects())
         {
-            return std::unexpected("it has a texture");
+            if (auto done = for_each_shape(*child, on_shape); !done)
+            {
+                return done;
+            }
         }
-        return gpu::material_desc{.kind = gpu::material_kind::lambertian, .albedo = to_gpu(solid->albedo())};
+        return {};
     }
-    if (const auto* mirror = dynamic_cast<const metal*>(mat))
-    {
-        return gpu::material_desc{
-            .kind = gpu::material_kind::metal, .albedo = to_gpu(mirror->albedo()), .fuzz = mirror->fuzz()};
-    }
-    if (const auto* glass = dynamic_cast<const dielectric*>(mat))
-    {
-        return gpu::material_desc{.kind = gpu::material_kind::dielectric,
-                                  .refraction_index = glass->refraction_index()};
-    }
-    return std::unexpected("it has a material other than lambertian, metal and dielectric");
+    return on_shape(object);
 }
 
-// The whole scene, or why the GPU can't render it yet. So far the GPU has the first book's features: spheres that
-// stand still, its three materials and the sky as the only light. The scene is taken by value: its objects are
-// moved out of it.
-std::expected<gpu::scene_desc, std::string> to_gpu(scene s, const camera_frame& frame)
+// Translates the CPU's scene into the GPU renderer's tables (renderer.h), or says why the GPU can't render it yet. It
+// reads the CPU's objects where they are, through dynamic_cast and their accessors, and changes nothing.
+class scene_translator
+{
+public:
+    explicit scene_translator(const camera_frame& frame) { desc_.camera = to_gpu(frame); }
+
+    // Every sphere of the world, wherever it is in the world's lists
+    std::expected<void, std::string> add_world(const hittable_list& world)
+    {
+        return for_each_shape(world, [this](const hittable& shape) { return add_shape(shape); });
+    }
+
+    gpu::scene_desc finish() && { return std::move(desc_); }
+
+private:
+    gpu::scene_desc desc_;
+    // Objects can share a material or a texture (they are shared_ptrs), and on the GPU they share it too: each one is
+    // stored once, the first time something refers to it, and found again by its address. The maps are only looked
+    // up, never iterated, so the tables' order depends only on the order of the world's objects, the same on every
+    // run: the order of first use, except that a checker comes after the two textures it refers to.
+    std::unordered_map<const material*, int> material_indices_;
+    std::unordered_map<const texture*, int> texture_indices_;
+
+    std::expected<void, std::string> add_shape(const hittable& shape);
+    std::expected<int, std::string> material_index(const material* mat);
+    std::expected<int, std::string> texture_index(const texture& tex);
+};
+
+std::expected<void, std::string> scene_translator::add_shape(const hittable& shape)
+{
+    if (const auto* ball = dynamic_cast<const sphere*>(&shape))
+    {
+        if (ball->is_moving())
+        {
+            return std::unexpected("it has a moving sphere");
+        }
+        const auto mat = material_index(ball->mat());
+        if (!mat)
+        {
+            return std::unexpected(mat.error());
+        }
+        desc_.spheres.push_back({.center = to_gpu(ball->center_at(0)), .radius = ball->radius(), .material = *mat});
+        return {};
+    }
+    if (dynamic_cast<const quad*>(&shape))
+    {
+        return std::unexpected("it has quadrilaterals");
+    }
+    if (dynamic_cast<const translate*>(&shape) || dynamic_cast<const rotate_y*>(&shape))
+    {
+        return std::unexpected("it has objects moved or turned by translate or rotate_y");
+    }
+    if (dynamic_cast<const constant_medium*>(&shape))
+    {
+        return std::unexpected("it has smoke or fog");
+    }
+    return std::unexpected("it has an object of a kind the GPU can't render yet");
+}
+
+std::expected<int, std::string> scene_translator::material_index(const material* mat)
+{
+    if (!mat)
+    {
+        return std::unexpected("an object of its world has no material");
+    }
+    if (const auto found = material_indices_.find(mat); found != material_indices_.end())
+    {
+        return found->second;
+    }
+    gpu::material_desc desc;
+    if (const auto* matte = dynamic_cast<const lambertian*>(mat))
+    {
+        const auto tex = texture_index(matte->albedo_texture());
+        if (!tex)
+        {
+            return tex;
+        }
+        desc = {.kind = gpu::material_kind::lambertian, .texture = *tex};
+    }
+    else if (const auto* mirror = dynamic_cast<const metal*>(mat))
+    {
+        desc = {.kind = gpu::material_kind::metal, .albedo = to_gpu(mirror->albedo()), .fuzz = mirror->fuzz()};
+    }
+    else if (const auto* glass = dynamic_cast<const dielectric*>(mat))
+    {
+        desc = {.kind = gpu::material_kind::dielectric, .refraction_index = glass->refraction_index()};
+    }
+    else
+    {
+        return std::unexpected("it has a material other than lambertian, metal and dielectric");
+    }
+    const auto index = static_cast<int>(desc_.materials.size());
+    desc_.materials.push_back(desc);
+    material_indices_.emplace(mat, index);
+    return index;
+}
+
+std::expected<int, std::string> scene_translator::texture_index(const texture& tex)
+{
+    if (const auto found = texture_indices_.find(&tex); found != texture_indices_.end())
+    {
+        return found->second;
+    }
+    gpu::texture_desc desc;
+    if (const auto* solid = dynamic_cast<const solid_color*>(&tex))
+    {
+        desc = {.kind = gpu::texture_kind::solid, .rgb = to_gpu(solid->albedo())};
+    }
+    else if (const auto* checker = dynamic_cast<const checker_texture*>(&tex))
+    {
+        // Its two textures first: they get smaller indices than the checker (see texture_desc)
+        const auto even = texture_index(checker->even());
+        if (!even)
+        {
+            return even;
+        }
+        const auto odd = texture_index(checker->odd());
+        if (!odd)
+        {
+            return odd;
+        }
+        desc = {.kind = gpu::texture_kind::checker, .inv_scale = checker->inv_scale(), .even = *even, .odd = *odd};
+    }
+    else if (dynamic_cast<const image_texture*>(&tex))
+    {
+        return std::unexpected("it has an image texture");
+    }
+    else if (dynamic_cast<const noise_texture*>(&tex))
+    {
+        return std::unexpected("it has a marble (noise) texture");
+    }
+    else
+    {
+        return std::unexpected("it has a texture other than solid_color and checker_texture");
+    }
+    const auto index = static_cast<int>(desc_.textures.size());
+    desc_.textures.push_back(desc);
+    texture_indices_.emplace(&tex, index);
+    return index;
+}
+
+// The whole scene, or why the GPU can't render it yet. So far the GPU renders spheres that stand still, matte surfaces
+// with solid or checker textures, metal and glass, lit by the sky.
+std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame)
 {
     if (!s.lights.empty())
     {
@@ -229,39 +377,12 @@ std::expected<gpu::scene_desc, std::string> to_gpu(scene s, const camera_frame& 
     {
         return std::unexpected("its camera doesn't sample as the material scatters");
     }
-
-    gpu::scene_desc desc{.camera = to_gpu(frame)};
-    // Objects can share a material (it is a shared_ptr), and on the GPU they share it too: each material is stored
-    // once, the first time an object refers to it, and is found again by its address
-    std::unordered_map<const material*, int> material_index;
-    for (const std::unique_ptr<hittable>& object : std::move(s.world).release_objects())
+    scene_translator translator(frame);
+    if (const auto added = translator.add_world(s.world); !added)
     {
-        const auto* ball = dynamic_cast<const sphere*>(object.get());
-        if (!ball)
-        {
-            return std::unexpected("it has an object that isn't a sphere");
-        }
-        if (ball->is_moving())
-        {
-            return std::unexpected("it has a moving sphere");
-        }
-
-        // try_emplace adds the material with the next free index if it isn't in the map yet; either way the
-        // iterator points to the material's entry
-        const auto [entry, added] = material_index.try_emplace(ball->mat(), static_cast<int>(desc.materials.size()));
-        if (added)
-        {
-            const auto mat = to_gpu(ball->mat());
-            if (!mat)
-            {
-                return std::unexpected(mat.error());
-            }
-            desc.materials.push_back(*mat);
-        }
-        desc.spheres.push_back(
-            {.center = to_gpu(ball->center_at(0)), .radius = ball->radius(), .material = entry->second});
+        return std::unexpected(added.error());
     }
-    return desc;
+    return std::move(translator).finish();
 }
 
 // --- Rendering -------------------------------------------------------------------------------------------------
@@ -300,13 +421,13 @@ int main(int argc, char* argv[])
     const sampling_strategy requested = s.camera.sampling;
     const sampling_strategy sampling = effective_sampling(requested, s.lights);
 
-    const auto gpu_scene = to_gpu(std::move(s), frame);
+    const auto gpu_scene = to_gpu(s, frame);
     if (!gpu_scene)
     {
         // C++23 formats ranges: n drops the brackets, and the empty format after the colon prints the names
         // without quotes
-        std::println("Error: the GPU can't render '{}' yet: {}. So far it renders the first book's scenes: {:n:}.",
-                     opts->scene, gpu_scene.error(), supported_scenes);
+        std::println("Error: the GPU can't render '{}' yet: {}. So far it renders: {:n:}.", opts->scene,
+                     gpu_scene.error(), supported_scenes);
         return 1;
     }
 
@@ -346,7 +467,8 @@ int main(int argc, char* argv[])
         const gpu::render_options gpu_options{
             .seed = opts->seed,
             .arithmetic = opts->fp64 ? gpu::precision::float64 : gpu::precision::float32,
-            .progress = show_progress};
+            .progress = show_progress,
+            .all_books_kernel = opts->all_books_kernel};
         result = gpu::render(*gpu_scene, gpu_options);
     }
     catch (const std::exception& error)
@@ -360,6 +482,14 @@ int main(int argc, char* argv[])
     // Both times come from the renderer: the whole render() call (the BVH, copying the scene to the GPU and the image
     // back, all the passes), and the passes alone, timed on the GPU
     std::println("Render time: {:.2f} s (GPU passes: {:.2f} s)", result.seconds, result.kernel_seconds);
+    // Which of the two kernels rendered (see the kernels in renderer.cu), and what decides how many of its threads
+    // the GPU keeps in flight: the registers a thread takes (see blocks_per_multiprocessor)
+    const gpu::kernel_info& kernel = result.kernel;
+    std::println("Kernel: {}, {} registers and {} bytes of local memory per thread, {} blocks of {} threads per "
+                 "multiprocessor ({} of its {} threads)",
+                 kernel.name, kernel.registers, kernel.local_bytes, kernel.blocks_per_multiprocessor,
+                 kernel.threads_per_block, kernel.blocks_per_multiprocessor * kernel.threads_per_block,
+                 kernel.max_threads_per_multiprocessor);
     // A ray traced is a search for the closest hit, counted as on the CPU, so per sample it is the average number of
     // rays in a path: the camera ray and its bounces. The speed is that of the whole call, as the CPU's.
     const auto rays = static_cast<double>(result.rays);

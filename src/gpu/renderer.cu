@@ -1,15 +1,15 @@
-// The GPU renderer (see renderer.h): the kernel, and the host code that prepares the scene and runs the kernel.
+// The GPU renderer (see renderer.h): the kernels, and the host code that prepares the scene and runs the one it needs.
 //
 // A CUDA program runs on two processors. Host code is ordinary C++ on the CPU; here it copies the scene into the GPU's
 // memory and launches a kernel: a __global__ function that the GPU runs in a great many threads at once, one per pixel.
-// nvcc splits this file: it compiles the device code (the kernel and the __device__ functions) for the GPU and hands
+// nvcc splits this file: it compiles the device code (the kernels and the __device__ functions) for the GPU and hands
 // the host code to the usual C++ compiler, MSVC here. The threads are grouped into blocks of 16×8 pixels, and the
 // blocks into a grid that covers the image. The GPU spreads the blocks over its multiprocessors,
 // and each multiprocessor runs the threads of its blocks in warps of 32: a warp executes one instruction for all of its
 // threads at once. Each multiprocessor keeps dozens of warps in flight and switches to another whenever one waits for
 // memory; that is how a GPU hides the slowness of memory.
 //
-// The GPU's memory spaces, as this renderer uses them: the scene (read-only, see render_kernel) and the image's sums
+// The GPU's memory spaces, as this renderer uses them: the scene (read-only, see the kernels) and the image's sums
 // live in global memory, the GPU's own gigabytes (cudaMalloc); the kernel's arguments, such as the camera, go to
 // constant memory, which is cached and hands one value to a whole warp at once when all its threads read the same
 // address, as they do here; each thread's variables live in its registers, and an array it indexes with a variable
@@ -36,6 +36,9 @@
 #include "camera.cuh"
 #include "material.cuh"
 #include "random.cuh"
+#include "scene.cuh"
+#include "sphere.cuh"
+#include "texture.cuh"
 #include "vec3.cuh"
 
 namespace gpu
@@ -49,7 +52,7 @@ namespace
 // Threads per block. A block of neighboring pixels keeps a warp's rays close together, so they tend to visit the same
 // BVH nodes and hit the same materials. 16×8 and 8×8 were equally fast, 16×16 and 32×4 slower by 2-3%, and 8×4 by 20%
 // (a multiprocessor runs at most 16 blocks at once, so blocks of 32 threads give it half as many threads as it could
-// hold with this kernel's 64 registers per thread).
+// hold with the first book's kernel's 64 registers per thread).
 constexpr int block_width = 16;
 constexpr int block_height = 8;
 
@@ -293,8 +296,7 @@ __device__ unsigned long long warp_sum(unsigned long long value)
     return value;
 }
 
-// The kernel: each thread traces the launch's passes of one pixel and adds them to the pixel's sums.
-// __launch_bounds__ tells the compiler the block size, so it can plan the registers for that many threads.
+// What a thread of either kernel does: it traces the launch's passes of one pixel and adds them to the pixel's sums.
 //
 // The thread traces its samples one after another in a single loop, one ray per iteration: when a sample ends, the
 // next one starts in the next iteration. The paths of a warp's threads have different lengths (one ray to the sky,
@@ -303,22 +305,12 @@ __device__ unsigned long long warp_sum(unsigned long long value)
 // whose sample ended early goes on with its next one, and only its last sample waits for the others. With one pass per
 // launch, where this can't help, the weekend scene took 1.6 times as long.
 //
-// The scene's arrays and the sums come as pointers marked __restrict__: a promise to the compiler that while the
-// kernel runs, the memory each of them points to is reached through that pointer alone. Then the writes to sums can't
-// change the scene, so the compiler may load the scene through the GPU's read-only data path (the texture cache's:
-// LDG.E.CONSTANT in the machine code) and keep what it loaded in registers. On the test GPU this measured no faster,
-// as its L1 cache serves ordinary loads as well, but older GPUs gained from it, and the promise costs nothing.
-template <real_number Real>
-__global__ void __launch_bounds__(block_width * block_height)
-    render_kernel(const camera<Real> cam, const bvh_node<Real>* __restrict__ nodes, const int node_count,
-                  const sphere<Real>* __restrict__ spheres, const int* __restrict__ sphere_materials,
-                  const material<Real>* __restrict__ materials, const std::uint64_t seed, const launch_work work,
-                  double* __restrict__ sums, unsigned long long* __restrict__ ray_count)
+// __forceinline__ makes sure the compiler copies this function into each kernel rather than calling it: a call would
+// pass the scene and the camera through memory.
+template <real_number Real, kernel_kind Kind>
+__device__ __forceinline__ void render_pixel(const camera<Real>& cam, const scene_view<Real>& scene, std::uint64_t seed,
+                                             const launch_work& work, double* sums, unsigned long long* ray_count)
 {
-    const scene_view<Real> scene{.tree = {.nodes = nodes, .spheres = spheres, .node_count = node_count},
-                                 .sphere_materials = sphere_materials,
-                                 .materials = materials};
-
     // This thread's pixel: blockIdx is the block's position in the grid, blockDim the block's size and threadIdx the
     // thread's position in its block. The grid covers the launch's rows.
     const int i = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -344,7 +336,7 @@ __global__ void __launch_bounds__(block_width * block_height)
         {
             ++rays;
             color<Real> sample;
-            if (!trace_ray(p, scene, cam, rng, sample))
+            if (!trace<Real, Kind>(p, scene, cam, rng, sample))
             {
                 continue; // the path goes on
             }
@@ -373,30 +365,104 @@ __global__ void __launch_bounds__(block_width * block_height)
     }
 }
 
-// How many blocks of render_kernel<Real> the GPU runs at once: a wave (see launch_planner). Each multiprocessor holds
-// as many blocks as its resources allow. A multiprocessor of the test GPU holds up to 1536 threads, but they share its
-// 65536 registers, and this kernel takes 64 registers per thread in float and 96 in double: so it holds 8 of the
-// kernel's blocks of 128 threads in float and 5 in double, 1024 and 640 threads. The CUDA runtime computes this from
-// the compiled kernel; the share of the 1536 threads it allows, 67% and 42% here, is called the kernel's occupancy.
-// (The 1536 threads per multiprocessor that cudaGetDeviceProperties reports would make a wave 1.5 times too large in
-// float and 2.4 times in double.)
+// The two kernels: __global__ functions, which the CPU launches and the GPU runs in many threads. __launch_bounds__
+// tells the compiler the block size, so it can plan the registers for that many threads.
+//
+// Why two. A kernel takes one number of registers for all its threads, fixed when it is compiled: as many as the most
+// demanding point of its code needs (where the most values are alive at once), whether a scene's paths ever get there
+// or not. And the more registers a thread takes, the fewer threads fit on a multiprocessor (see
+// blocks_per_multiprocessor). Each feature of the second and third books (smoke, lamps, light sampling...) adds code
+// to the kernel, and with it, most likely, registers that the first book's scenes would pay for without using them. So
+// the scenes that need nothing beyond the first book get a kernel of their own, which traces Step 46's code
+// (trace_first_book_ray), and every other scene gets the kernel for all three books. Both run render_pixel, each with
+// its own Kind, and `if constexpr` (see trace in camera.cuh) compiles into each only its own code. So far, with the
+// solid and checker textures, both take the same registers: 64 per thread in float and 96 in double.
+//
+// They also get the scene differently. The first book's kernel takes Step 46's parameters: each of its arrays is a
+// pointer marked __restrict__, a promise to the compiler that while the kernel runs, the memory it points to is reached
+// through that pointer alone. Then writing the sums can't change the scene, so the compiler may load the scene through
+// the GPU's read-only data path (the texture cache's: LDG.E.CONSTANT in the machine code) and keep what it loaded in
+// registers. The compiler honors that promise only on a kernel's own parameters: the kernel for all three books gets
+// its many arrays in one struct (scene_view), and the same pointers marked __restrict__ inside it were tried: they
+// still gave ordinary loads (LDG.E), so they aren't marked. On the test GPU the read-only path measured no faster, as
+// its L1 cache serves ordinary loads as well, but older GPUs gained from it.
 template <real_number Real>
+__global__ void __launch_bounds__(block_width * block_height)
+    first_book_kernel(const camera<Real> cam, const bvh_node<Real>* __restrict__ nodes, const int node_count,
+                      const sphere<Real>* __restrict__ spheres, const int* __restrict__ primitive_materials,
+                      const material<Real>* __restrict__ materials, const std::uint64_t seed, const launch_work work,
+                      double* __restrict__ sums, unsigned long long* __restrict__ ray_count)
+{
+    const scene_view<Real> scene{.tree = {.nodes = nodes, .spheres = spheres, .node_count = node_count},
+                                 .primitive_materials = primitive_materials,
+                                 .materials = materials};
+    render_pixel<Real, kernel_kind::first_book>(cam, scene, seed, work, sums, ray_count);
+}
+
+template <real_number Real>
+__global__ void __launch_bounds__(block_width * block_height)
+    all_books_kernel(const camera<Real> cam, const scene_view<Real> scene, const std::uint64_t seed,
+                     const launch_work work, double* __restrict__ sums, unsigned long long* __restrict__ ray_count)
+{
+    render_pixel<Real, kernel_kind::all_books>(cam, scene, seed, work, sums, ray_count);
+}
+
+// The kernel of the given kind, for the CUDA runtime's questions about it
+template <real_number Real, kernel_kind Kind>
+constexpr auto kernel_function()
+{
+    if constexpr (Kind == kernel_kind::first_book)
+    {
+        return first_book_kernel<Real>;
+    }
+    else
+    {
+        return all_books_kernel<Real>;
+    }
+}
+
+// How many blocks of the kernel of the given kind one multiprocessor runs at once. It holds as many blocks as its
+// resources allow. A multiprocessor of the test GPU holds up to 1536 threads, but they share its 65536 registers, and
+// the first book's kernel takes 64 registers per thread in float and 96 in double: so it holds 8 of the kernel's blocks
+// of 128 threads in float and 5 in double, 1024 and 640 threads. The CUDA runtime computes this from the compiled
+// kernel; the share of the 1536 threads it allows, 67% and 42% here, is called the kernel's occupancy.
+template <real_number Real, kernel_kind Kind>
+int blocks_per_multiprocessor()
+{
+    int blocks = 0;
+    check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel_function<Real, Kind>(),
+                                                        block_width * block_height, 0),
+          "computing the kernel's occupancy");
+    return blocks;
+}
+
+// How many blocks of the kernel the whole GPU runs at once: a wave (see launch_planner). (The 1536 threads per
+// multiprocessor that cudaGetDeviceProperties reports would make the first book's waves 1.5 times too large in float
+// and 2.4 times in double.)
+template <real_number Real, kernel_kind Kind>
 int resident_blocks()
 {
     int multiprocessors = 0;
     check(cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, 0),
           "reading the CUDA device's properties");
-    int blocks_per_multiprocessor = 0;
-    check(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_multiprocessor, render_kernel<Real>,
-                                                        block_width * block_height, 0),
-          "computing the kernel's occupancy");
-    return multiprocessors * blocks_per_multiprocessor;
+    return multiprocessors * blocks_per_multiprocessor<Real, Kind>();
 }
 
-template <real_number Real>
-vec3<Real> to_real(const vec3d& v)
+// The kernel as the CUDA runtime describes it (see kernel_info in renderer.h)
+template <real_number Real, kernel_kind Kind>
+kernel_info describe_kernel()
 {
-    return {static_cast<Real>(v.x), static_cast<Real>(v.y), static_cast<Real>(v.z)};
+    cudaFuncAttributes attributes{};
+    check(cudaFuncGetAttributes(&attributes, kernel_function<Real, Kind>()), "reading the kernel's attributes");
+    int max_threads = 0;
+    check(cudaDeviceGetAttribute(&max_threads, cudaDevAttrMaxThreadsPerMultiProcessor, 0),
+          "reading the CUDA device's properties");
+    return {.name = Kind == kernel_kind::first_book ? "first book" : "all books",
+            .registers = attributes.numRegs,
+            .local_bytes = static_cast<int>(attributes.localSizeBytes),
+            .blocks_per_multiprocessor = blocks_per_multiprocessor<Real, Kind>(),
+            .threads_per_block = block_width * block_height,
+            .max_threads_per_multiprocessor = max_threads};
 }
 
 template <real_number Real>
@@ -423,21 +489,63 @@ camera<Real> to_camera(const camera_desc& desc)
             .sky_top = to_real<Real>(desc.sky_top)};
 }
 
+// Whether a material is a lambertian whose texture is one solid color
+bool solid_lambertian(const scene_desc& scene, const material_desc& desc)
+{
+    return desc.kind == material_kind::lambertian &&
+           scene.textures[static_cast<std::size_t>(desc.texture)].kind == texture_kind::solid;
+}
+
+// The materials in Real. A lambertian's texture of one color becomes its albedo: there the first book's kernel reads it
+// (see scatter in material.cuh), and the kernel for all three books takes it without looking up a texture.
 template <real_number Real>
-std::vector<material<Real>> to_materials(const std::vector<material_desc>& descs)
+std::vector<material<Real>> to_materials(const scene_desc& scene)
 {
     std::vector<material<Real>> materials;
-    for (const material_desc& desc : descs)
+    for (const material_desc& desc : scene.materials)
     {
+        const vec3d albedo =
+            solid_lambertian(scene, desc) ? scene.textures[static_cast<std::size_t>(desc.texture)].rgb : desc.albedo;
         materials.push_back({.kind = desc.kind,
-                             .albedo = to_real<Real>(desc.albedo),
+                             .albedo = to_real<Real>(albedo),
                              .fuzz = static_cast<Real>(desc.fuzz),
                              .refraction_index = static_cast<Real>(desc.refraction_index)});
     }
     return materials;
 }
 
-// Rejects what the kernel can't render, before anything is copied to the GPU
+// What the kernel for all three books needs about each material besides that (see material_texture in material.cuh)
+std::vector<material_texture> to_material_textures(const scene_desc& scene)
+{
+    std::vector<material_texture> shading;
+    for (const material_desc& desc : scene.materials)
+    {
+        const bool textured = desc.kind == material_kind::lambertian && !solid_lambertian(scene, desc);
+        shading.push_back(
+            {.texture_index = textured ? desc.texture : -1,
+             .needs_exact_point =
+                 textured && scene.textures[static_cast<std::size_t>(desc.texture)].kind == texture_kind::checker});
+    }
+    return shading;
+}
+
+template <real_number Real>
+std::vector<texture<Real>> to_textures(const std::vector<texture_desc>& descs)
+{
+    std::vector<texture<Real>> textures;
+    for (const texture_desc& desc : descs)
+    {
+        textures.push_back({.kind = desc.kind,
+                            .even = desc.even,
+                            .odd = desc.odd,
+                            .rgb = to_real<Real>(desc.rgb),
+                            .inv_scale = static_cast<Real>(desc.inv_scale)});
+    }
+    return textures;
+}
+
+// Rejects what the kernels can't render, before anything is copied to the GPU. Every index the kernels follow is
+// checked here: on the GPU an index out of range may read whatever lies there without any error, or stop the kernel.
 void validate(const scene_desc& scene)
 {
     const camera_desc& camera = scene.camera;
@@ -455,10 +563,33 @@ void validate(const scene_desc& scene)
     {
         throw std::runtime_error("the number of rays per pixel must be from 1 to 46340²");
     }
+    const auto texture_count = std::ssize(scene.textures);
+    for (std::ptrdiff_t i = 0; i < texture_count; ++i)
+    {
+        const texture_desc& t = scene.textures[static_cast<std::size_t>(i)];
+        if (t.kind == texture_kind::checker)
+        {
+            // So that the kernel's loop down nested checkers ends (see texture_value in texture.cuh)
+            if (t.even < 0 || t.even >= i || t.odd < 0 || t.odd >= i)
+            {
+                throw std::runtime_error("a checker texture must refer to textures that come before it");
+            }
+        }
+        else if (t.kind != texture_kind::solid)
+        {
+            throw std::runtime_error("unknown texture kind");
+        }
+    }
     for (const material_desc& m : scene.materials)
     {
-        if (m.kind != material_kind::lambertian && m.kind != material_kind::metal &&
-            m.kind != material_kind::dielectric)
+        if (m.kind == material_kind::lambertian)
+        {
+            if (m.texture < 0 || m.texture >= texture_count)
+            {
+                throw std::runtime_error("a material refers to a texture that doesn't exist");
+            }
+        }
+        else if (m.kind != material_kind::metal && m.kind != material_kind::dielectric)
         {
             throw std::runtime_error("unknown material kind");
         }
@@ -472,6 +603,116 @@ void validate(const scene_desc& scene)
     }
 }
 
+// Whether the first book's kernel can render the scene (see first_book_kernel). Every scene the GPU renders so far has
+// spheres that stand still, lit by the sky, so its materials decide: each a lambertian of one color, a metal or a
+// dielectric
+bool first_book_scene(const scene_desc& scene)
+{
+    return std::ranges::all_of(scene.materials, [&](const material_desc& m) {
+        return m.kind != material_kind::lambertian || solid_lambertian(scene, m);
+    });
+}
+
+// The scene in the GPU's memory, in Real: the arrays the kernels read, owned here (so that they are freed however
+// render() ends), and the scene_view that tells a kernel where they are
+template <real_number Real>
+class device_scene
+{
+public:
+    explicit device_scene(const scene_desc& scene)
+        : device_scene(scene, build_bvh<Real>(scene.spheres, leaf_size(scene)))
+    {
+    }
+
+    scene_view<Real> view() const
+    {
+        return {.tree = {.nodes = nodes_.data(), .spheres = spheres_.data(), .node_count = node_count_},
+                .primitive_materials = primitive_materials_.data(),
+                .sphere_frames = sphere_frames_.data(),
+                .materials = materials_.data(),
+                .material_textures = material_textures_.data(),
+                .textures = {.textures = textures_.data()}};
+    }
+
+private:
+    device_scene(const scene_desc& scene, const bvh<Real>& tree)
+        : nodes_(tree.nodes),
+          node_count_(static_cast<int>(tree.nodes.size())),
+          spheres_(tree.spheres),
+          primitive_materials_(tree.primitive_materials),
+          sphere_frames_(tree.sphere_frames),
+          materials_(to_materials<Real>(scene)),
+          material_textures_(to_material_textures(scene)),
+          textures_(to_textures<Real>(scene.textures))
+    {
+    }
+
+    static int leaf_size(const scene_desc& scene)
+    {
+        return std::ssize(scene.spheres) <= small_scene_spheres ? small_scene_spheres : bvh_leaf_size;
+    }
+
+    device_array<bvh_node<Real>> nodes_;
+    int node_count_;
+    device_array<sphere<Real>> spheres_;
+    device_array<int> primitive_materials_;
+    device_array<sphere_frame<Real>> sphere_frames_;
+    device_array<material<Real>> materials_;
+    device_array<material_texture> material_textures_;
+    device_array<texture<Real>> textures_;
+};
+
+// All passes of the render with the kernel of the given kind, launch after launch: adds the samples to sums and the
+// rays traced to ray_count. Returns the time the passes took on the GPU.
+template <real_number Real, kernel_kind Kind>
+double run_passes(const camera<Real>& cam, const scene_view<Real>& scene, const render_options& options, double* sums,
+                  unsigned long long* ray_count)
+{
+    const int width = cam.image_width;
+    const int height = cam.image_height;
+    const int passes = cam.sqrt_spp * cam.sqrt_spp;
+    launch_planner planner(width, height, passes, resident_blocks<Real, Kind>());
+    event start;
+    event stop;
+    double kernel_seconds = 0;
+    while (!planner.done())
+    {
+        const launch_work work = planner.next();
+        const dim3 block(block_width, block_height);
+        const dim3 grid(static_cast<unsigned>((width + block_width - 1) / block_width),
+                        static_cast<unsigned>((work.row_count + block_height - 1) / block_height));
+        start.record();
+        // <<<grid, block>>> is CUDA's syntax for a launch: the kernel runs in grid.x × grid.y blocks of
+        // block.x × block.y threads each. The launch only queues the kernel and returns at once; the GPU runs it
+        // while the CPU goes on to stop.synchronize(), which waits for it.
+        if constexpr (Kind == kernel_kind::first_book)
+        {
+            first_book_kernel<Real><<<grid, block>>>(cam, scene.tree.nodes, scene.tree.node_count, scene.tree.spheres,
+                                                     scene.primitive_materials, scene.materials, options.seed, work,
+                                                     sums, ray_count);
+        }
+        else
+        {
+            all_books_kernel<Real><<<grid, block>>>(cam, scene, options.seed, work, sums, ray_count);
+        }
+        // A launch returns no error code. If the kernel couldn't even start (an invalid grid or block size, say),
+        // cudaGetLastError reports it; errors while it runs come back at stop.synchronize()
+        check(cudaGetLastError(), "launching the kernel");
+        stop.record();
+        stop.synchronize();
+        const double seconds = event::seconds_between(start, stop);
+        kernel_seconds += seconds;
+
+        const int passes_before = planner.passes_done();
+        planner.finished(work, seconds);
+        if (options.progress && planner.passes_done() > passes_before)
+        {
+            options.progress(planner.passes_done(), passes);
+        }
+    }
+    return kernel_seconds;
+}
+
 // render() in one precision
 template <real_number Real>
 render_result render_in(const scene_desc& scene, const render_options& options)
@@ -481,14 +722,7 @@ render_result render_in(const scene_desc& scene, const render_options& options)
     check(cudaSetDevice(0), "selecting the CUDA device");
 
     const camera<Real> cam = to_camera<Real>(scene.camera);
-    const int leaf_size = std::ssize(scene.spheres) <= small_scene_spheres ? small_scene_spheres : bvh_leaf_size;
-    const bvh<Real> tree = build_bvh<Real>(scene.spheres, leaf_size);
-    const device_array<bvh_node<Real>> nodes(tree.nodes);
-    const auto node_count = static_cast<int>(tree.nodes.size());
-    const device_array<sphere<Real>> spheres(tree.spheres);
-    const device_array<int> sphere_materials(tree.sphere_materials);
-    const device_array<material<Real>> materials(to_materials<Real>(scene.materials));
-
+    const device_scene<Real> device(scene);
     const int width = cam.image_width;
     const int height = cam.image_height;
     const int passes = cam.sqrt_spp * cam.sqrt_spp;
@@ -497,41 +731,18 @@ render_result render_in(const scene_desc& scene, const render_options& options)
     device_array<unsigned long long> ray_count(1);
     ray_count.fill_with_zeros();
 
+    // The kernel is chosen by what the scene contains (and by the option that asks for the general one)
+    const bool first_book = !options.all_books_kernel && first_book_scene(scene);
     render_result result;
+    result.kernel = first_book ? describe_kernel<Real, kernel_kind::first_book>()
+                               : describe_kernel<Real, kernel_kind::all_books>();
     // A path of no rays brings no light: with max_depth 0 the image stays black, as on the CPU
     if (cam.max_depth > 0)
     {
-        launch_planner planner(width, height, passes, resident_blocks<Real>());
-        event start;
-        event stop;
-        while (!planner.done())
-        {
-            const launch_work work = planner.next();
-            const dim3 block(block_width, block_height);
-            const dim3 grid(static_cast<unsigned>((width + block_width - 1) / block_width),
-                            static_cast<unsigned>((work.row_count + block_height - 1) / block_height));
-            start.record();
-            // <<<grid, block>>> is CUDA's syntax for a launch: the kernel runs in grid.x × grid.y blocks of
-            // block.x × block.y threads each. The launch only queues the kernel and returns at once; the GPU runs it
-            // while the CPU goes on to stop.synchronize(), which waits for it.
-            render_kernel<Real><<<grid, block>>>(cam, nodes.data(), node_count, spheres.data(),
-                                                 sphere_materials.data(), materials.data(), options.seed, work,
-                                                 sums.data(), ray_count.data());
-            // A launch returns no error code. If the kernel couldn't even start (an invalid grid or block size, say),
-            // cudaGetLastError reports it; errors while it runs come back at stop.synchronize()
-            check(cudaGetLastError(), "launching the kernel");
-            stop.record();
-            stop.synchronize();
-            const double seconds = event::seconds_between(start, stop);
-            result.kernel_seconds += seconds;
-
-            const int passes_before = planner.passes_done();
-            planner.finished(work, seconds);
-            if (options.progress && planner.passes_done() > passes_before)
-            {
-                options.progress(planner.passes_done(), passes);
-            }
-        }
+        result.kernel_seconds =
+            first_book
+                ? run_passes<Real, kernel_kind::first_book>(cam, device.view(), options, sums.data(), ray_count.data())
+                : run_passes<Real, kernel_kind::all_books>(cam, device.view(), options, sums.data(), ray_count.data());
     }
 
     result.pixels = sums.to_host();

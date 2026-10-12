@@ -4,19 +4,13 @@
 #include "bvh.cuh"
 #include "material.cuh"
 #include "random.cuh"
+#include "scene.cuh"
+#include "sphere.cuh"
+#include "texture.cuh"
 #include "vec3.cuh"
 
 namespace gpu
 {
-// The scene as the kernel sees it: where its arrays are in the GPU's memory
-template <real_number Real>
-struct scene_view
-{
-    bvh_view<Real> tree;
-    const int* sphere_materials; // the material index of each sphere, in the BVH's order
-    const material<Real>* materials;
-};
-
 // A sample on its way. The CPU's ray_color calls itself for each bounce and multiplies the attenuations on the way back
 // out of the recursion. The GPU's version is a loop that goes forward instead: the path keeps the product of the
 // attenuations so far, its throughput, and the light it finds at its end is multiplied by it.
@@ -104,11 +98,12 @@ struct camera
     }
 };
 
-// Traces the path's next ray: one level of the CPU's ray_color. Returns true when the sample is complete, with its
-// color in `sample`; otherwise the path now holds the ray to trace next.
+// Traces the path's next ray in the first book's kernel: one level of the CPU's ray_color for the first book's scenes.
+// Returns true when the sample is complete, with its color in `sample`; otherwise the path now holds the ray to trace
+// next.
 template <real_number Real>
-__device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const camera<Real>& cam, pcg32& rng,
-                          color<Real>& sample)
+__device__ bool trace_first_book_ray(path<Real>& p, const scene_view<Real>& scene, const camera<Real>& cam, pcg32& rng,
+                                     color<Real>& sample)
 {
     const bvh_hit<Real> hit = closest_hit(scene.tree, p.r, p.from_sphere, p.inward);
     if (hit.index < 0)
@@ -132,7 +127,7 @@ __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const ca
     rec.front_face = hit.entering;
     rec.normal = rec.front_face ? outward : -outward;
 
-    const material<Real>& mat = scene.materials[scene.sphere_materials[hit.index]];
+    const material<Real>& mat = scene.materials[scene.primitive_materials[hit.index]];
     vec3<Real> direction;
     if (!scatter(mat, p.r.direction, rec, rng, direction, p.throughput))
     {
@@ -148,5 +143,113 @@ __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const ca
     p.from_sphere = hit.index;
     p.inward = dot(direction, outward) < Real(0);
     return false;
+}
+
+// What the kernel for all three books knows about a hit: Step 46's hit_record (the point, the normal facing the ray,
+// the side), the material, and where its texture is read
+template <real_number Real>
+struct surface
+{
+    hit_record<Real> rec;
+    vec3<Real> outward;         // the sphere's outward unit normal, before it is turned to face the ray
+    point3<Real> texture_point; // where the texture is read: rec.p, or for a checker on a sphere rec.p moved exactly
+                                // onto the sphere (onto_sphere). The next ray starts at rec.p either way.
+    int material;               // an index into the materials
+    int texture_index;          // the material's texture_index (material_texture): -1 for one solid color
+};
+
+// The hit as the materials and textures need it (the CPU's hit_record, which sphere::hit fills)
+template <real_number Real>
+__device__ surface<Real> surface_at(const scene_view<Real>& scene, const ray<Real>& r, const bvh_hit<Real>& hit)
+{
+    surface<Real> s{};
+    // Step 46's lines (see trace_first_book_ray above): the side from the root
+    const sphere<Real> ball = scene.tree.spheres[hit.index];
+    s.rec.p = r.at(hit.t);
+    s.outward = (Real(1) / ball.radius) * (s.rec.p - ball.center);
+    s.rec.front_face = hit.entering;
+    s.rec.normal = s.rec.front_face ? s.outward : -s.outward;
+
+    s.material = scene.primitive_materials[hit.index];
+    const material_texture shading = scene.material_textures[s.material];
+    s.texture_index = shading.texture_index;
+    s.texture_point = shading.needs_exact_point
+                          ? onto_sphere(s.rec.p, s.outward, ball, scene.sphere_frames[hit.index])
+                          : s.rec.p;
+    return s;
+}
+
+// The material's color at the hit: its texture there, or its one solid color without a lookup
+template <real_number Real>
+__device__ color<Real> surface_color(const scene_view<Real>& scene, const material<Real>& mat, const surface<Real>& s)
+{
+    return s.texture_index < 0 ? mat.albedo : texture_value(scene.textures, s.texture_index, s.texture_point);
+}
+
+// Traces the path's next ray in the kernel for all three books: one level of the CPU's ray_color, with the features of
+// the books so far. Returns true when the sample is complete, with its color in `sample`; otherwise the path now holds
+// the ray to trace next.
+template <real_number Real>
+__device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const camera<Real>& cam, pcg32& rng,
+                          color<Real>& sample)
+{
+    const bvh_hit<Real> hit = closest_hit(scene.tree, p.r, p.from_sphere, p.inward);
+    if (hit.index < 0)
+    {
+        sample = p.throughput * cam.sky(p.r.direction);
+        return true;
+    }
+    const surface<Real> s = surface_at(scene, p.r, hit);
+    const material<Real> mat = scene.materials[s.material];
+    // The material's color here, for a kind that has one, computed at one place so that the texture code is in the
+    // kernel once. Textures draw no random numbers, so computing it before the bounce changes nothing else.
+    const color<Real> c = mat.kind == material_kind::lambertian ? surface_color(scene, mat, s) : color<Real>{};
+
+    vec3<Real> direction;
+    switch (mat.kind)
+    {
+    case material_kind::lambertian:
+        // Step 46's matte bounce (see scatter in material.cuh), attenuated by the texture's color
+        direction = around(s.rec.normal, random_cosine_direction<Real>(rng));
+        if (!(dot(s.rec.normal, direction) > Real(0)))
+        {
+            sample = {}; // a direction the CPU doesn't trace: no light
+            return true;
+        }
+        p.throughput *= c;
+        break;
+    case material_kind::metal:
+    case material_kind::dielectric:
+        if (!scatter(mat, p.r.direction, s.rec, rng, direction, p.throughput))
+        {
+            sample = {}; // absorbed: no light
+            return true;
+        }
+        break;
+    }
+    if (--p.rays_left == 0)
+    {
+        sample = {}; // the path may trace no more rays (the CPU's depth reached 0): no light
+        return true;
+    }
+    p.r = {s.rec.p, direction};
+    p.from_sphere = hit.index;
+    p.inward = dot(direction, s.outward) < Real(0);
+    return false;
+}
+
+// One ray of the path, as the kernel's kind traces it
+template <real_number Real, kernel_kind Kind>
+__device__ bool trace(path<Real>& p, const scene_view<Real>& scene, const camera<Real>& cam, pcg32& rng,
+                      color<Real>& sample)
+{
+    if constexpr (Kind == kernel_kind::first_book)
+    {
+        return trace_first_book_ray(p, scene, cam, rng, sample);
+    }
+    else
+    {
+        return trace_ray(p, scene, cam, rng, sample);
+    }
 }
 }
