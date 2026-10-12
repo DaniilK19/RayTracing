@@ -396,3 +396,7 @@ To see the project at any step: `git switch --detach <commit>`; to come back: `g
 - CPU performance: `float` instead of `double`, SIMD, a BVH built with the surface area heuristic, rendering in tiles instead of rows.
 - Multiple importance sampling: weighting the material's and the lamps' samples by the power heuristic instead of a fixed half-and-half mixture.
 - A glossy material between matte and mirror (the third book's parting advice), and environment lighting from an HDR image.
+
+## License
+
+The project's code is under the [MIT license](LICENSE). The stb libraries in `external/stb` keep their own license (public domain or MIT, as their files say), and the Earth map in `assets` is CC0, like the books' repository it comes from.
