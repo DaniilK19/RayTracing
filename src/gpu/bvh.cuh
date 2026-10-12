@@ -229,14 +229,17 @@ private:
     void add_sphere(const sphere_desc& s)
     {
         const sphere<Real> converted{to_real<Real>(s.center), static_cast<Real>(s.radius)};
-        // The frame's numbers (see onto_sphere), in double from the sphere in Real: the squares of floats are exact in
-        // double, so for the ground (center (0, -1000, 0), radius 1000) k comes out exactly 0
+        // The frame: the sphere's turn for sphere_uv, and onto_sphere's numbers k and limit, in double from the sphere
+        // in Real: the squares of floats are exact in double, so for the ground (center (0, -1000, 0), radius 1000) k
+        // comes out exactly 0
         const double x = converted.center.x;
         const double y = converted.center.y;
         const double z = converted.center.z;
         const double radius = converted.radius;
         const double center_squared = x * x + y * y + z * z;
-        const sphere_frame<Real> frame{.k = static_cast<Real>(center_squared - radius * radius),
+        const sphere_frame<Real> frame{.cos_theta = static_cast<Real>(s.uv_cos),
+                                       .sin_theta = static_cast<Real>(s.uv_sin),
+                                       .k = static_cast<Real>(center_squared - radius * radius),
                                        .limit = static_cast<Real>(2 * radius * std::sqrt(center_squared))};
         inputs_.push_back({.kind = primitive_kind::sphere,
                            .index = static_cast<int>(spheres_.size()),
@@ -261,7 +264,10 @@ private:
         inputs_.push_back({.kind = primitive_kind::moving_sphere,
                            .index = static_cast<int>(moving_spheres_.size()),
                            .material = s.material,
-                           .frame = {.k = 0, .limit = 0},
+                           .frame = {.cos_theta = static_cast<Real>(s.uv_cos),
+                                     .sin_theta = static_cast<Real>(s.uv_sin),
+                                     .k = 0,
+                                     .limit = 0},
                            .box = sphere_box(converted.center, end, converted.radius)});
         moving_spheres_.push_back(converted);
     }

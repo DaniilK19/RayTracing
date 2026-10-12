@@ -106,13 +106,18 @@ struct material_desc
 // A sphere, standing still or moving
 struct sphere_desc
 {
-    vec3d center;     // at time 0: sphere::center_at(0)
+    vec3d center;     // at time 0, in the world: sphere::center_at(0), carried out of the instances around the sphere
     double radius = 0;
     int material = 0; // an index into scene_desc::materials
     // Motion blur: while the shutter is open, from time 0 to 1, the center moves by this much
-    // (sphere::center_at(1) - center_at(0)), and at time t it is center + t·displacement. Exactly 0 for a sphere that
-    // stands still.
+    // (sphere::center_at(1) - center_at(0), turned by those instances), and at time t it is center + t·displacement.
+    // Exactly 0 for a sphere that stands still.
     vec3d displacement;
+    // A sphere that rotate_y instances turned: the cosine and the sine of their combined rotation about the y axis (1
+    // and 0 for a sphere that wasn't turned). Its texture coordinates come from its own, unturned normal (sphere::hit),
+    // which the GPU gets back from the world's normal with rotate_y::to_object's formula.
+    double uv_cos = 1;
+    double uv_sin = 0;
 };
 
 // A parallelogram: the points q + α·u + β·v with α and β from 0 to 1. Its front side is the one u × v points to.

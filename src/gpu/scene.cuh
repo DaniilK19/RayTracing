@@ -20,7 +20,7 @@ struct scene_view
     bool motion; // some sphere moves: camera rays get a random time (see start_sample in camera.cuh)
     bvh_view<Real> tree;
     const int* primitive_materials;            // the material index of each primitive, by its global id (see bvh)
-    const sphere_frame<Real>* sphere_frames;   // each sphere's frame (see onto_sphere), by its global id
+    const sphere_frame<Real>* sphere_frames;   // each sphere's frame (see sphere_frame), by its global id
     const material<Real>* materials;
     const material_texture* material_textures; // read by the kernel for all three books only, by material index
     texture_view<Real> textures;

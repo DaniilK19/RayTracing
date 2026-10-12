@@ -189,8 +189,10 @@ __device__ surface<Real> surface_at(const scene_view<Real>& scene, const ray<Rea
             // t·direction, then the sum: for rays from above, the floor's points come out at y = 0 or just above, the
             // color of the cubes above. at() lets nvcc fuse the two into one rounding, and then about half of the
             // points fell below: a floor of mixed colors. Computed as the CPU computes them, the points fall on the
-            // CPU's side as often as the CPU's do in float, and exactly where they do in double (an axis-aligned quad's
-            // t is the CPU's own number there).
+            // CPU's side as often as the CPU's do in float, and in double exactly where they do for a quad placed in
+            // the world directly (an axis-aligned quad's t is then the CPU's own number). For a quad baked out of
+            // instances the CPU finds the point in the instance's coordinates and moves it back: there the two agree
+            // only to rounding, also in double.
             s.texture_point = r.at_unfused(hit.t);
         }
         return s;
@@ -202,13 +204,17 @@ __device__ surface<Real> surface_at(const scene_view<Real>& scene, const ray<Rea
                                   : tree.moving_spheres[hit.index - tree.moving_base].at(r.time);
     s.outward = (Real(1) / ball.radius) * (s.rec.p - ball.center);
     s.rec.normal = s.rec.front_face ? s.outward : -s.outward;
-    if (shading.needs_uv)
+    if (shading.needs_uv || shading.needs_exact_point)
     {
-        sphere_uv(s.outward, s.u, s.v);
-    }
-    if (shading.needs_exact_point)
-    {
-        s.texture_point = onto_sphere(s.rec.p, s.outward, ball, scene.sphere_frames[hit.index]);
+        const sphere_frame<Real> frame = scene.sphere_frames[hit.index];
+        if (shading.needs_uv)
+        {
+            sphere_uv(s.outward, frame, s.u, s.v);
+        }
+        if (shading.needs_exact_point)
+        {
+            s.texture_point = onto_sphere(s.rec.p, s.outward, ball, frame);
+        }
     }
     return s;
 }

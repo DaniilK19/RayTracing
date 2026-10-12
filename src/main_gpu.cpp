@@ -28,13 +28,14 @@ import vec3;
 // --- The command line ------------------------------------------------------------------------------------------
 
 // The scenes of RayTracing that the GPU can render so far. The others need features of the second and third books
-// that the GPU doesn't have yet (instances, smoke...), and to_gpu below says which one is missing. The scenes lit by
+// that the GPU doesn't have yet (smoke, nested BVHs), and to_gpu below says which one is missing. The scenes lit by
 // lamps render only with -p material so far.
 // In the end to_gpu decides: any scene it can translate renders, listed here or not. (earth renders without its
 // texture's file too, as the plain cyan sphere that the CPU renders then.)
 // std::to_array (C++20) counts the names itself, so the array's size can't disagree with the list.
-constexpr auto supported_scenes = std::to_array<std::string_view>(
-    {"materials", "weekend", "bouncing", "checker", "earth", "perlin", "quads", "light"});
+constexpr auto supported_scenes = std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker",
+                                                                    "earth", "perlin", "quads", "light", "cornell",
+                                                                    "aluminum", "glass"});
 constexpr std::string_view default_gpu_scene = "weekend";
 
 // The options are RayTracing's (-p takes all of its names, though the GPU samples only as the material scatters so
@@ -237,11 +238,50 @@ gpu::camera_desc to_gpu(const camera_frame& frame, sampling_strategy sampling)
             .sampling = to_gpu(sampling)};
 }
 
-// Calls on_shape(shape) for every object in the lists under `object` that isn't a list itself (or for `object`, if it
-// isn't a list). Only lists are opened so far, the world among them: an object that holds others in another way goes
-// to on_shape whole, and add_shape says the GPU can't render it yet. Stops at the first error that on_shape returns.
-// (An abbreviated function template, C++20: on_shape may be any callable that takes a hittable, here a lambda.)
-std::expected<void, std::string> for_each_shape(const hittable& object, const auto& on_shape)
+// Where an object inside instances ends up in the world. The CPU moves every ray into an instance's coordinates and
+// the hit back out (instance.ixx); this program does the opposite, once: it moves the objects themselves into the
+// world ("bakes" the instances), so the GPU's kernel knows only world coordinates and traces no ray twice. However
+// translate and rotate_y are nested, they add up to one rigid motion: a turn about the y axis, then a shift.
+//
+// In exact arithmetic the two ways give the same hits: a rigid motion keeps lengths and angles, so the same t, the
+// same point and normal, the same side, the same α and β of a quad. Only a sphere's texture coordinates come from its
+// own coordinates, so a sphere keeps its turn for them (sphere_desc::uv_cos and uv_sin).
+struct placement
+{
+    double cos_theta = 1; // the turn, as rotate_y keeps it: the cosine and the sine of its angle
+    double sin_theta = 0;
+    vec3 offset{0, 0, 0}; // then the shift
+
+    // rotate_y::to_world: a direction, or a side of a quad, turns but doesn't move
+    vec3 turn(const vec3& v) const
+    {
+        return {cos_theta * v.x + sin_theta * v.z, v.y, -sin_theta * v.x + cos_theta * v.z};
+    }
+
+    // A point turns, then moves: as a hit point leaves rotate_y and then translate
+    point3 place(const point3& p) const { return turn(p) + offset; }
+
+    // The placement of the object a translate holds, if the translate is placed here: the object's points move
+    // first, by the translate's offset, then go where this placement puts them
+    placement inside(const translate& moved) const { return {cos_theta, sin_theta, place(moved.offset())}; }
+
+    // The placement of the object a rotate_y holds: its points turn first. Turns about one axis add up their angles:
+    // cos(a + b) = cos a·cos b - sin a·sin b and sin(a + b) = sin a·cos b + cos a·sin b. For the scenes' usual
+    // translate(rotate_y(...)), the walk starts from {1, 0, 0}: inside the translate {1, 0, offset} exactly, then
+    // {1·c - 0·s, 0·c + 1·s} = {c, s}, the rotate_y's own numbers, bit for bit.
+    placement inside(const rotate_y& turned) const
+    {
+        return {cos_theta * turned.cos_theta() - sin_theta * turned.sin_theta(),
+                sin_theta * turned.cos_theta() + cos_theta * turned.sin_theta(), offset};
+    }
+};
+
+// Calls on_shape(shape, where) for every object under `object` that holds no other objects, with the placement that
+// brings it into the world. Lists (the world, a box()) hold objects; translate and rotate_y hold one and move it; other
+// objects that hold some go to on_shape whole, and add_shape says the GPU can't render them yet. Stops at the first
+// error that on_shape returns. (An abbreviated function template, C++20: on_shape may be any callable that takes a
+// hittable and a placement, here a lambda.)
+std::expected<void, std::string> for_each_shape(const hittable& object, const placement& where, const auto& on_shape)
 {
     // dynamic_cast asks an object what it really is: dynamic_cast<const hittable_list*>(&object) gives a pointer to
     // the list if object is one, and nullptr if it is another kind of hittable
@@ -249,14 +289,22 @@ std::expected<void, std::string> for_each_shape(const hittable& object, const au
     {
         for (const std::unique_ptr<hittable>& child : list->objects())
         {
-            if (auto done = for_each_shape(*child, on_shape); !done)
+            if (auto done = for_each_shape(*child, where, on_shape); !done)
             {
                 return done;
             }
         }
         return {};
     }
-    return on_shape(object);
+    if (const auto* moved = dynamic_cast<const translate*>(&object))
+    {
+        return for_each_shape(moved->object(), where.inside(*moved), on_shape);
+    }
+    if (const auto* turned = dynamic_cast<const rotate_y*>(&object))
+    {
+        return for_each_shape(turned->object(), where.inside(*turned), on_shape);
+    }
+    return on_shape(object, where);
 }
 
 // Translates the CPU's scene into the GPU renderer's tables (renderer.h), or says why the GPU can't render it yet. It
@@ -266,10 +314,12 @@ class scene_translator
 public:
     scene_translator(const camera_frame& frame, sampling_strategy sampling) { desc_.camera = to_gpu(frame, sampling); }
 
-    // Every shape of the world (spheres and quads), wherever it is in the world's lists
+    // Every shape of the world (spheres and quads), wherever it is in the world's lists and instances
     std::expected<void, std::string> add_world(const hittable_list& world)
     {
-        return for_each_shape(world, [this](const hittable& shape) { return add_shape(shape); });
+        return for_each_shape(world, placement{}, [this](const hittable& shape, const placement& where) {
+            return add_shape(shape, where);
+        });
     }
 
     gpu::scene_desc finish() && { return std::move(desc_); }
@@ -283,12 +333,12 @@ private:
     std::unordered_map<const material*, int> material_indices_;
     std::unordered_map<const texture*, int> texture_indices_;
 
-    std::expected<void, std::string> add_shape(const hittable& shape);
+    std::expected<void, std::string> add_shape(const hittable& shape, const placement& where);
     std::expected<int, std::string> material_index(const material* mat);
     std::expected<int, std::string> texture_index(const texture& tex);
 };
 
-std::expected<void, std::string> scene_translator::add_shape(const hittable& shape)
+std::expected<void, std::string> scene_translator::add_shape(const hittable& shape, const placement& where)
 {
     if (const auto* ball = dynamic_cast<const sphere*>(&shape))
     {
@@ -298,11 +348,14 @@ std::expected<void, std::string> scene_translator::add_shape(const hittable& sha
             return std::unexpected(mat.error());
         }
         // How far the center moves while the shutter is open, from the sphere's own accessors: exactly 0 for a sphere
-        // that stands still (c + 1·0 - c), which is how the renderer tells the two kinds apart
-        desc_.spheres.push_back({.center = to_gpu(ball->center_at(0)),
+        // that stands still (c + 1·0 - c), which is how the renderer tells the two kinds apart. Its path is a line, so
+        // in the world it starts at place(center) and moves by turn(displacement).
+        desc_.spheres.push_back({.center = to_gpu(where.place(ball->center_at(0))),
                                  .radius = ball->radius(),
                                  .material = *mat,
-                                 .displacement = to_gpu(ball->center_at(1) - ball->center_at(0))});
+                                 .displacement = to_gpu(where.turn(ball->center_at(1) - ball->center_at(0))),
+                                 .uv_cos = where.cos_theta,
+                                 .uv_sin = where.sin_theta});
         return {};
     }
     if (const auto* face = dynamic_cast<const quad*>(&shape))
@@ -312,19 +365,18 @@ std::expected<void, std::string> scene_translator::add_shape(const hittable& sha
         {
             return std::unexpected(mat.error());
         }
-        desc_.quads.push_back(
-            {.q = to_gpu(face->q()), .u = to_gpu(face->u()), .v = to_gpu(face->v()), .material = *mat});
+        desc_.quads.push_back({.q = to_gpu(where.place(face->q())),
+                               .u = to_gpu(where.turn(face->u())),
+                               .v = to_gpu(where.turn(face->v())),
+                               .material = *mat});
         return {};
-    }
-    if (dynamic_cast<const translate*>(&shape) || dynamic_cast<const rotate_y*>(&shape))
-    {
-        return std::unexpected("it has objects moved or turned by translate or rotate_y");
     }
     if (dynamic_cast<const constant_medium*>(&shape))
     {
         return std::unexpected("it has smoke or fog");
     }
-    return std::unexpected("it has an object of a kind the GPU can't render yet");
+    return std::unexpected(
+        "it has an object of a kind the GPU can't render yet (such as a BVH built inside the world)");
 }
 
 std::expected<int, std::string> scene_translator::material_index(const material* mat)
@@ -450,8 +502,9 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
 }
 
 // The whole scene, or why the GPU can't render it yet. So far the GPU renders spheres, standing still or moving, and
-// quads, with matte surfaces of solid, checker, image or marble textures, metal, glass and lamps. sampling is the
-// strategy the CPU would render with (effective_sampling); see unsupported_sampling for the ones the GPU has.
+// quads, also in lists, translate and rotate_y, with matte surfaces of solid, checker, image or marble textures, metal,
+// glass and lamps. sampling is the strategy the CPU would render with (effective_sampling); see unsupported_sampling
+// for the ones the GPU has.
 std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame,
                                                    sampling_strategy sampling)
 {

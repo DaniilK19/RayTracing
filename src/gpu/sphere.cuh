@@ -32,11 +32,14 @@ struct alignas(4 * sizeof(Real)) moving_sphere
     __device__ sphere<Real> at(Real time) const { return {center + time * displacement, radius}; }
 };
 
-// What only the closest hit reads about a sphere besides its material (see bvh): the two numbers that let a checker
-// texture read a point exactly on the sphere (see onto_sphere). 8 bytes in float: one load.
+// What only the closest hit reads about a sphere besides its material (see bvh): the rotation that its instances gave
+// it (sphere_desc::uv_cos and uv_sin), to find its texture coordinates, and the two numbers that let a checker texture
+// read a point exactly on the sphere (see onto_sphere). 16 bytes in float: one load.
 template <real_number Real>
-struct alignas(2 * sizeof(Real)) sphere_frame
+struct alignas(4 * sizeof(Real)) sphere_frame
 {
+    Real cos_theta;
+    Real sin_theta;
     Real k;     // |center|² - radius², computed in double on the host from the sphere the GPU tests, then rounded
     Real limit; // 2·radius·|center|: onto_sphere helps only where its own rounding stays below this. 0 for a moving
                 // sphere, whose center, and so k, change with time: onto_sphere leaves its points alone.
@@ -95,13 +98,18 @@ __device__ bool hit_sphere(const sphere<Real>& s, const ray<Real>& r, Real inver
 
 // The texture coordinates of a point of the sphere (sphere::hit in sphere.ixx): the longitude and latitude of its
 // outward unit normal, both from 0 to 1. u goes around the y axis from the direction -x, v from the south pole (-y) to
-// the north pole.
+// the north pole. The normal is the sphere's own: in a scene where rotate_y instances turned the sphere, the CPU finds
+// it in the sphere's coordinates, and here the world's normal is turned back by the frame's rotation (rotate_y's
+// to_object). For a sphere that wasn't turned (cos 1, sin 0) n is the outward normal itself, up to the sign of a zero
+// (-0 - 0·(-0) is +0), which atan2 notices only at a pole hit exactly, where every u is the same point.
 template <real_number Real>
-__device__ void sphere_uv(const vec3<Real>& outward, Real& u, Real& v)
+__device__ void sphere_uv(const vec3<Real>& outward, const sphere_frame<Real>& frame, Real& u, Real& v)
 {
-    const Real phi = atan2(-outward.z, outward.x) + pi<Real>;
+    const vec3<Real> n{frame.cos_theta * outward.x - frame.sin_theta * outward.z, outward.y,
+                       frame.sin_theta * outward.x + frame.cos_theta * outward.z};
+    const Real phi = atan2(-n.z, n.x) + pi<Real>;
     // Rounding can put |y| a little above 1, where acos is NaN: clamped, as on the CPU
-    const Real theta = acos(fmin(fmax(-outward.y, Real(-1)), Real(1)));
+    const Real theta = acos(fmin(fmax(-n.y, Real(-1)), Real(1)));
     u = phi / (Real(2) * pi<Real>);
     v = theta / pi<Real>;
 }
