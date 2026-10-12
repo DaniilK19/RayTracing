@@ -93,6 +93,9 @@ public:
         return image_[i, j];
     }
 
+    // For code that copies a scene into its own format: the GPU program
+    inline const image& source_image() const { return image_; }
+
 private:
     image image_; // its colors are already linear: image::load converted them from sRGB
 };

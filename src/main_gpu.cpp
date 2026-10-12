@@ -27,12 +27,12 @@ import vec3;
 // --- The command line ------------------------------------------------------------------------------------------
 
 // The scenes of RayTracing that the GPU can render so far. The others need features of the second and third books
-// that the GPU doesn't have yet (image and marble textures, quads, smoke, lamps...), and to_gpu below says which one is
-// missing.
-// In the end to_gpu decides, so any scene it can translate renders: earth, for one, when its texture's file is
-// missing, as the plain cyan sphere that the CPU renders then too.
+// that the GPU doesn't have yet (marble textures, quads, smoke, lamps...), and to_gpu below says which one is missing.
+// In the end to_gpu decides: any scene it can translate renders, listed here or not. (earth renders without its
+// texture's file too, as the plain cyan sphere that the CPU renders then.)
 // std::to_array (C++20) counts the names itself, so the array's size can't disagree with the list.
-constexpr auto supported_scenes = std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker"});
+constexpr auto supported_scenes =
+    std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker", "earth"});
 constexpr std::string_view default_gpu_scene = "weekend";
 
 // The options are RayTracing's without -p (the GPU samples as the material scatters, as the CPU does in a scene lit
@@ -347,9 +347,25 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
         }
         desc = {.kind = gpu::texture_kind::checker, .inv_scale = checker->inv_scale(), .even = *even, .odd = *odd};
     }
-    else if (dynamic_cast<const image_texture*>(&tex))
+    else if (const auto* picture = dynamic_cast<const image_texture*>(&tex))
     {
-        return std::unexpected("it has an image texture");
+        // An image belongs to exactly one image_texture (a member), so storing each texture once stores each image once
+        const image& img = picture->source_image();
+        gpu::image_desc pixels{.width = img.width(), .height = img.height()};
+        pixels.rgb.reserve(3 * static_cast<std::size_t>(img.width()) * static_cast<std::size_t>(img.height()));
+        for (int y = 0; y < img.height(); ++y)
+        {
+            for (int x = 0; x < img.width(); ++x)
+            {
+                // Exact: image::load made these doubles from stb_image's floats
+                const color& c = img[x, y];
+                pixels.rgb.push_back(static_cast<float>(c.x));
+                pixels.rgb.push_back(static_cast<float>(c.y));
+                pixels.rgb.push_back(static_cast<float>(c.z));
+            }
+        }
+        desc = {.kind = gpu::texture_kind::image, .image = static_cast<int>(desc_.images.size())};
+        desc_.images.push_back(std::move(pixels));
     }
     else if (dynamic_cast<const noise_texture*>(&tex))
     {
@@ -357,7 +373,7 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
     }
     else
     {
-        return std::unexpected("it has a texture other than solid_color and checker_texture");
+        return std::unexpected("it has a texture other than solid_color, checker_texture and image_texture");
     }
     const auto index = static_cast<int>(desc_.textures.size());
     desc_.textures.push_back(desc);
@@ -366,7 +382,7 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
 }
 
 // The whole scene, or why the GPU can't render it yet. So far the GPU renders spheres, standing still or moving, with
-// matte surfaces of solid or checker textures, metal and glass, lit by the sky.
+// matte surfaces of solid, checker or image textures, metal and glass, lit by the sky.
 std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame)
 {
     if (!s.lights.empty())

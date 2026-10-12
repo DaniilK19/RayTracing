@@ -10,6 +10,7 @@
 
 #include <concepts>
 #include <limits>
+#include <numbers>
 
 #include "renderer.h"
 
@@ -24,6 +25,10 @@ concept real_number = std::same_as<T, float> || std::same_as<T, double>;
 // compile-time values, which GPU code may read although they are defined for the CPU.
 template <real_number Real>
 constexpr Real infinity = std::numeric_limits<Real>::infinity();
+
+// π rounded to Real, from C++20's <numbers>: also a compile-time constant that GPU code may read
+template <real_number Real>
+constexpr Real pi = std::numbers::pi_v<Real>;
 
 // The math functions the device code uses, in both precisions. CUDA overloads most of them for float, as C++'s <cmath>
 // does, so sqrt of a float already computes in float. But not every overload it finds works on the GPU: with MSVC,
@@ -54,6 +59,12 @@ __device__ inline double fma(double x, double y, double z) { return ::fma(x, y, 
 // The largest whole number not above x (the checker texture's cubes)
 __device__ inline float floor(float x) { return ::floorf(x); }
 __device__ inline double floor(double x) { return ::floor(x); }
+// The angle of the point (x, y) seen from the origin, from -π to π, and the angle whose cosine is x, from 0 to π (the
+// texture coordinates of a sphere)
+__device__ inline float atan2(float y, float x) { return ::atan2f(y, x); }
+__device__ inline double atan2(double y, double x) { return ::atan2(y, x); }
+__device__ inline float acos(float x) { return ::acosf(x); }
+__device__ inline double acos(double x) { return ::acos(x); }
 // sin(π·x) and cos(π·x) in one call. More accurate than sin(π * x), whose argument π * x is already rounded.
 __device__ inline void sincospi(float x, float* sine, float* cosine) { ::sincospif(x, sine, cosine); }
 __device__ inline void sincospi(double x, double* sine, double* cosine) { ::sincospi(x, sine, cosine); }

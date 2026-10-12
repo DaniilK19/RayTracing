@@ -30,6 +30,8 @@ struct material_texture
 {
     int texture_index;      // lambertian: an index into the textures, or -1 when its texture is one solid color,
                             // which material::albedo then holds: no texture to look up at the hit
+    bool needs_uv;          // its texture reads the texture coordinates (an image, also inside a checker): only then
+                            // does the hit compute them
     bool needs_exact_point; // its texture is a checker, whose colors jump across the faces of its cubes: on a sphere
                             // it reads the hit point moved exactly onto the surface (onto_sphere in sphere.cuh)
 };

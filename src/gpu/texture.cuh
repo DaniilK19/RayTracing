@@ -13,10 +13,30 @@ struct alignas(16) texture
     texture_kind kind;
     int even;        // checker: the texture of the even cubes, an index smaller than this texture's own
     int odd;         // checker: the texture of the odd cubes
-    int unused;      // padding, named: the alignment makes the struct 32 bytes in float either way
+    int table;       // image: its index in texture_view::images
     color<Real> rgb; // solid: the color. (Not named `color`: a member named like the type color<Real> used above it
                      // would change what the name means inside the struct, which C++ forbids.)
     Real inv_scale;  // checker: 1 / the side of its cubes, the number the CPU multiplies by
+};
+
+// Where an image's pixels are in texture_view::texels. 16 bytes: the alignment lets one load read all of it (from a
+// struct of ints the compiler would know only 4-byte alignment and load them one by one).
+struct alignas(16) image_info
+{
+    int offset; // texels[offset + j·width + i] is pixel (i, j), rows from the top
+    int width;
+    int height;
+    int unused; // padding, named
+};
+
+// One pixel of an image: 16 bytes, one load. The fourth float is padding: three floats would take three loads. Floats
+// keep stb_image's values exactly, so the --fp64 kernels read the same colors.
+struct alignas(16) texel
+{
+    float r;
+    float g;
+    float b;
+    float unused;
 };
 
 // The texture arrays as the kernel sees them
@@ -24,16 +44,19 @@ template <real_number Real>
 struct texture_view
 {
     const texture<Real>* textures;
+    const image_info* images;
+    const texel* texels; // the pixels of all images, one after another
 };
 
-// The texture's color at the point p (texture::value), where p is the hit point in world coordinates.
+// The texture's color at the hit (texture::value): (u, v) are the hit's texture coordinates, p the hit point in world
+// coordinates.
 //
 // The CPU's checker_texture asks one of its two textures for the color, and that one may be a checker too. Device code
 // can call itself recursively, but each level would need room on the thread's stack, so the GPU walks down the chain in
 // a loop: each step replaces the checker by the texture of p's cube. The textures a checker refers to always have
 // smaller indices than its own (renderer.cu checks it), so the loop ends.
 template <real_number Real>
-__device__ color<Real> texture_value(const texture_view<Real>& view, int index, const point3<Real>& p)
+__device__ color<Real> texture_value(const texture_view<Real>& view, int index, Real u, Real v, const point3<Real>& p)
 {
     texture<Real> t = view.textures[index];
     while (t.kind == texture_kind::checker)
@@ -44,6 +67,20 @@ __device__ color<Real> texture_value(const texture_view<Real>& view, int index, 
         const int y = static_cast<int>(floor(t.inv_scale * p.y));
         const int z = static_cast<int>(floor(t.inv_scale * p.z));
         t = view.textures[(x + y + z) % 2 == 0 ? t.even : t.odd];
+    }
+    if (t.kind == texture_kind::image)
+    {
+        // image_texture::value: u and v clamped to [0, 1], v flipped (rows go from the top), and the pixel they fall in
+        const image_info image = view.images[t.table];
+        const Real clamped_u = fmin(fmax(u, Real(0)), Real(1));
+        const Real flipped_v = Real(1) - fmin(fmax(v, Real(0)), Real(1));
+        const int column = static_cast<int>(clamped_u * static_cast<Real>(image.width));
+        const int row = static_cast<int>(flipped_v * static_cast<Real>(image.height));
+        // u = 1 would give the column width, one past the edge
+        const int i = column < image.width - 1 ? column : image.width - 1;
+        const int j = row < image.height - 1 ? row : image.height - 1;
+        const texel pixel = view.texels[image.offset + j * image.width + i];
+        return {static_cast<Real>(pixel.r), static_cast<Real>(pixel.g), static_cast<Real>(pixel.b)};
     }
     return t.rgb; // solid
 }

@@ -93,6 +93,19 @@ __device__ bool hit_sphere(const sphere<Real>& s, const ray<Real>& r, Real inver
     return t_min < t && t < t_max;
 }
 
+// The texture coordinates of a point of the sphere (sphere::hit in sphere.ixx): the longitude and latitude of its
+// outward unit normal, both from 0 to 1. u goes around the y axis from the direction -x, v from the south pole (-y) to
+// the north pole.
+template <real_number Real>
+__device__ void sphere_uv(const vec3<Real>& outward, Real& u, Real& v)
+{
+    const Real phi = atan2(-outward.z, outward.x) + pi<Real>;
+    // Rounding can put |y| a little above 1, where acos is NaN: clamped, as on the CPU
+    const Real theta = acos(fmin(fmax(-outward.y, Real(-1)), Real(1)));
+    u = phi / (Real(2) * pi<Real>);
+    v = theta / pi<Real>;
+}
+
 // A point computed near the sphere, moved onto it, for a checker texture to read. A float hit point is known relative
 // to the sphere's center only to about a float step of the center's coordinates: on the ground of radius 1000 it lies
 // ~3·10^-5 above or below the surface, as hit_sphere rounds center - origin at 1000 (see closest_hit in bvh.cuh).

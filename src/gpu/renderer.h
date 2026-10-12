@@ -7,8 +7,9 @@
 // virtual functions and no pointers into the CPU's objects.
 //
 // The scene is a set of tables that refer to each other by index, as the CPU's objects refer to each other by pointer:
-// a sphere names its material, a material its texture, a checker two other textures. Each struct mirrors a CPU class,
-// with plain fields in double; how the GPU stores them is the renderer's own business.
+// a sphere names its material, a material its texture, a checker two other textures, an image texture its image. Each
+// struct mirrors a CPU class, with plain fields in double (an image's pixels in float, which keeps stb_image's values
+// exactly: see image_desc); how the GPU stores them is the renderer's own business.
 //
 // A file that also has `import std;` must include this header BEFORE that line: MSVC accepts standard headers ahead of
 // the std module in one file, but not after it.
@@ -36,6 +37,7 @@ enum class texture_kind
 {
     solid,   // solid_color: one color everywhere
     checker, // checker_texture: the cubes of space alternate between two other textures
+    image,   // image_texture: a picture wrapped around the surface by its texture coordinates (u, v)
 };
 
 // A texture: its kind and the numbers of that kind (the other fields keep their defaults). Textures refer to each
@@ -48,6 +50,16 @@ struct texture_desc
     double inv_scale = 1; // checker: 1 / the side of its cubes, the number the CPU multiplies by (inv_scale())
     int even = -1;        // checker: the texture of the cubes whose x + y + z is even, an index into textures
     int odd = -1;         // checker: the texture of the other cubes
+    int image = -1;       // image: an index into scene_desc::images
+};
+
+// The pixels of an image texture as the CPU's image holds them: linear colors, rows from the top. They are the floats
+// that stb_image loaded (image::load), so floats keep every one of them exactly.
+struct image_desc
+{
+    int width = 0;
+    int height = 0;
+    std::vector<float> rgb; // width × height × 3: pixel (x, y) starts at 3·(y·width + x)
 };
 
 // --- Materials (material.ixx) ---------------------------------------------------------------------------------------
@@ -115,6 +127,7 @@ struct scene_desc
     std::vector<material_desc> materials;
     camera_desc camera;
     std::vector<texture_desc> textures;
+    std::vector<image_desc> images;
 };
 
 // The number type the GPU computes with. A GeForce card does arithmetic on 32-bit floats about

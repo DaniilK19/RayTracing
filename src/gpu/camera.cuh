@@ -154,6 +154,8 @@ struct surface
     vec3<Real> outward;         // the sphere's outward unit normal, before it is turned to face the ray
     point3<Real> texture_point; // where the texture is read: rec.p, or for a checker on a sphere rec.p moved exactly
                                 // onto the sphere (onto_sphere). The next ray starts at rec.p either way.
+    Real u;                     // the texture coordinates, computed only when the material's texture reads them
+    Real v;                     // (needs_uv), otherwise 0
     int material;               // an index into the materials
     int texture_index;          // the material's texture_index (material_texture): -1 for one solid color
 };
@@ -177,6 +179,10 @@ __device__ surface<Real> surface_at(const scene_view<Real>& scene, const ray<Rea
     s.material = scene.primitive_materials[hit.index];
     const material_texture shading = scene.material_textures[s.material];
     s.texture_index = shading.texture_index;
+    if (shading.needs_uv)
+    {
+        sphere_uv(s.outward, s.u, s.v);
+    }
     s.texture_point = shading.needs_exact_point
                           ? onto_sphere(s.rec.p, s.outward, ball, scene.sphere_frames[hit.index])
                           : s.rec.p;
@@ -187,7 +193,8 @@ __device__ surface<Real> surface_at(const scene_view<Real>& scene, const ray<Rea
 template <real_number Real>
 __device__ color<Real> surface_color(const scene_view<Real>& scene, const material<Real>& mat, const surface<Real>& s)
 {
-    return s.texture_index < 0 ? mat.albedo : texture_value(scene.textures, s.texture_index, s.texture_point);
+    return s.texture_index < 0 ? mat.albedo
+                               : texture_value(scene.textures, s.texture_index, s.u, s.v, s.texture_point);
 }
 
 // Traces the path's next ray in the kernel for all three books: one level of the CPU's ray_color, with the features of

@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -373,13 +374,12 @@ __device__ __forceinline__ void render_pixel(const camera<Real>& cam, const scen
 // demanding point of its code needs (where the most values are alive at once), whether a scene's paths ever get there
 // or not. And the more registers a thread takes, the fewer threads fit on a multiprocessor (see
 // blocks_per_multiprocessor). Each feature of the second and third books (textures, moving spheres, smoke, lamps...)
-// adds code to the kernel, and it may add registers that the first book's scenes would pay for without using them. The
-// solid and checker textures added none; with moving spheres, a float thread of the general kernel takes 72 registers
-// instead of 64, and a multiprocessor holds 7 of its blocks instead of 8 (in double both kernels still take 96). So
-// the scenes that need nothing beyond the first book get a kernel of their own, which
-// traces Step 46's code (trace_first_book_ray), and every other scene gets the kernel for all three books. Both run
-// render_pixel, each with its own Kind, and `if constexpr` (see trace in camera.cuh) compiles into each only its own
-// code. Every render prints the registers of the kernel it ran (the Kernel: line).
+// adds code to the kernel, and it may add registers that the first book's scenes would pay for without using them
+// (the solid and checker textures added none, moving spheres and image textures some: every render prints the
+// registers of the kernel it ran, in its Kernel: line). So the scenes that need nothing beyond the first book get a
+// kernel of their own, which traces Step 46's code (trace_first_book_ray), and every other scene gets the kernel for
+// all three books. Both run render_pixel, each with its own Kind, and `if constexpr` (see trace in camera.cuh) compiles
+// into each only its own code.
 //
 // They also get the scene differently. The first book's kernel takes Step 46's parameters: each of its arrays is a
 // pointer marked __restrict__, a promise to the compiler that while the kernel runs, the memory it points to is reached
@@ -517,7 +517,23 @@ std::vector<material<Real>> to_materials(const scene_desc& scene)
     return materials;
 }
 
-// What the kernel for all three books needs about each material besides that (see material_texture in material.cuh)
+// Whether a texture reads the texture coordinates: an image does, and so does a checker one of whose textures does
+bool needs_uv(const scene_desc& scene, int index)
+{
+    const texture_desc& t = scene.textures[static_cast<std::size_t>(index)];
+    switch (t.kind)
+    {
+    case texture_kind::image:
+        return true;
+    case texture_kind::checker:
+        return needs_uv(scene, t.even) || needs_uv(scene, t.odd); // smaller indices: the recursion ends (validate)
+    default:
+        return false;
+    }
+}
+
+// What the kernel for all three books needs about each material besides the struct to_materials makes (see
+// material_texture in material.cuh)
 std::vector<material_texture> to_material_textures(const scene_desc& scene)
 {
     std::vector<material_texture> shading;
@@ -526,6 +542,7 @@ std::vector<material_texture> to_material_textures(const scene_desc& scene)
         const bool textured = desc.kind == material_kind::lambertian && !solid_lambertian(scene, desc);
         shading.push_back(
             {.texture_index = textured ? desc.texture : -1,
+             .needs_uv = textured && needs_uv(scene, desc.texture),
              .needs_exact_point =
                  textured && scene.textures[static_cast<std::size_t>(desc.texture)].kind == texture_kind::checker});
     }
@@ -541,10 +558,35 @@ std::vector<texture<Real>> to_textures(const std::vector<texture_desc>& descs)
         textures.push_back({.kind = desc.kind,
                             .even = desc.even,
                             .odd = desc.odd,
+                            .table = desc.image,
                             .rgb = to_real<Real>(desc.rgb),
                             .inv_scale = static_cast<Real>(desc.inv_scale)});
     }
     return textures;
+}
+
+// The pixels of all images in one array, one after another, and where each image is in it
+struct images_on_device
+{
+    std::vector<image_info> infos;
+    std::vector<texel> texels;
+};
+
+images_on_device to_images(const std::vector<image_desc>& images)
+{
+    images_on_device result;
+    for (const image_desc& desc : images)
+    {
+        result.infos.push_back({.offset = static_cast<int>(result.texels.size()),
+                                .width = desc.width,
+                                .height = desc.height,
+                                .unused = 0});
+        for (std::size_t i = 0; i < desc.rgb.size(); i += 3)
+        {
+            result.texels.push_back({.r = desc.rgb[i], .g = desc.rgb[i + 1], .b = desc.rgb[i + 2], .unused = 0});
+        }
+    }
+    return result;
 }
 
 // Rejects what the kernels can't render, before anything is copied to the GPU. Every index the kernels follow is
@@ -566,6 +608,21 @@ void validate(const scene_desc& scene)
     {
         throw std::runtime_error("the number of rays per pixel must be from 1 to 46340²");
     }
+    // The texels of all images are numbered with ints (see image_info)
+    std::size_t texel_count = 0;
+    for (const image_desc& image : scene.images)
+    {
+        if (image.width < 1 || image.height < 1 ||
+            image.rgb.size() != 3 * static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height))
+        {
+            throw std::runtime_error("an image texture's pixels don't match its size");
+        }
+        texel_count += image.rgb.size() / 3;
+    }
+    if (texel_count > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    {
+        throw std::runtime_error("the images have too many pixels for the GPU renderer");
+    }
     const auto texture_count = std::ssize(scene.textures);
     for (std::ptrdiff_t i = 0; i < texture_count; ++i)
     {
@@ -576,6 +633,13 @@ void validate(const scene_desc& scene)
             if (t.even < 0 || t.even >= i || t.odd < 0 || t.odd >= i)
             {
                 throw std::runtime_error("a checker texture must refer to textures that come before it");
+            }
+        }
+        else if (t.kind == texture_kind::image)
+        {
+            if (t.image < 0 || t.image >= std::ssize(scene.images))
+            {
+                throw std::runtime_error("an image texture refers to an image that doesn't exist");
             }
         }
         else if (t.kind != texture_kind::solid)
@@ -630,7 +694,7 @@ class device_scene
 {
 public:
     explicit device_scene(const scene_desc& scene)
-        : device_scene(scene, build_bvh<Real>(scene.spheres, leaf_size(scene)))
+        : device_scene(scene, build_bvh<Real>(scene.spheres, leaf_size(scene)), to_images(scene.images))
     {
     }
 
@@ -646,11 +710,11 @@ public:
                 .sphere_frames = sphere_frames_.data(),
                 .materials = materials_.data(),
                 .material_textures = material_textures_.data(),
-                .textures = {.textures = textures_.data()}};
+                .textures = {.textures = textures_.data(), .images = images_.data(), .texels = texels_.data()}};
     }
 
 private:
-    device_scene(const scene_desc& scene, const bvh<Real>& tree)
+    device_scene(const scene_desc& scene, const bvh<Real>& tree, const images_on_device& images)
         : nodes_(tree.nodes),
           node_count_(static_cast<int>(tree.nodes.size())),
           spheres_(tree.spheres),
@@ -661,6 +725,8 @@ private:
           materials_(to_materials<Real>(scene)),
           material_textures_(to_material_textures(scene)),
           textures_(to_textures<Real>(scene.textures)),
+          images_(images.infos),
+          texels_(images.texels),
           motion_(std::ranges::any_of(scene.spheres, moves))
     {
     }
@@ -680,6 +746,8 @@ private:
     device_array<material<Real>> materials_;
     device_array<material_texture> material_textures_;
     device_array<texture<Real>> textures_;
+    device_array<image_info> images_;
+    device_array<texel> texels_;
     bool motion_;
 };
 
