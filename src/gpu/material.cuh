@@ -19,8 +19,8 @@ template <real_number Real>
 struct material
 {
     material_kind kind;
-    color<Real> albedo;    // metal; lambertian, diffuse_light: its color, or the light it emits, when its texture is
-                           // one solid color (see material_texture)
+    color<Real> albedo;    // metal; lambertian, diffuse_light, isotropic: its color, or the light it emits, when its
+                           // texture is one solid color (see material_texture)
     Real fuzz;             // metal
     Real refraction_index; // dielectric
 };
@@ -30,8 +30,8 @@ struct material
 // before
 struct material_texture
 {
-    int texture_index;      // lambertian, diffuse_light: an index into the textures, or -1 when its texture is one
-                            // solid color, which material::albedo then holds: no texture to look up at the hit
+    int texture_index;      // lambertian, diffuse_light, isotropic: an index into the textures, or -1 when its
+                            // texture is one solid color, which material::albedo then holds (nothing to look up)
     bool needs_uv;          // its texture reads the texture coordinates (an image, also inside a checker): only then
                             // does the hit compute them
     bool needs_exact_point; // its texture is a checker, whose colors jump across the faces of its cubes: on a sphere
@@ -121,7 +121,7 @@ __device__ bool scatter(const material<Real>& mat, const vec3<Real>& direction, 
     }
     }
     // Not reached: the first book's kernel gets only these three kinds (see first_book_scene in renderer.cu), and
-    // trace_ray calls this function only for metal and glass (it handles matte surfaces and lamps itself)
+    // trace_ray calls this function only for metal and glass (it handles matte surfaces, lamps and smoke itself)
     return false;
 }
 }

@@ -27,15 +27,15 @@ import vec3;
 
 // --- The command line ------------------------------------------------------------------------------------------
 
-// The scenes of RayTracing that the GPU can render so far. The others need features of the second and third books
-// that the GPU doesn't have yet (smoke, nested BVHs), and to_gpu below says which one is missing. The scenes lit by
-// lamps render only with -p material so far.
+// The scenes of RayTracing that the GPU can render so far: all but final, which needs BVHs built inside the world (its
+// ground of boxes and its cloud of balls), as to_gpu below says. The scenes lit by lamps render only with -p material
+// so far.
 // In the end to_gpu decides: any scene it can translate renders, listed here or not. (earth renders without its
 // texture's file too, as the plain cyan sphere that the CPU renders then.)
 // std::to_array (C++20) counts the names itself, so the array's size can't disagree with the list.
 constexpr auto supported_scenes = std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker",
                                                                     "earth", "perlin", "quads", "light", "cornell",
-                                                                    "aluminum", "glass"});
+                                                                    "smoke", "aluminum", "glass"});
 constexpr std::string_view default_gpu_scene = "weekend";
 
 // The options are RayTracing's (-p takes all of its names, though the GPU samples only as the material scatters so
@@ -277,10 +277,11 @@ struct placement
 };
 
 // Calls on_shape(shape, where) for every object under `object` that holds no other objects, with the placement that
-// brings it into the world. Lists (the world, a box()) hold objects; translate and rotate_y hold one and move it; other
-// objects that hold some go to on_shape whole, and add_shape says the GPU can't render them yet. Stops at the first
-// error that on_shape returns. (An abbreviated function template, C++20: on_shape may be any callable that takes a
-// hittable and a placement, here a lambda.)
+// brings it into the world. Lists (the world, a box()) hold objects; translate and rotate_y hold one and move it.
+// Other objects that hold some go to on_shape whole: add_shape translates a volume of smoke (add_medium walks its
+// boundary with this function again) and says the GPU can't render the others (a BVH built inside the world) yet.
+// Stops at the first error that on_shape returns. (An abbreviated function template, C++20: on_shape may be any
+// callable that takes a hittable and a placement, here a lambda.)
 std::expected<void, std::string> for_each_shape(const hittable& object, const placement& where, const auto& on_shape)
 {
     // dynamic_cast asks an object what it really is: dynamic_cast<const hittable_list*>(&object) gives a pointer to
@@ -314,7 +315,8 @@ class scene_translator
 public:
     scene_translator(const camera_frame& frame, sampling_strategy sampling) { desc_.camera = to_gpu(frame, sampling); }
 
-    // Every shape of the world (spheres and quads), wherever it is in the world's lists and instances
+    // Every shape (sphere, quad) and every volume of smoke of the world, wherever it is in the world's lists and
+    // instances
     std::expected<void, std::string> add_world(const hittable_list& world)
     {
         return for_each_shape(world, placement{}, [this](const hittable& shape, const placement& where) {
@@ -334,6 +336,7 @@ private:
     std::unordered_map<const texture*, int> texture_indices_;
 
     std::expected<void, std::string> add_shape(const hittable& shape, const placement& where);
+    std::expected<void, std::string> add_medium(const constant_medium& volume, const placement& where);
     std::expected<int, std::string> material_index(const material* mat);
     std::expected<int, std::string> texture_index(const texture& tex);
 };
@@ -371,12 +374,67 @@ std::expected<void, std::string> scene_translator::add_shape(const hittable& sha
                                .material = *mat});
         return {};
     }
-    if (dynamic_cast<const constant_medium*>(&shape))
+    if (const auto* volume = dynamic_cast<const constant_medium*>(&shape))
     {
-        return std::unexpected("it has smoke or fog");
+        return add_medium(*volume, where);
     }
     return std::unexpected(
         "it has an object of a kind the GPU can't render yet (such as a BVH built inside the world)");
+}
+
+std::expected<void, std::string> scene_translator::add_medium(const constant_medium& volume, const placement& where)
+{
+    // The phase function is always an isotropic (constant_medium's constructor makes one); material_index translates
+    // it like any other material
+    const auto phase = material_index(&volume.phase_function());
+    if (!phase)
+    {
+        return std::unexpected(phase.error());
+    }
+    gpu::medium_desc medium{.neg_inv_density = volume.neg_inv_density(), .material = *phase};
+    // The boundary only says where the volume is, so its shapes are collected without their materials: the smoke's
+    // boxes carry white and the final scene's spheres glass, and neither is ever used. The boundary may sit inside
+    // instances of its own (the smoke scene's turned boxes).
+    int spheres = 0;
+    const auto collected = for_each_shape(
+        volume.boundary(), where, [&](const hittable& part, const placement& at) -> std::expected<void, std::string> {
+            if (const auto* ball = dynamic_cast<const sphere*>(&part))
+            {
+                ++spheres;
+                medium.sphere = {.center = to_gpu(at.place(ball->center_at(0))),
+                                 .radius = ball->radius(),
+                                 .material = 0,
+                                 .displacement = to_gpu(at.turn(ball->center_at(1) - ball->center_at(0)))};
+                return {};
+            }
+            if (const auto* face = dynamic_cast<const quad*>(&part))
+            {
+                medium.quads.push_back({.q = to_gpu(at.place(face->q())),
+                                        .u = to_gpu(at.turn(face->u())),
+                                        .v = to_gpu(at.turn(face->v())),
+                                        .material = 0});
+                return {};
+            }
+            return std::unexpected("the boundary of its smoke or fog holds something other than spheres and quads");
+        });
+    if (!collected)
+    {
+        return collected;
+    }
+    if (spheres == 1 && medium.quads.empty())
+    {
+        medium.boundary = gpu::boundary_shape::sphere;
+    }
+    else if (spheres == 0 && !medium.quads.empty() && gpu::is_convex(medium.quads))
+    {
+        medium.boundary = gpu::boundary_shape::convex_quads;
+    }
+    else
+    {
+        return std::unexpected("the boundary of its smoke or fog isn't one sphere or a convex shape made of quads");
+    }
+    desc_.media.push_back(std::move(medium));
+    return {};
 }
 
 std::expected<int, std::string> scene_translator::material_index(const material* mat)
@@ -416,9 +474,19 @@ std::expected<int, std::string> scene_translator::material_index(const material*
         }
         desc = {.kind = gpu::material_kind::diffuse_light, .texture = *tex};
     }
+    else if (const auto* particles = dynamic_cast<const isotropic*>(mat))
+    {
+        const auto tex = texture_index(particles->albedo_texture());
+        if (!tex)
+        {
+            return tex;
+        }
+        desc = {.kind = gpu::material_kind::isotropic, .texture = *tex};
+    }
     else
     {
-        return std::unexpected("it has a material other than lambertian, metal, dielectric and diffuse_light");
+        return std::unexpected(
+            "it has a material other than lambertian, metal, dielectric, diffuse_light and isotropic");
     }
     const auto index = static_cast<int>(desc_.materials.size());
     desc_.materials.push_back(desc);
@@ -503,8 +571,8 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
 
 // The whole scene, or why the GPU can't render it yet. So far the GPU renders spheres, standing still or moving, and
 // quads, also in lists, translate and rotate_y, with matte surfaces of solid, checker, image or marble textures, metal,
-// glass and lamps. sampling is the strategy the CPU would render with (effective_sampling); see unsupported_sampling
-// for the ones the GPU has.
+// glass and lamps, and volumes of smoke or fog. sampling is the strategy the CPU would render with
+// (effective_sampling); see unsupported_sampling for the ones the GPU has.
 std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame,
                                                    sampling_strategy sampling)
 {

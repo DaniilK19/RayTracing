@@ -77,6 +77,12 @@ public:
 
     aabb bounding_box() const override { return boundary_->bounding_box(); }
 
+    // For code that copies a scene into its own format: the GPU program. neg_inv_density is read as it is: -1/(-1/ρ)
+    // need not give back ρ to the last bit.
+    inline const hittable& boundary() const { return *boundary_; }
+    inline double neg_inv_density() const { return neg_inv_density_; }
+    inline const material& phase_function() const { return *phase_function_; }
+
 private:
     std::unique_ptr<hittable> boundary_;
     double neg_inv_density_;                          // −1 / density

@@ -142,6 +142,74 @@ Real round_up(double x)
     return rounded >= x ? rounded : std::nextafter(rounded, infinity<Real>);
 }
 
+// The box, in double, of a sphere in Real that goes from one center to another: the box must contain the spheres the
+// GPU will test. center ± radius may round inward, so each bound moves out by one step of double (std::nextafter).
+template <real_number Real>
+build_box sphere_box(const point3<Real>& start, const point3<Real>& end, Real radius)
+{
+    const std::array<double, 3> a{start.x, start.y, start.z};
+    const std::array<double, 3> b{end.x, end.y, end.z};
+    build_box box;
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        box.min[axis] = std::nextafter(std::min(a[axis], b[axis]) - radius, -infinity<double>);
+        box.max[axis] = std::nextafter(std::max(a[axis], b[axis]) + radius, infinity<double>);
+    }
+    return box;
+}
+
+// The box of a moving sphere's whole sweep. Where the center is at the end of the shutter time is computed in Real, as
+// the GPU computes it. The GPU's center at a time in [0, 1), center + time·displacement, is a number between center
+// and center + displacement, rounded, and rounding never puts a larger number before a smaller one: so in every
+// coordinate it lies between center and this end, rounded the same way. The box around both spheres holds the sphere
+// at every time, as the CPU's does (sphere.ixx).
+template <real_number Real>
+build_box sweep_box(const moving_sphere<Real>& s)
+{
+    const point3<Real> end = s.center + s.displacement;
+    return sphere_box(s.center, end, s.radius);
+}
+
+// The box of a quad's four corners, in double. The GPU tests the quad in Real, whose rounded axes accept points up to
+// ~10^-7 of the coordinates beyond the exact edges, so the box is widened by 10^-6 of them on every side: this margin,
+// which grows with the coordinates, is what keeps the slab test from missing the box by rounding. And as the CPU pads
+// a flat box to 0.0001 (aabb::axis_span), an axis still thinner than that after the margin gets 0.0001 more: the flat
+// side of a quad in a plane x = c, 2·10^-6·(1 + the largest coordinate) thick, while the largest coordinate is below
+// 49 (in the Cornell box the margin alone makes it 0.0011).
+inline build_box quad_box(const quad_desc& desc)
+{
+    const vec3d corners[4] = {desc.q,
+                              {desc.q.x + desc.u.x, desc.q.y + desc.u.y, desc.q.z + desc.u.z},
+                              {desc.q.x + desc.v.x, desc.q.y + desc.v.y, desc.q.z + desc.v.z},
+                              {desc.q.x + desc.u.x + desc.v.x, desc.q.y + desc.u.y + desc.v.y,
+                               desc.q.z + desc.u.z + desc.v.z}};
+    build_box box;
+    double largest = 0;
+    for (const vec3d& c : corners)
+    {
+        const std::array<double, 3> xyz{c.x, c.y, c.z};
+        for (std::size_t axis = 0; axis < 3; ++axis)
+        {
+            box.min[axis] = std::min(box.min[axis], xyz[axis]);
+            box.max[axis] = std::max(box.max[axis], xyz[axis]);
+            largest = std::max(largest, std::fabs(xyz[axis]));
+        }
+    }
+    const double margin = 1e-6 * (1 + largest);
+    for (std::size_t axis = 0; axis < 3; ++axis)
+    {
+        box.min[axis] -= margin;
+        box.max[axis] += margin;
+        constexpr double min_size = 0.0001;
+        if (box.max[axis] - box.min[axis] < min_size)
+        {
+            box.min[axis] -= min_size / 2;
+            box.max[axis] += min_size / 2;
+        }
+    }
+    return box;
+}
+
 template <real_number Real>
 class bvh_builder
 {
@@ -210,22 +278,6 @@ private:
         return s.displacement.x == 0 && s.displacement.y == 0 && s.displacement.z == 0;
     }
 
-    // The box, in double, of a sphere in Real that goes from one center to another: the box must contain the spheres
-    // the GPU will test. center ± radius may round inward, so each bound moves out by one step of double
-    // (std::nextafter).
-    static build_box sphere_box(const point3<Real>& start, const point3<Real>& end, Real radius)
-    {
-        const std::array<double, 3> a{start.x, start.y, start.z};
-        const std::array<double, 3> b{end.x, end.y, end.z};
-        build_box box;
-        for (std::size_t axis = 0; axis < 3; ++axis)
-        {
-            box.min[axis] = std::nextafter(std::min(a[axis], b[axis]) - radius, -infinity<double>);
-            box.max[axis] = std::nextafter(std::max(a[axis], b[axis]) + radius, infinity<double>);
-        }
-        return box;
-    }
-
     void add_sphere(const sphere_desc& s)
     {
         const sphere<Real> converted{to_real<Real>(s.center), static_cast<Real>(s.radius)};
@@ -255,12 +307,6 @@ private:
                                             .radius = static_cast<Real>(s.radius),
                                             .displacement = to_real<Real>(s.displacement),
                                             .unused = 0};
-        // Where the center is at the end of the shutter time, computed in Real as the GPU computes it. The GPU's center
-        // at a time in [0, 1), center + time·displacement, is a number between center and center + displacement,
-        // rounded, and rounding never puts a larger number before a smaller one: so in every coordinate it lies
-        // between center and this end, rounded the same way. The box around both spheres holds the sphere at every
-        // time, as the CPU's does (sphere.ixx).
-        const point3<Real> end = converted.center + converted.displacement;
         inputs_.push_back({.kind = primitive_kind::moving_sphere,
                            .index = static_cast<int>(moving_spheres_.size()),
                            .material = s.material,
@@ -268,52 +314,17 @@ private:
                                      .sin_theta = static_cast<Real>(s.uv_sin),
                                      .k = 0,
                                      .limit = 0},
-                           .box = sphere_box(converted.center, end, converted.radius)});
+                           .box = sweep_box(converted)});
         moving_spheres_.push_back(converted);
     }
 
     void add_quad(const quad_desc& desc)
     {
-        // The box of the four corners, in double. The GPU tests the quad in Real, whose rounded axes accept points up
-        // to ~10^-7 of the coordinates beyond the exact edges, so the box is widened by 10^-6 of them on every side:
-        // this margin, which grows with the coordinates, is what keeps the slab test from missing the box by rounding.
-        // And as the CPU pads a flat box to 0.0001 (aabb::axis_span), an axis still thinner than that after the margin
-        // gets 0.0001 more: the flat side of a quad in a plane x = c, 2·10^-6·(1 + the largest coordinate) thick,
-        // while the largest coordinate is below 49 (in the Cornell box the margin alone makes it 0.0011).
-        const vec3d corners[4] = {desc.q,
-                                  {desc.q.x + desc.u.x, desc.q.y + desc.u.y, desc.q.z + desc.u.z},
-                                  {desc.q.x + desc.v.x, desc.q.y + desc.v.y, desc.q.z + desc.v.z},
-                                  {desc.q.x + desc.u.x + desc.v.x, desc.q.y + desc.u.y + desc.v.y,
-                                   desc.q.z + desc.u.z + desc.v.z}};
-        build_box box;
-        double largest = 0;
-        for (const vec3d& c : corners)
-        {
-            const std::array<double, 3> xyz{c.x, c.y, c.z};
-            for (std::size_t axis = 0; axis < 3; ++axis)
-            {
-                box.min[axis] = std::min(box.min[axis], xyz[axis]);
-                box.max[axis] = std::max(box.max[axis], xyz[axis]);
-                largest = std::max(largest, std::fabs(xyz[axis]));
-            }
-        }
-        const double margin = 1e-6 * (1 + largest);
-        for (std::size_t axis = 0; axis < 3; ++axis)
-        {
-            box.min[axis] -= margin;
-            box.max[axis] += margin;
-            constexpr double min_size = 0.0001;
-            if (box.max[axis] - box.min[axis] < min_size)
-            {
-                box.min[axis] -= min_size / 2;
-                box.max[axis] += min_size / 2;
-            }
-        }
         inputs_.push_back({.kind = primitive_kind::quad,
                            .index = static_cast<int>(quads_.size()),
                            .material = desc.material,
                            .frame = {},
-                           .box = box});
+                           .box = quad_box(desc)});
         quads_.push_back(make_quad<Real>(desc));
     }
 
@@ -472,18 +483,26 @@ __device__ Real safe_inverse(Real x)
 // costs one multiply-add, box · (1 / direction) - origin / direction. Unlike the CPU's form, this one needs a finite
 // inverse_direction (see safe_inverse).
 template <real_number Real>
-__device__ Real box_entry(const bvh_node<Real>& node, const vec3<Real>& inverse_direction,
-                          const vec3<Real>& origin_scaled, Real t_min, Real t_max)
+__device__ Real box_entry(const point3<Real>& box_min, const point3<Real>& box_max,
+                          const vec3<Real>& inverse_direction, const vec3<Real>& origin_scaled, Real t_min, Real t_max)
 {
-    const Real x0 = node.box_min.x * inverse_direction.x - origin_scaled.x;
-    const Real x1 = node.box_max.x * inverse_direction.x - origin_scaled.x;
-    const Real y0 = node.box_min.y * inverse_direction.y - origin_scaled.y;
-    const Real y1 = node.box_max.y * inverse_direction.y - origin_scaled.y;
-    const Real z0 = node.box_min.z * inverse_direction.z - origin_scaled.z;
-    const Real z1 = node.box_max.z * inverse_direction.z - origin_scaled.z;
+    const Real x0 = box_min.x * inverse_direction.x - origin_scaled.x;
+    const Real x1 = box_max.x * inverse_direction.x - origin_scaled.x;
+    const Real y0 = box_min.y * inverse_direction.y - origin_scaled.y;
+    const Real y1 = box_max.y * inverse_direction.y - origin_scaled.y;
+    const Real z0 = box_min.z * inverse_direction.z - origin_scaled.z;
+    const Real z1 = box_max.z * inverse_direction.z - origin_scaled.z;
     const Real enter = fmax(fmax(fmin(x0, x1), fmin(y0, y1)), fmax(fmin(z0, z1), t_min));
     const Real exit = fmin(fmin(fmax(x0, x1), fmax(y0, y1)), fmin(fmax(z0, z1), t_max));
     return enter <= exit ? enter : infinity<Real>;
+}
+
+// The same for a node's box
+template <real_number Real>
+__device__ Real box_entry(const bvh_node<Real>& node, const vec3<Real>& inverse_direction,
+                          const vec3<Real>& origin_scaled, Real t_min, Real t_max)
+{
+    return box_entry(node.box_min, node.box_max, inverse_direction, origin_scaled, t_min, t_max);
 }
 
 // What closest_hit found: the primitive's global id (-1: none), the distance to it, and whether the ray hits the front
@@ -497,13 +516,14 @@ struct bvh_hit
     bool entering;
 };
 
-// The closest primitive the ray hits at a distance t in (0.001, ∞): the CPU's world.hit(r, interval{0.001, infinity}),
-// except for the primitive the ray starts on, `from` (its global id; -1 for a camera ray), which follows the
-// self-intersection rule. For a quad the rule is simple: a ray never hits the quad it leaves. A line meets a plane
-// only once, and this ray met it at its start, at t = 0 (or lies in it, which the parallel test rejects anyway). In
-// float that is needed: a hit point lies off its quad's plane by a float step of the coordinates (6·10^-5 in the
-// Cornell box), so a bounce at a grazing angle would meet its own quad again beyond t = 0.001, from the wrong side,
-// and its light would be lost. For a sphere:
+// The closest primitive the ray hits at a distance t in (0.001, ∞): the CPU's world.hit(r, interval{0.001, infinity})
+// for the surfaces (closest_event in camera.cuh adds the volumes of smoke), except for the primitive the ray starts on,
+// `from` (its global id; -1 for a ray that starts on no surface: a camera ray, or one scattered by a particle of
+// smoke), which follows the self-intersection rule. For a quad the rule is simple: a ray never hits the quad it
+// leaves. A line meets a plane only once, and this ray met it at its start, at t = 0 (or lies in it, which the parallel
+// test rejects anyway). In float that is needed: a hit point lies off its quad's plane by a float step of the
+// coordinates (6·10^-5 in the Cornell box), so a bounce at a grazing angle would meet its own quad again beyond
+// t = 0.001, from the wrong side, and its light would be lost. For a sphere:
 //
 // In float, a point on the ground sphere (radius 1000, centered at y = -1000) is known relative to that center only to
 // about 3·10^-5, half the distance between neighboring floats near 1000, and a computed hit point is often further off

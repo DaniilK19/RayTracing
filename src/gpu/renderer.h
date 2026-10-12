@@ -89,6 +89,7 @@ enum class material_kind
     metal,         // a blurred mirror: albedo and fuzz
     dielectric,    // glass: refraction_index
     diffuse_light, // a lamp: `texture` is the light it emits, from its front side only; it reflects nothing
+    isotropic,     // the particles of smoke and fog (constant_medium): `texture` is their albedo
 };
 
 struct material_desc
@@ -97,8 +98,8 @@ struct material_desc
     vec3d albedo;                // metal: the fraction of light kept in each channel
     double fuzz = 0;             // metal: 0 is a perfect mirror; at most 1 (the metal class caps it)
     double refraction_index = 1; // dielectric: relative to the medium around it (1 / 1.5 for an air bubble in glass)
-    int texture = -1;            // lambertian, diffuse_light: an index into scene_desc::textures (one color is a solid
-                                 // texture)
+    int texture = -1;            // lambertian, diffuse_light, isotropic: an index into scene_desc::textures (one
+                                 // color is a solid texture)
 };
 
 // --- Shapes, in world coordinates (sphere.ixx, quad.ixx) ------------------------------------------------------------
@@ -128,6 +129,35 @@ struct quad_desc
     vec3d v;
     int material = 0; // an index into scene_desc::materials
 };
+
+// --- Smoke and fog (constant_medium.ixx) ---------------------------------------------------------------------------
+
+// What bounds a volume of smoke. constant_medium::hit takes the first crossing of the ray's line with the boundary and
+// the next one at least 0.0001 beyond it: where the line enters and leaves a convex shape, as its comment says. The GPU
+// renders the convex boundaries made of the books' shapes.
+enum class boundary_shape
+{
+    sphere,       // one sphere (medium_desc::sphere)
+    convex_quads, // quads that bound a convex shape, such as a box's six faces (medium_desc::quads, see is_convex)
+};
+
+// A volume uniformly filled with particles. Rays don't stop at its boundary, which only says where the volume is: the
+// boundary's shapes are not among the scene's spheres and quads, and their materials are not used.
+struct medium_desc
+{
+    boundary_shape boundary = boundary_shape::sphere;
+    sphere_desc sphere;           // boundary_shape::sphere; it may move (its displacement)
+    std::vector<quad_desc> quads; // boundary_shape::convex_quads
+    double neg_inv_density = 0;   // -1 / density: constant_medium's own number
+    int material = 0;             // its phase function: an isotropic material in scene_desc::materials
+};
+
+// Whether the quads lie on the surface of one convex shape: for every quad, all the corners of all the quads lie on
+// one side of its plane, or on it (within 10^-9 of the largest coordinate, for the rounding of the instances' turns).
+// Then a line meets the quads at no more than two points, and the CPU's "first crossing, then the next one at least
+// 0.0001 beyond it" are the nearest and the farthest crossing (see boundary_crossings in constant_medium.cuh).
+// main_gpu.cpp asks it to explain a scene it can't render; renderer.cu's validate asks it again.
+bool is_convex(const std::vector<quad_desc>& quads);
 
 // --- The camera (camera.ixx) ----------------------------------------------------------------------------------------
 
@@ -177,6 +207,7 @@ struct scene_desc
     std::vector<image_desc> images;
     std::vector<perlin_desc> perlins;
     std::vector<quad_desc> quads;
+    std::vector<medium_desc> media;
 };
 
 // The number type the GPU computes with. A GeForce card does arithmetic on 32-bit floats about

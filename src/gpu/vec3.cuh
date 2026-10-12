@@ -73,6 +73,9 @@ __device__ inline double acos(double x) { return ::acos(x); }
 // The sine (the marble's stripes)
 __device__ inline float sin(float x) { return ::sinf(x); }
 __device__ inline double sin(double x) { return ::sin(x); }
+// The natural logarithm (the distance to a particle of smoke); log(0) is -∞, as in C
+__device__ inline float log(float x) { return ::logf(x); }
+__device__ inline double log(double x) { return ::log(x); }
 // sin(π·x) and cos(π·x) in one call. More accurate than sin(π * x), whose argument π * x is already rounded.
 __device__ inline void sincospi(float x, float* sine, float* cosine) { ::sincospif(x, sine, cosine); }
 __device__ inline void sincospi(double x, double* sine, double* cosine) { ::sincospi(x, sine, cosine); }

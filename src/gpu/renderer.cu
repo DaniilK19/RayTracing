@@ -35,6 +35,7 @@
 
 #include "bvh.cuh"
 #include "camera.cuh"
+#include "constant_medium.cuh"
 #include "material.cuh"
 #include "random.cuh"
 #include "scene.cuh"
@@ -493,10 +494,11 @@ camera<Real> to_camera(const camera_desc& desc)
             .sky_top = to_real<Real>(desc.sky_top)};
 }
 
-// Whether a material has a texture: a lambertian's albedo, or a lamp's light
+// Whether a material has a texture: a lambertian's albedo, a lamp's light, or the albedo of smoke's particles
 bool has_texture(const material_desc& desc)
 {
-    return desc.kind == material_kind::lambertian || desc.kind == material_kind::diffuse_light;
+    return desc.kind == material_kind::lambertian || desc.kind == material_kind::diffuse_light ||
+           desc.kind == material_kind::isotropic;
 }
 
 // Whether a material's texture is one solid color
@@ -735,8 +737,26 @@ void validate(const scene_desc& scene)
             throw std::runtime_error("a quad refers to a material that doesn't exist");
         }
     }
-    // Global ids are ints (see bvh in bvh.cuh)
-    if (scene.spheres.size() + scene.quads.size() > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+    for (const medium_desc& m : scene.media)
+    {
+        if (m.material < 0 || m.material >= std::ssize(scene.materials) ||
+            scene.materials[static_cast<std::size_t>(m.material)].kind != material_kind::isotropic)
+        {
+            throw std::runtime_error("a volume of smoke must refer to an isotropic material");
+        }
+        if (m.boundary == boundary_shape::convex_quads && (m.quads.empty() || !is_convex(m.quads)))
+        {
+            throw std::runtime_error("a volume of smoke must be bounded by one sphere or by quads of a convex shape");
+        }
+    }
+    // Global ids are ints (see bvh in bvh.cuh), and so are the indices of the boundaries' quads
+    std::size_t boundary_quads = 0;
+    for (const medium_desc& m : scene.media)
+    {
+        boundary_quads += m.quads.size();
+    }
+    const auto limit = static_cast<std::size_t>(std::numeric_limits<int>::max());
+    if (scene.spheres.size() + scene.quads.size() + scene.media.size() > limit || boundary_quads > limit)
     {
         throw std::runtime_error("the scene has too many shapes for the GPU renderer");
     }
@@ -748,12 +768,72 @@ bool moves(const sphere_desc& s)
     return s.displacement.x != 0 || s.displacement.y != 0 || s.displacement.z != 0;
 }
 
+// Whether something moves: a sphere, or a sphere that bounds a volume of smoke (the CPU passes the ray, with its time,
+// on to the boundary). Then camera rays get a random time (see start_sample in camera.cuh).
+bool motion(const scene_desc& scene)
+{
+    return std::ranges::any_of(scene.spheres, moves) || std::ranges::any_of(scene.media, [](const medium_desc& m) {
+               return m.boundary == boundary_shape::sphere && moves(m.sphere);
+           });
+}
+
+// A box in double rounded outward to Real: the box's corners in a medium (see bvh_builder::add_subtree for nodes)
+template <real_number Real>
+void round_outward(const build_box& box, point3<Real>& box_min, point3<Real>& box_max)
+{
+    box_min = {round_down<Real>(box.min[0]), round_down<Real>(box.min[1]), round_down<Real>(box.min[2])};
+    box_max = {round_up<Real>(box.max[0]), round_up<Real>(box.max[1]), round_up<Real>(box.max[2])};
+}
+
+// The volumes of smoke in Real, and their boundaries' quads, one after another in one array (see medium in
+// constant_medium.cuh). Each volume gets a conservative box: its sphere's sweep, or the union of its quads' boxes.
+template <real_number Real>
+struct media_on_device
+{
+    std::vector<medium<Real>> media;
+    std::vector<quad<Real>> boundary_quads;
+};
+
+template <real_number Real>
+media_on_device<Real> to_media(const scene_desc& scene)
+{
+    media_on_device<Real> result;
+    for (const medium_desc& desc : scene.media)
+    {
+        medium<Real> m{}; // value-initialized: the fields the boundary's kind doesn't use are zeros
+        m.neg_inv_density = static_cast<Real>(desc.neg_inv_density);
+        m.material = desc.material;
+        build_box box;
+        if (desc.boundary == boundary_shape::sphere)
+        {
+            m.sphere = {.center = to_real<Real>(desc.sphere.center),
+                        .radius = static_cast<Real>(desc.sphere.radius),
+                        .displacement = to_real<Real>(desc.sphere.displacement),
+                        .unused = 0};
+            box = sweep_box(m.sphere);
+        }
+        else
+        {
+            m.first_quad = static_cast<int>(result.boundary_quads.size());
+            m.quad_count = static_cast<int>(desc.quads.size());
+            for (const quad_desc& q : desc.quads)
+            {
+                result.boundary_quads.push_back(make_quad<Real>(q));
+                box.enclose(quad_box(q));
+            }
+        }
+        round_outward(box, m.box_min, m.box_max);
+        result.media.push_back(m);
+    }
+    return result;
+}
+
 // Whether the first book's kernel can render the scene (see first_book_kernel): it has spheres that stand still and no
 // other shapes, every material is a lambertian of one color, a metal or a dielectric (so the sky is the only light),
 // and diffuse bounces sample as the material scatters
 bool first_book_scene(const scene_desc& scene)
 {
-    return scene.quads.empty() && std::ranges::none_of(scene.spheres, moves) &&
+    return scene.quads.empty() && scene.media.empty() && std::ranges::none_of(scene.spheres, moves) &&
            scene.camera.sampling == sampling_strategy::material &&
            std::ranges::all_of(scene.materials, [&](const material_desc& m) {
                return (m.kind == material_kind::lambertian && solid_texture(scene, m)) ||
@@ -768,7 +848,8 @@ class device_scene
 {
 public:
     explicit device_scene(const scene_desc& scene)
-        : device_scene(scene, build_bvh<Real>(scene.spheres, scene.quads, leaf_size(scene)), to_images(scene.images))
+        : device_scene(scene, build_bvh<Real>(scene.spheres, scene.quads, leaf_size(scene)), to_images(scene.images),
+                       to_media<Real>(scene))
     {
     }
 
@@ -782,6 +863,10 @@ public:
                          .moving_base = moving_base_,
                          .quads = quads_.data(),
                          .quad_base = quad_base_},
+                .media = {.media = media_.data(),
+                          .boundary_quads = boundary_quads_.data(),
+                          .count = media_count_,
+                          .base = media_base_},
                 .primitive_materials = primitive_materials_.data(),
                 .sphere_frames = sphere_frames_.data(),
                 .materials = materials_.data(),
@@ -793,7 +878,8 @@ public:
     }
 
 private:
-    device_scene(const scene_desc& scene, const bvh<Real>& tree, const images_on_device& images)
+    device_scene(const scene_desc& scene, const bvh<Real>& tree, const images_on_device& images,
+                 const media_on_device<Real>& media)
         : nodes_(tree.nodes),
           node_count_(static_cast<int>(tree.nodes.size())),
           spheres_(tree.spheres),
@@ -801,6 +887,10 @@ private:
           moving_base_(tree.moving_base),
           quads_(tree.quads),
           quad_base_(tree.quad_base),
+          media_(media.media),
+          boundary_quads_(media.boundary_quads),
+          media_count_(static_cast<int>(media.media.size())),
+          media_base_(static_cast<int>(tree.primitive_materials.size())),
           primitive_materials_(tree.primitive_materials),
           sphere_frames_(tree.sphere_frames),
           materials_(to_materials<Real>(scene)),
@@ -809,7 +899,7 @@ private:
           images_(images.infos),
           texels_(images.texels),
           noises_(to_noises<Real>(scene)),
-          motion_(std::ranges::any_of(scene.spheres, moves))
+          motion_(motion(scene))
     {
     }
 
@@ -826,6 +916,10 @@ private:
     int moving_base_;
     device_array<quad<Real>> quads_;
     int quad_base_;
+    device_array<medium<Real>> media_;
+    device_array<quad<Real>> boundary_quads_;
+    int media_count_;
+    int media_base_; // the global id of the first volume's particles: right after the surface primitives
     device_array<int> primitive_materials_;
     device_array<sphere_frame<Real>> sphere_frames_;
     device_array<material<Real>> materials_;
@@ -930,6 +1024,47 @@ render_result render_in(const scene_desc& scene, const render_options& options)
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
     return result;
 }
+}
+
+bool is_convex(const std::vector<quad_desc>& quads)
+{
+    // Every corner of every quad, and the largest coordinate among them, for the tolerance
+    std::vector<vec3d> corners;
+    double largest = 0;
+    for (const quad_desc& q : quads)
+    {
+        for (const vec3d& c : {q.q, vec3d{q.q.x + q.u.x, q.q.y + q.u.y, q.q.z + q.u.z},
+                               vec3d{q.q.x + q.v.x, q.q.y + q.v.y, q.q.z + q.v.z},
+                               vec3d{q.q.x + q.u.x + q.v.x, q.q.y + q.u.y + q.v.y, q.q.z + q.u.z + q.v.z}})
+        {
+            corners.push_back(c);
+            largest = std::max({largest, std::fabs(c.x), std::fabs(c.y), std::fabs(c.z)});
+        }
+    }
+    const double tolerance = 1e-9 * (1 + largest);
+    for (const quad_desc& q : quads)
+    {
+        const vec3d n = cross(q.u, q.v);
+        const double length = std::sqrt(dot(n, n));
+        if (!(length > 0))
+        {
+            return false; // a quad without area bounds nothing
+        }
+        const vec3d unit = scale(1 / length, n);
+        bool in_front = false;
+        bool behind = false;
+        for (const vec3d& c : corners)
+        {
+            const double height = dot(unit, vec3d{c.x - q.q.x, c.y - q.q.y, c.z - q.q.z});
+            in_front = in_front || height > tolerance;
+            behind = behind || height < -tolerance;
+        }
+        if (in_front && behind)
+        {
+            return false; // the quad's plane cuts the shape: it isn't on the surface of a convex one
+        }
+    }
+    return true;
 }
 
 device_info query_device()

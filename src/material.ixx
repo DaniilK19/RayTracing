@@ -167,6 +167,8 @@ public:
     // so). Telling thin and dense volumes apart, or sending separate rays to the lamps, is left for later.
     bool mixes_in_lights() const override { return false; }
 
+    inline const texture& albedo_texture() const { return *tex_; }
+
 private:
     std::shared_ptr<const texture> tex_;
 };

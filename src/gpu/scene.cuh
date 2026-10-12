@@ -4,6 +4,7 @@
 #include <type_traits>
 
 #include "bvh.cuh"
+#include "constant_medium.cuh"
 #include "material.cuh"
 #include "sphere.cuh"
 #include "texture.cuh"
@@ -17,8 +18,9 @@ namespace gpu
 template <real_number Real>
 struct scene_view
 {
-    bool motion; // some sphere moves: camera rays get a random time (see start_sample in camera.cuh)
+    bool motion; // some sphere moves, a shape or a volume's boundary: camera rays get a random time (see start_sample)
     bvh_view<Real> tree;
+    media_view<Real> media; // smoke and fog, tested after the surfaces (see closest_event in camera.cuh)
     const int* primitive_materials;            // the material index of each primitive, by its global id (see bvh)
     const sphere_frame<Real>* sphere_frames;   // each sphere's frame (see sphere_frame), by its global id
     const material<Real>* materials;

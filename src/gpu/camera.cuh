@@ -2,6 +2,7 @@
 #pragma once
 
 #include "bvh.cuh"
+#include "constant_medium.cuh"
 #include "material.cuh"
 #include "quad.cuh"
 #include "random.cuh"
@@ -21,7 +22,8 @@ struct path
     ray<Real> r; // the ray to trace next
     color<Real> throughput;
     int rays_left; // how many more rays the path may trace, r included (the CPU's depth)
-    int from;      // the global id of the primitive r starts on, -1 for a camera ray (see closest_hit)
+    int from;      // the global id of the primitive r starts on; -1 for none, after the camera or a particle of smoke
+                   // (see closest_hit)
     bool inward;   // r goes into that sphere
 };
 
@@ -159,16 +161,30 @@ struct surface
     Real v;                     // (needs_uv), otherwise 0
     int material;               // an index into the materials
     int texture_index;          // the material's texture_index (material_texture): -1 for one solid color
+    int from;                   // the next ray's path::from: the hit primitive's global id, -1 after a particle
 };
 
-// The hit as the materials and textures need it (the CPU's hit_record, which sphere::hit and quad::hit fill)
+// The hit as the materials and textures need it (the CPU's hit_record, which sphere::hit, quad::hit and
+// constant_medium::hit fill)
 template <real_number Real>
 __device__ surface<Real> surface_at(const scene_view<Real>& scene, const ray<Real>& r, const bvh_hit<Real>& hit)
 {
     surface<Real> s{};
     s.rec.p = r.at(hit.t);
-    s.rec.front_face = hit.entering; // from the root for a sphere, from the sign of normal·direction for a quad
     s.texture_point = s.rec.p;
+    s.from = hit.index;
+    if (hit.index >= scene.media.base)
+    {
+        // A particle of smoke (constant_medium::hit): it has no surface, so any normal and side will do (the CPU's
+        // (1, 0, 0) and the front), its texture coordinates are 0, and the next ray starts on no surface
+        s.rec.normal = {Real(1), Real(0), Real(0)};
+        s.rec.front_face = true;
+        s.material = scene.media.media[hit.index - scene.media.base].material;
+        s.texture_index = scene.material_textures[s.material].texture_index;
+        s.from = -1;
+        return s;
+    }
+    s.rec.front_face = hit.entering; // from the root for a sphere, from the sign of normal·direction for a quad
     s.material = scene.primitive_materials[hit.index];
     const material_texture shading = scene.material_textures[s.material];
     s.texture_index = shading.texture_index;
@@ -227,6 +243,37 @@ __device__ color<Real> surface_color(const scene_view<Real>& scene, const materi
                                : texture_value(scene.textures, s.texture_index, s.u, s.v, s.texture_point);
 }
 
+// What the ray meets first: the nearest surface (closest_hit), or a particle of smoke in front of it (the CPU's
+// world.hit, whose objects include the volumes). The volumes are tested after the surfaces, in their list's order,
+// each against the closest event found so far (see medium_collision in constant_medium.cuh for why that order gives
+// the CPU's distribution). In a scene without smoke this is closest_hit alone.
+template <real_number Real>
+__device__ bvh_hit<Real> closest_event(const scene_view<Real>& scene, const ray<Real>& r, int from, bool inward,
+                                       pcg32& rng)
+{
+    bvh_hit<Real> closest = closest_hit<Real, kernel_kind::all_books>(scene.tree, r, from, inward);
+    const media_view<Real>& media = scene.media;
+    if (media.count == 0)
+    {
+        return closest;
+    }
+    const Real t_min = Real(0.001);
+    const Real inverse_a = Real(1) / r.direction.length_squared();
+    const vec3<Real> inverse_direction{safe_inverse(r.direction.x), safe_inverse(r.direction.y),
+                                       safe_inverse(r.direction.z)};
+    const vec3<Real> origin_scaled = r.origin * inverse_direction;
+    for (int k = 0; k < media.count; ++k)
+    {
+        Real t;
+        if (medium_collision(media.media[k], media.boundary_quads, r, inverse_a, inverse_direction, origin_scaled,
+                             t_min, closest.t, rng, t))
+        {
+            closest = {.index = media.base + k, .t = t, .entering = true};
+        }
+    }
+    return closest;
+}
+
 // Traces the path's next ray in the kernel for all three books: one level of the CPU's ray_color, with the features of
 // the books so far. Returns true when the sample is complete, with its color in `sample`; otherwise the path now holds
 // the ray to trace next.
@@ -234,7 +281,7 @@ template <real_number Real>
 __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const camera<Real>& cam, pcg32& rng,
                           color<Real>& sample)
 {
-    const bvh_hit<Real> hit = closest_hit<Real, kernel_kind::all_books>(scene.tree, p.r, p.from, p.inward);
+    const bvh_hit<Real> hit = closest_event(scene, p.r, p.from, p.inward, rng);
     if (hit.index < 0)
     {
         sample = p.throughput * cam.sky(p.r.direction);
@@ -242,11 +289,11 @@ __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const ca
     }
     const surface<Real> s = surface_at(scene, p.r, hit);
     const material<Real> mat = scene.materials[s.material];
-    // The material's color here, for a kind that has one: a matte surface, or a lamp seen from its front. Computed at
-    // one place, so that the texture code is in the kernel once; textures draw no random numbers, so computing it
-    // before the bounce changes nothing else.
-    const bool colored =
-        mat.kind == material_kind::lambertian || (mat.kind == material_kind::diffuse_light && s.rec.front_face);
+    // The material's color here, for a kind that has one: a matte surface, a particle of smoke, or a lamp seen from
+    // its front. Computed at one place, so that the texture code is in the kernel once; textures draw no random
+    // numbers, so computing it before the bounce changes nothing else.
+    const bool colored = mat.kind == material_kind::lambertian || mat.kind == material_kind::isotropic ||
+                         (mat.kind == material_kind::diffuse_light && s.rec.front_face);
     const color<Real> c = colored ? surface_color(scene, mat, s) : color<Real>{};
 
     vec3<Real> direction;
@@ -275,6 +322,12 @@ __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const ca
         }
         p.throughput *= c;
         break;
+    case material_kind::isotropic:
+        // A particle of smoke scatters the same in every direction (sphere_pdf): sampled with its own density, the
+        // weight is exactly 1
+        direction = random_unit_vector<Real>(rng);
+        p.throughput *= c;
+        break;
     case material_kind::metal:
     case material_kind::dielectric:
         if (!scatter(mat, p.r.direction, s.rec, rng, direction, p.throughput))
@@ -291,7 +344,7 @@ __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const ca
     }
     // A bounce keeps the ray's time (material.ixx for metal and glass, ray_color in camera.ixx for a diffuse bounce)
     p.r = {s.rec.p, direction, p.r.time};
-    p.from = hit.index;
+    p.from = s.from;
     p.inward = dot(direction, s.outward) < Real(0); // read only when the ray leaves a sphere (see closest_hit)
     return false;
 }
