@@ -149,12 +149,15 @@ __device__ vec3<Real> refract(const vec3<Real>& uv, const vec3<Real>& n, Real et
     return r_out_perp + r_out_parallel;
 }
 
-// A ray (see ray.ixx), without the time: the GPU renders only stationary spheres so far
+// A ray (see ray.ixx). time is when it was emitted, from 0 to 1 while the camera's shutter is open (see start_sample
+// in camera.cuh): only moving spheres read it, and the ray's bounces keep it. Written as {origin, direction}, a ray
+// gets the time 0.
 template <real_number Real>
 struct ray
 {
     point3<Real> origin;
     vec3<Real> direction; // not normalized: t is measured in lengths of the direction, as on the CPU
+    Real time = 0;
 
     __device__ point3<Real> at(Real t) const { return origin + t * direction; }
 };

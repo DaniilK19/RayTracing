@@ -19,9 +19,9 @@ struct path
 {
     ray<Real> r; // the ray to trace next
     color<Real> throughput;
-    int rays_left;   // how many more rays the path may trace, r included (the CPU's depth)
-    int from_sphere; // the sphere r starts on, -1 for a camera ray (see closest_hit)
-    bool inward;     // r goes into that sphere
+    int rays_left; // how many more rays the path may trace, r included (the CPU's depth)
+    int from;      // the global id of the primitive r starts on, -1 for a camera ray (see closest_hit)
+    bool inward;   // r goes into that sphere
 };
 
 // camera_desc (see renderer.h) in Real, with the camera's functions that the kernel needs
@@ -50,7 +50,7 @@ struct camera
         return {.r = get_ray(i, j, pass % sqrt_spp, pass / sqrt_spp, rng),
                 .throughput = {Real(1), Real(1), Real(1)},
                 .rays_left = max_depth,
-                .from_sphere = -1,
+                .from = -1,
                 .inward = false};
     }
 
@@ -105,7 +105,7 @@ template <real_number Real>
 __device__ bool trace_first_book_ray(path<Real>& p, const scene_view<Real>& scene, const camera<Real>& cam, pcg32& rng,
                                      color<Real>& sample)
 {
-    const bvh_hit<Real> hit = closest_hit(scene.tree, p.r, p.from_sphere, p.inward);
+    const bvh_hit<Real> hit = closest_hit<Real, kernel_kind::first_book>(scene.tree, p.r, p.from, p.inward);
     if (hit.index < 0)
     {
         sample = p.throughput * cam.sky(p.r.direction);
@@ -140,7 +140,7 @@ __device__ bool trace_first_book_ray(path<Real>& p, const scene_view<Real>& scen
         return true;
     }
     p.r = {rec.p, direction};
-    p.from_sphere = hit.index;
+    p.from = hit.index;
     p.inward = dot(direction, outward) < Real(0);
     return false;
 }
@@ -163,8 +163,12 @@ template <real_number Real>
 __device__ surface<Real> surface_at(const scene_view<Real>& scene, const ray<Real>& r, const bvh_hit<Real>& hit)
 {
     surface<Real> s{};
-    // Step 46's lines (see trace_first_book_ray above): the side from the root
-    const sphere<Real> ball = scene.tree.spheres[hit.index];
+    // A sphere that stands still, or a moving one where it is at the ray's time. Then Step 46's lines (see
+    // trace_first_book_ray above): the side from the root.
+    const bvh_view<Real>& tree = scene.tree;
+    const sphere<Real> ball = hit.index < tree.moving_base
+                                  ? tree.spheres[hit.index]
+                                  : tree.moving_spheres[hit.index - tree.moving_base].at(r.time);
     s.rec.p = r.at(hit.t);
     s.outward = (Real(1) / ball.radius) * (s.rec.p - ball.center);
     s.rec.front_face = hit.entering;
@@ -193,7 +197,7 @@ template <real_number Real>
 __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const camera<Real>& cam, pcg32& rng,
                           color<Real>& sample)
 {
-    const bvh_hit<Real> hit = closest_hit(scene.tree, p.r, p.from_sphere, p.inward);
+    const bvh_hit<Real> hit = closest_hit<Real, kernel_kind::all_books>(scene.tree, p.r, p.from, p.inward);
     if (hit.index < 0)
     {
         sample = p.throughput * cam.sky(p.r.direction);
@@ -232,10 +236,31 @@ __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const ca
         sample = {}; // the path may trace no more rays (the CPU's depth reached 0): no light
         return true;
     }
-    p.r = {s.rec.p, direction};
-    p.from_sphere = hit.index;
+    // A bounce keeps the ray's time (material.ixx for metal and glass, ray_color in camera.ixx for a diffuse bounce)
+    p.r = {s.rec.p, direction, p.r.time};
+    p.from = hit.index;
     p.inward = dot(direction, s.outward) < Real(0);
     return false;
+}
+
+// The path of pass `pass` of pixel (i, j), as the kernel's kind starts it: the camera ray of camera::start_path and, in
+// a scene where something moves, the moment it is emitted, drawn after the camera ray's numbers as on the CPU
+// (camera::get_ray in camera.ixx). The CPU draws the time for every ray; the GPU only when a sphere moves, as a scene
+// that stands still never reads it: drawing it anyway would shift every random number after it, and the first book's
+// scenes would get other noise than in Step 46 (the same picture, no longer the same bytes).
+template <real_number Real, kernel_kind Kind>
+__device__ path<Real> start_sample(const camera<Real>& cam, const scene_view<Real>& scene, int i, int j, int pass,
+                                   pcg32& rng)
+{
+    path<Real> p = cam.start_path(i, j, pass, rng);
+    if constexpr (Kind == kernel_kind::all_books)
+    {
+        if (scene.motion)
+        {
+            p.r.time = random_real<Real>(rng);
+        }
+    }
+    return p;
 }
 
 // One ray of the path, as the kernel's kind traces it

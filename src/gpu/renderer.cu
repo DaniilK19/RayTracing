@@ -63,7 +63,8 @@ static_assert(block_width * block_height % 32 == 0);
 // 8 spheres (by 5, 7 and 20%). But for a handful of spheres a tree costs more than it saves: testing them all was
 // faster in every scene of 8 spheres measured (parts of the weekend scene, with and without its ground) and about as
 // fast at 16, and the materials scene renders 1.7 times faster as a single leaf. So a scene of at most 8 spheres gets
-// a single leaf.
+// a single leaf (one per kind under a root when some of its spheres move and others don't: see add_subtree in
+// bvh.cuh).
 constexpr int bvh_leaf_size = 1;
 constexpr int small_scene_spheres = 8;
 
@@ -331,7 +332,7 @@ __device__ __forceinline__ void render_pixel(const camera<Real>& cam, const scen
         int pass = work.first_pass;
         const int end_pass = work.first_pass + work.pass_count;
         pcg32 rng = sample_generator(seed, pixel, static_cast<std::uint64_t>(pass));
-        path<Real> p = cam.start_path(i, j, pass, rng);
+        path<Real> p = start_sample<Real, Kind>(cam, scene, i, j, pass, rng);
         while (true)
         {
             ++rays;
@@ -349,7 +350,7 @@ __device__ __forceinline__ void render_pixel(const camera<Real>& cam, const scen
                 break;
             }
             rng = sample_generator(seed, pixel, static_cast<std::uint64_t>(pass));
-            p = cam.start_path(i, j, pass, rng);
+            p = start_sample<Real, Kind>(cam, scene, i, j, pass, rng);
         }
         pixel_sum[0] = red;
         pixel_sum[1] = green;
@@ -371,12 +372,14 @@ __device__ __forceinline__ void render_pixel(const camera<Real>& cam, const scen
 // Why two. A kernel takes one number of registers for all its threads, fixed when it is compiled: as many as the most
 // demanding point of its code needs (where the most values are alive at once), whether a scene's paths ever get there
 // or not. And the more registers a thread takes, the fewer threads fit on a multiprocessor (see
-// blocks_per_multiprocessor). Each feature of the second and third books (smoke, lamps, light sampling...) adds code
-// to the kernel, and with it, most likely, registers that the first book's scenes would pay for without using them. So
-// the scenes that need nothing beyond the first book get a kernel of their own, which traces Step 46's code
-// (trace_first_book_ray), and every other scene gets the kernel for all three books. Both run render_pixel, each with
-// its own Kind, and `if constexpr` (see trace in camera.cuh) compiles into each only its own code. So far, with the
-// solid and checker textures, both take the same registers: 64 per thread in float and 96 in double.
+// blocks_per_multiprocessor). Each feature of the second and third books (textures, moving spheres, smoke, lamps...)
+// adds code to the kernel, and it may add registers that the first book's scenes would pay for without using them. The
+// solid and checker textures added none; with moving spheres, a float thread of the general kernel takes 72 registers
+// instead of 64, and a multiprocessor holds 7 of its blocks instead of 8 (in double both kernels still take 96). So
+// the scenes that need nothing beyond the first book get a kernel of their own, which
+// traces Step 46's code (trace_first_book_ray), and every other scene gets the kernel for all three books. Both run
+// render_pixel, each with its own Kind, and `if constexpr` (see trace in camera.cuh) compiles into each only its own
+// code. Every render prints the registers of the kernel it ran (the Kernel: line).
 //
 // They also get the scene differently. The first book's kernel takes Step 46's parameters: each of its arrays is a
 // pointer marked __restrict__, a promise to the compiler that while the kernel runs, the memory it points to is reached
@@ -603,14 +606,21 @@ void validate(const scene_desc& scene)
     }
 }
 
-// Whether the first book's kernel can render the scene (see first_book_kernel). Every scene the GPU renders so far has
-// spheres that stand still, lit by the sky, so its materials decide: each a lambertian of one color, a metal or a
-// dielectric
+// Whether a sphere moves while the shutter is open
+bool moves(const sphere_desc& s)
+{
+    return s.displacement.x != 0 || s.displacement.y != 0 || s.displacement.z != 0;
+}
+
+// Whether the first book's kernel can render the scene (see first_book_kernel): its spheres stand still, and every
+// material is a lambertian of one color, a metal or a dielectric. (Every scene the GPU renders so far is lit by the
+// sky.)
 bool first_book_scene(const scene_desc& scene)
 {
-    return std::ranges::all_of(scene.materials, [&](const material_desc& m) {
-        return m.kind != material_kind::lambertian || solid_lambertian(scene, m);
-    });
+    return std::ranges::none_of(scene.spheres, moves) &&
+           std::ranges::all_of(scene.materials, [&](const material_desc& m) {
+               return m.kind != material_kind::lambertian || solid_lambertian(scene, m);
+           });
 }
 
 // The scene in the GPU's memory, in Real: the arrays the kernels read, owned here (so that they are freed however
@@ -626,7 +636,12 @@ public:
 
     scene_view<Real> view() const
     {
-        return {.tree = {.nodes = nodes_.data(), .spheres = spheres_.data(), .node_count = node_count_},
+        return {.motion = motion_,
+                .tree = {.nodes = nodes_.data(),
+                         .spheres = spheres_.data(),
+                         .node_count = node_count_,
+                         .moving_spheres = moving_spheres_.data(),
+                         .moving_base = moving_base_},
                 .primitive_materials = primitive_materials_.data(),
                 .sphere_frames = sphere_frames_.data(),
                 .materials = materials_.data(),
@@ -639,11 +654,14 @@ private:
         : nodes_(tree.nodes),
           node_count_(static_cast<int>(tree.nodes.size())),
           spheres_(tree.spheres),
+          moving_spheres_(tree.moving_spheres),
+          moving_base_(tree.moving_base),
           primitive_materials_(tree.primitive_materials),
           sphere_frames_(tree.sphere_frames),
           materials_(to_materials<Real>(scene)),
           material_textures_(to_material_textures(scene)),
-          textures_(to_textures<Real>(scene.textures))
+          textures_(to_textures<Real>(scene.textures)),
+          motion_(std::ranges::any_of(scene.spheres, moves))
     {
     }
 
@@ -655,11 +673,14 @@ private:
     device_array<bvh_node<Real>> nodes_;
     int node_count_;
     device_array<sphere<Real>> spheres_;
+    device_array<moving_sphere<Real>> moving_spheres_;
+    int moving_base_;
     device_array<int> primitive_materials_;
     device_array<sphere_frame<Real>> sphere_frames_;
     device_array<material<Real>> materials_;
     device_array<material_texture> material_textures_;
     device_array<texture<Real>> textures_;
+    bool motion_;
 };
 
 // All passes of the render with the kernel of the given kind, launch after launch: adds the samples to sums and the

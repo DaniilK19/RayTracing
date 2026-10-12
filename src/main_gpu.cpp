@@ -27,11 +27,12 @@ import vec3;
 // --- The command line ------------------------------------------------------------------------------------------
 
 // The scenes of RayTracing that the GPU can render so far. The others need features of the second and third books
-// that the GPU doesn't have yet (quads, moving spheres, smoke, lamps...), and to_gpu below says which one is missing.
+// that the GPU doesn't have yet (image and marble textures, quads, smoke, lamps...), and to_gpu below says which one is
+// missing.
 // In the end to_gpu decides, so any scene it can translate renders: earth, for one, when its texture's file is
 // missing, as the plain cyan sphere that the CPU renders then too.
 // std::to_array (C++20) counts the names itself, so the array's size can't disagree with the list.
-constexpr auto supported_scenes = std::to_array<std::string_view>({"materials", "weekend", "checker"});
+constexpr auto supported_scenes = std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker"});
 constexpr std::string_view default_gpu_scene = "weekend";
 
 // The options are RayTracing's without -p (the GPU samples as the material scatters, as the CPU does in a scene lit
@@ -254,16 +255,17 @@ std::expected<void, std::string> scene_translator::add_shape(const hittable& sha
 {
     if (const auto* ball = dynamic_cast<const sphere*>(&shape))
     {
-        if (ball->is_moving())
-        {
-            return std::unexpected("it has a moving sphere");
-        }
         const auto mat = material_index(ball->mat());
         if (!mat)
         {
             return std::unexpected(mat.error());
         }
-        desc_.spheres.push_back({.center = to_gpu(ball->center_at(0)), .radius = ball->radius(), .material = *mat});
+        // How far the center moves while the shutter is open, from the sphere's own accessors: exactly 0 for a sphere
+        // that stands still (c + 1·0 - c), which is how the renderer tells the two kinds apart
+        desc_.spheres.push_back({.center = to_gpu(ball->center_at(0)),
+                                 .radius = ball->radius(),
+                                 .material = *mat,
+                                 .displacement = to_gpu(ball->center_at(1) - ball->center_at(0))});
         return {};
     }
     if (dynamic_cast<const quad*>(&shape))
@@ -363,8 +365,8 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
     return index;
 }
 
-// The whole scene, or why the GPU can't render it yet. So far the GPU renders spheres that stand still, matte surfaces
-// with solid or checker textures, metal and glass, lit by the sky.
+// The whole scene, or why the GPU can't render it yet. So far the GPU renders spheres, standing still or moving, with
+// matte surfaces of solid or checker textures, metal and glass, lit by the sky.
 std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame)
 {
     if (!s.lights.empty())

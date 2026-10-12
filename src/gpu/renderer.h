@@ -70,12 +70,16 @@ struct material_desc
 
 // --- Shapes, in world coordinates (sphere.ixx) ----------------------------------------------------------------------
 
-// A stationary sphere
+// A sphere, standing still or moving
 struct sphere_desc
 {
-    vec3d center;
+    vec3d center;     // at time 0: sphere::center_at(0)
     double radius = 0;
     int material = 0; // an index into scene_desc::materials
+    // Motion blur: while the shutter is open, from time 0 to 1, the center moves by this much
+    // (sphere::center_at(1) - center_at(0)), and at time t it is center + t·displacement. Exactly 0 for a sphere that
+    // stands still.
+    vec3d displacement;
 };
 
 // --- The camera (camera.ixx) ----------------------------------------------------------------------------------------

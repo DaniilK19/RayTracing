@@ -15,13 +15,31 @@ struct alignas(4 * sizeof(Real)) sphere
     Real radius;
 };
 
+// A sphere that moves while the shutter is open: at time t its center is center + t·displacement (sphere.ixx keeps
+// the center's path as a ray). 32 bytes in float: two 16-byte loads. A kind of its own (see primitive_kind in
+// bvh.cuh), so that a sphere that stands still keeps its single load.
+template <real_number Real>
+struct alignas(4 * sizeof(Real)) moving_sphere
+{
+    point3<Real> center; // at time 0
+    Real radius;
+    vec3<Real> displacement;
+    Real unused; // padding, named: the alignment makes the struct 32 bytes in float either way
+
+    // The sphere where it is at the given time. A ray and all its bounces share one time, so the tests of this sphere
+    // along one path (in closest_hit) all compute the same center, bit for bit: a bounce leaves the sphere where it was
+    // hit, and the self-intersection rule for the sphere the ray leaves holds as for a sphere that stands still.
+    __device__ sphere<Real> at(Real time) const { return {center + time * displacement, radius}; }
+};
+
 // What only the closest hit reads about a sphere besides its material (see bvh): the two numbers that let a checker
 // texture read a point exactly on the sphere (see onto_sphere). 8 bytes in float: one load.
 template <real_number Real>
 struct alignas(2 * sizeof(Real)) sphere_frame
 {
     Real k;     // |center|² - radius², computed in double on the host from the sphere the GPU tests, then rounded
-    Real limit; // 2·radius·|center|: onto_sphere helps only where its own rounding stays below this
+    Real limit; // 2·radius·|center|: onto_sphere helps only where its own rounding stays below this. 0 for a moving
+                // sphere, whose center, and so k, change with time: onto_sphere leaves its points alone.
 };
 
 // The distance t (in lengths of the ray's direction) at which the ray hits the sphere, if a hit lies in (t_min, t_max),
