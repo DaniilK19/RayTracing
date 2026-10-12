@@ -28,22 +28,24 @@ import vec3;
 // --- The command line ------------------------------------------------------------------------------------------
 
 // The scenes of RayTracing that the GPU can render so far. The others need features of the second and third books
-// that the GPU doesn't have yet (lamps, smoke...), and to_gpu below says which one is missing.
+// that the GPU doesn't have yet (instances, smoke...), and to_gpu below says which one is missing. The scenes lit by
+// lamps render only with -p material so far.
 // In the end to_gpu decides: any scene it can translate renders, listed here or not. (earth renders without its
 // texture's file too, as the plain cyan sphere that the CPU renders then.)
 // std::to_array (C++20) counts the names itself, so the array's size can't disagree with the list.
-constexpr auto supported_scenes =
-    std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker", "earth", "perlin", "quads"});
+constexpr auto supported_scenes = std::to_array<std::string_view>(
+    {"materials", "weekend", "bouncing", "checker", "earth", "perlin", "quads", "light"});
 constexpr std::string_view default_gpu_scene = "weekend";
 
-// The options are RayTracing's without -p (the GPU samples as the material scatters, as the CPU does in a scene lit
-// by the sky), plus two of the GPU's own: --fp64 and --all-books-kernel. std::optional tells "not given: take it from
-// the scene" apart from any given value.
+// The options are RayTracing's (-p takes all of its names, though the GPU samples only as the material scatters so
+// far), plus two of the GPU's own: --fp64 and --all-books-kernel. std::optional tells "not given: take it from the
+// scene" apart from any given value.
 struct options
 {
     std::string_view scene = default_gpu_scene;
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
+    std::optional<sampling_strategy> sampling;
     std::uint32_t seed = 0;
     std::vector<std::filesystem::path> outputs; // one per -o; parse_options adds <scene name>-gpu.png if there is none
     bool fp64 = false;
@@ -55,7 +57,7 @@ void print_usage()
 {
     std::println("Usage: RayTracingGPU [scene] [options]\n\n"
                  "Renders RayTracing's scenes on an NVIDIA graphics card with CUDA. So far it can render\n"
-                 "these scenes:");
+                 "these scenes (those lit by lamps only with -p material):");
     for (const std::string_view name : supported_scenes)
     {
         std::println("  {:10} {}", name, find_scene(name)->description);
@@ -68,6 +70,9 @@ Options:
   -s, --samples N      rays per pixel: fewer is faster but noisier
                        (each scene has its own default); rounded to the nearest square k²,
                        because the rays form a k×k grid in the pixel
+  -p, --sampling NAME  how a diffuse bounce chooses the next direction, as in RayTracing:
+                       so far only material (as the surface scatters), which a scene lit
+                       by lamps needs to be told: its default is mixture
       --fp64           compute in 64-bit doubles like the CPU instead of 32-bit floats:
                        a check of the floats, many times slower on a GeForce card
       --all-books-kernel
@@ -120,7 +125,8 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         const bool is_samples = arg == "-s" || arg == "--samples";
         const bool is_output = arg == "-o" || arg == "--output";
         const bool is_seed = arg == "--seed";
-        if (!is_width && !is_samples && !is_output && !is_seed)
+        const bool is_sampling = arg == "-p" || arg == "--sampling";
+        if (!is_width && !is_samples && !is_output && !is_seed && !is_sampling)
         {
             return std::unexpected(std::format("unknown option '{}'", arg));
         }
@@ -138,6 +144,17 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
                 return std::unexpected(std::format("{}: {}", arg, checked.error()));
             }
             opts.outputs.push_back(std::move(output));
+            continue;
+        }
+        if (is_sampling)
+        {
+            // Any of RayTracing's names, for a clear message if the GPU can't sample that way yet
+            const auto it = std::ranges::find(sampling_list, value, &sampling_entry::name);
+            if (it == sampling_list.end())
+            {
+                return std::unexpected(std::format("unknown sampling strategy '{}'", value));
+            }
+            opts.sampling = it->strategy;
             continue;
         }
         if (is_seed)
@@ -183,8 +200,26 @@ gpu::vec3d to_gpu(const vec3& v)
     return {v.x, v.y, v.z};
 }
 
-// The pixel grid and the lens, as the CPU's camera computed them from the scene's settings
-gpu::camera_desc to_gpu(const camera_frame& frame)
+// The strategy as the GPU renderer's enum (renderer.h can't import the camera module, so it has its own)
+gpu::sampling_strategy to_gpu(sampling_strategy strategy)
+{
+    switch (strategy)
+    {
+    case sampling_strategy::uniform:
+        return gpu::sampling_strategy::uniform;
+    case sampling_strategy::material:
+        return gpu::sampling_strategy::material;
+    case sampling_strategy::lights:
+        return gpu::sampling_strategy::lights;
+    case sampling_strategy::mixture:
+        return gpu::sampling_strategy::mixture;
+    }
+    std::unreachable(); // C++23: the switch covers every enumerator
+}
+
+// The pixel grid and the lens, as the CPU's camera computed them from the scene's settings, and the strategy it
+// renders with
+gpu::camera_desc to_gpu(const camera_frame& frame, sampling_strategy sampling)
 {
     return {.image_width = frame.image_width,
             .image_height = frame.image_height,
@@ -198,7 +233,8 @@ gpu::camera_desc to_gpu(const camera_frame& frame)
             .defocus_disk_u = to_gpu(frame.defocus_disk_u),
             .defocus_disk_v = to_gpu(frame.defocus_disk_v),
             .sky_bottom = to_gpu(frame.background.bottom),
-            .sky_top = to_gpu(frame.background.top)};
+            .sky_top = to_gpu(frame.background.top),
+            .sampling = to_gpu(sampling)};
 }
 
 // Calls on_shape(shape) for every object in the lists under `object` that isn't a list itself (or for `object`, if it
@@ -228,7 +264,7 @@ std::expected<void, std::string> for_each_shape(const hittable& object, const au
 class scene_translator
 {
 public:
-    explicit scene_translator(const camera_frame& frame) { desc_.camera = to_gpu(frame); }
+    scene_translator(const camera_frame& frame, sampling_strategy sampling) { desc_.camera = to_gpu(frame, sampling); }
 
     // Every shape of the world (spheres and quads), wherever it is in the world's lists
     std::expected<void, std::string> add_world(const hittable_list& world)
@@ -319,9 +355,18 @@ std::expected<int, std::string> scene_translator::material_index(const material*
     {
         desc = {.kind = gpu::material_kind::dielectric, .refraction_index = glass->refraction_index()};
     }
+    else if (const auto* lamp = dynamic_cast<const diffuse_light*>(mat))
+    {
+        const auto tex = texture_index(lamp->emission_texture());
+        if (!tex)
+        {
+            return tex;
+        }
+        desc = {.kind = gpu::material_kind::diffuse_light, .texture = *tex};
+    }
     else
     {
-        return std::unexpected("it has a material other than lambertian, metal and dielectric");
+        return std::unexpected("it has a material other than lambertian, metal, dielectric and diffuse_light");
     }
     const auto index = static_cast<int>(desc_.materials.size());
     desc_.materials.push_back(desc);
@@ -405,25 +450,36 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
 }
 
 // The whole scene, or why the GPU can't render it yet. So far the GPU renders spheres, standing still or moving, and
-// quads, with matte surfaces of solid, checker, image or marble textures, metal and glass, lit by the sky.
-std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame)
+// quads, with matte surfaces of solid, checker, image or marble textures, metal, glass and lamps. sampling is the
+// strategy the CPU would render with (effective_sampling); see unsupported_sampling for the ones the GPU has.
+std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame,
+                                                   sampling_strategy sampling)
 {
-    if (!s.lights.empty())
-    {
-        return std::unexpected("it has lamps");
-    }
-    // The GPU samples a diffuse bounce only as the material scatters. Without lamps the CPU does too (see
-    // effective_sampling), unless the scene asks for uniform sampling.
-    if (effective_sampling(s.camera.sampling, s.lights) != sampling_strategy::material)
-    {
-        return std::unexpected("its camera doesn't sample as the material scatters");
-    }
-    scene_translator translator(frame);
+    scene_translator translator(frame, sampling);
     if (const auto added = translator.add_world(s.world); !added)
     {
         return std::unexpected(added.error());
     }
     return std::move(translator).finish();
+}
+
+// Why the GPU can't sample diffuse bounces with this strategy yet, or nothing if it can: so far only as the material
+// scatters
+std::optional<std::string> unsupported_sampling(sampling_strategy sampling)
+{
+    switch (sampling)
+    {
+    case sampling_strategy::uniform:
+        return "the GPU can't sample uniformly (-p uniform) yet: try -p material";
+    case sampling_strategy::lights:
+        return "the GPU can't aim at the lamps (-p lights) yet: try -p material";
+    case sampling_strategy::mixture:
+        return "the GPU can't aim half of the bounces at the lamps (-p mixture, the default in a scene with lamps) "
+               "yet: add -p material";
+    case sampling_strategy::material:
+        break;
+    }
+    return std::nullopt;
 }
 
 // --- Rendering -------------------------------------------------------------------------------------------------
@@ -453,6 +509,7 @@ int main(int argc, char* argv[])
     scene s = find_scene(opts->scene)->build();
     s.camera.image_width = opts->image_width.value_or(s.camera.image_width);
     s.camera.samples_per_pixel = opts->samples_per_pixel.value_or(s.camera.samples_per_pixel);
+    s.camera.sampling = opts->sampling.value_or(s.camera.sampling); // -p, as in RayTracing
 
     // The CPU's camera computes the pixel grid and the lens from the settings; the GPU renders with its numbers
     const camera cam(s.camera);
@@ -462,13 +519,19 @@ int main(int argc, char* argv[])
     const sampling_strategy requested = s.camera.sampling;
     const sampling_strategy sampling = effective_sampling(requested, s.lights);
 
-    const auto gpu_scene = to_gpu(s, frame);
+    const auto gpu_scene = to_gpu(s, frame, sampling);
     if (!gpu_scene)
     {
         // C++23 formats ranges: n drops the brackets, and the empty format after the colon prints the names
         // without quotes
         std::println("Error: the GPU can't render '{}' yet: {}. So far it renders: {:n:}.", opts->scene,
                      gpu_scene.error(), supported_scenes);
+        return 1;
+    }
+    // Checked after the scene, so that "add -p material" is said only where it makes the scene render
+    if (const auto why = unsupported_sampling(sampling))
+    {
+        std::println("Error: {}", *why);
         return 1;
     }
 

@@ -130,6 +130,8 @@ public:
         return rec.front_face ? tex_->value(rec.u, rec.v, rec.p) : color{0, 0, 0};
     }
 
+    inline const texture& emission_texture() const { return *tex_; }
+
 private:
     std::shared_ptr<const texture> tex_;
 };

@@ -493,15 +493,21 @@ camera<Real> to_camera(const camera_desc& desc)
             .sky_top = to_real<Real>(desc.sky_top)};
 }
 
-// Whether a material is a lambertian whose texture is one solid color
-bool solid_lambertian(const scene_desc& scene, const material_desc& desc)
+// Whether a material has a texture: a lambertian's albedo, or a lamp's light
+bool has_texture(const material_desc& desc)
 {
-    return desc.kind == material_kind::lambertian &&
-           scene.textures[static_cast<std::size_t>(desc.texture)].kind == texture_kind::solid;
+    return desc.kind == material_kind::lambertian || desc.kind == material_kind::diffuse_light;
 }
 
-// The materials in Real. A lambertian's texture of one color becomes its albedo: there the first book's kernel reads it
-// (see scatter in material.cuh), and the kernel for all three books takes it without looking up a texture.
+// Whether a material's texture is one solid color
+bool solid_texture(const scene_desc& scene, const material_desc& desc)
+{
+    return has_texture(desc) && scene.textures[static_cast<std::size_t>(desc.texture)].kind == texture_kind::solid;
+}
+
+// The materials in Real. A texture of one color becomes the material's albedo: there the first book's kernel reads a
+// lambertian's (see scatter in material.cuh), and the kernel for all three books takes it without looking up a
+// texture (a lamp's light too).
 template <real_number Real>
 std::vector<material<Real>> to_materials(const scene_desc& scene)
 {
@@ -509,7 +515,7 @@ std::vector<material<Real>> to_materials(const scene_desc& scene)
     for (const material_desc& desc : scene.materials)
     {
         const vec3d albedo =
-            solid_lambertian(scene, desc) ? scene.textures[static_cast<std::size_t>(desc.texture)].rgb : desc.albedo;
+            solid_texture(scene, desc) ? scene.textures[static_cast<std::size_t>(desc.texture)].rgb : desc.albedo;
         materials.push_back({.kind = desc.kind,
                              .albedo = to_real<Real>(albedo),
                              .fuzz = static_cast<Real>(desc.fuzz),
@@ -540,7 +546,7 @@ std::vector<material_texture> to_material_textures(const scene_desc& scene)
     std::vector<material_texture> shading;
     for (const material_desc& desc : scene.materials)
     {
-        const bool textured = desc.kind == material_kind::lambertian && !solid_lambertian(scene, desc);
+        const bool textured = has_texture(desc) && !solid_texture(scene, desc);
         shading.push_back(
             {.texture_index = textured ? desc.texture : -1,
              .needs_uv = textured && needs_uv(scene, desc.texture),
@@ -694,9 +700,11 @@ void validate(const scene_desc& scene)
             throw std::runtime_error("unknown texture kind");
         }
     }
+    // Only diffuse_light emits light, and it scatters none: so a path ends where it finds light, and the kernel keeps
+    // no running sum of it (see trace_ray in camera.cuh). A material that both emitted and scattered would need one.
     for (const material_desc& m : scene.materials)
     {
-        if (m.kind == material_kind::lambertian)
+        if (has_texture(m))
         {
             if (m.texture < 0 || m.texture >= texture_count)
             {
@@ -707,6 +715,11 @@ void validate(const scene_desc& scene)
         {
             throw std::runtime_error("unknown material kind");
         }
+    }
+    // Only the material strategy so far: a diffuse bounce samples as the material scatters
+    if (camera.sampling != sampling_strategy::material)
+    {
+        throw std::runtime_error("the GPU renderer samples diffuse bounces only as the material scatters so far");
     }
     for (const sphere_desc& s : scene.spheres)
     {
@@ -736,13 +749,15 @@ bool moves(const sphere_desc& s)
 }
 
 // Whether the first book's kernel can render the scene (see first_book_kernel): it has spheres that stand still and no
-// other shapes, and every material is a lambertian of one color, a metal or a dielectric. (Every scene the GPU renders
-// so far is lit by the sky.)
+// other shapes, every material is a lambertian of one color, a metal or a dielectric (so the sky is the only light),
+// and diffuse bounces sample as the material scatters
 bool first_book_scene(const scene_desc& scene)
 {
     return scene.quads.empty() && std::ranges::none_of(scene.spheres, moves) &&
+           scene.camera.sampling == sampling_strategy::material &&
            std::ranges::all_of(scene.materials, [&](const material_desc& m) {
-               return m.kind != material_kind::lambertian || solid_lambertian(scene, m);
+               return (m.kind == material_kind::lambertian && solid_texture(scene, m)) ||
+                      m.kind == material_kind::metal || m.kind == material_kind::dielectric;
            });
 }
 

@@ -85,9 +85,10 @@ struct perlin_desc
 
 enum class material_kind
 {
-    lambertian, // matte: `texture` is its albedo
-    metal,      // a blurred mirror: albedo and fuzz
-    dielectric, // glass: refraction_index
+    lambertian,    // matte: `texture` is its albedo
+    metal,         // a blurred mirror: albedo and fuzz
+    dielectric,    // glass: refraction_index
+    diffuse_light, // a lamp: `texture` is the light it emits, from its front side only; it reflects nothing
 };
 
 struct material_desc
@@ -96,7 +97,8 @@ struct material_desc
     vec3d albedo;                // metal: the fraction of light kept in each channel
     double fuzz = 0;             // metal: 0 is a perfect mirror; at most 1 (the metal class caps it)
     double refraction_index = 1; // dielectric: relative to the medium around it (1 / 1.5 for an air bubble in glass)
-    int texture = -1;            // lambertian: an index into scene_desc::textures (a single color is a solid texture)
+    int texture = -1;            // lambertian, diffuse_light: an index into scene_desc::textures (one color is a solid
+                                 // texture)
 };
 
 // --- Shapes, in world coordinates (sphere.ixx, quad.ixx) ------------------------------------------------------------
@@ -124,6 +126,15 @@ struct quad_desc
 
 // --- The camera (camera.ixx) ----------------------------------------------------------------------------------------
 
+// How a diffuse bounce chooses the next direction: the CPU's sampling_strategy
+enum class sampling_strategy
+{
+    uniform,  // the same density in every direction
+    material, // as the material scatters
+    lights,   // toward the lamps of the scene's lights list
+    mixture,  // half and half
+};
+
 // The camera as the CPU's camera class has set it up from its settings (see camera_frame in camera.ixx). The sample of
 // pixel (i, j) in cell (s_i, s_j) of the pixel's sqrt_spp × sqrt_spp grid is the ray from the camera center, or from a
 // random point center + a·defocus_disk_u + b·defocus_disk_v of the lens disk (a² + b² < 1), toward the point
@@ -144,7 +155,10 @@ struct camera_desc
     vec3d defocus_disk_u;
     vec3d defocus_disk_v;
     vec3d sky_bottom; // the background: the gradient between these colors that the CPU's sky computes
-    vec3d sky_top;
+    vec3d sky_top;    // (both black in the scenes lit by lamps)
+    // The strategy the CPU's camera renders with: effective_sampling of the one asked for, so lights and mixture come
+    // only with a lights list that isn't empty
+    sampling_strategy sampling = sampling_strategy::material;
 };
 
 // --- The scene, and how to render it --------------------------------------------------------------------------------

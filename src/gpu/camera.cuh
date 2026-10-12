@@ -236,13 +236,29 @@ __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const ca
     }
     const surface<Real> s = surface_at(scene, p.r, hit);
     const material<Real> mat = scene.materials[s.material];
-    // The material's color here, for a kind that has one, computed at one place so that the texture code is in the
-    // kernel once. Textures draw no random numbers, so computing it before the bounce changes nothing else.
-    const color<Real> c = mat.kind == material_kind::lambertian ? surface_color(scene, mat, s) : color<Real>{};
+    // The material's color here, for a kind that has one: a matte surface, or a lamp seen from its front. Computed at
+    // one place, so that the texture code is in the kernel once; textures draw no random numbers, so computing it
+    // before the bounce changes nothing else.
+    const bool colored =
+        mat.kind == material_kind::lambertian || (mat.kind == material_kind::diffuse_light && s.rec.front_face);
+    const color<Real> c = colored ? surface_color(scene, mat, s) : color<Real>{};
 
     vec3<Real> direction;
     switch (mat.kind)
     {
+    case material_kind::diffuse_light:
+        // A lamp glows on its front side only (c is 0 on its back) and reflects nothing: the path ends here, whichever
+        // side it hit. Its light counts on the path's last ray too, as on the CPU: there the depth test at the top of
+        // ray_color decides only whether a ray is traced, so the last ray, once traced, still returns what its hit
+        // emits. The test that ends a path is the next ray's: here the --p.rays_left test below, which a lamp never
+        // reaches.
+        //
+        // The CPU's ray_color adds up emitted + attenuation·(the light of the next ray) down its recursion. Here a
+        // path keeps no running sum of light, only its throughput: the only material that emits, diffuse_light,
+        // ends the path, and every other material emits nothing. A material that both emitted and scattered would
+        // need such a sum (renderer.cu's validate accepts only the materials that this holds for).
+        sample = p.throughput * c;
+        return true;
     case material_kind::lambertian:
         // Step 46's matte bounce (see scatter in material.cuh), attenuated by the texture's color
         direction = around(s.rec.normal, random_cosine_direction<Real>(rng));

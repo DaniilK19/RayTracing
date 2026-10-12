@@ -1,4 +1,5 @@
-// The GPU's materials (see material.ixx): the first book's three, as plain data and a switch.
+// The GPU's materials (see material.ixx) as plain data, and the first book's three as a switch. (A lamp, diffuse_light,
+// reflects nothing: trace_ray in camera.cuh ends the path there.)
 //
 // On the CPU a material is an object of a class with virtual functions, and a hit calls its scatter(). On the GPU the
 // usual way is data: a material is its kind and its numbers, and one function switches on the kind. The CPU's objects
@@ -18,7 +19,8 @@ template <real_number Real>
 struct material
 {
     material_kind kind;
-    color<Real> albedo;    // metal; lambertian: its color when its texture is one solid color (see material_texture)
+    color<Real> albedo;    // metal; lambertian, diffuse_light: its color, or the light it emits, when its texture is
+                           // one solid color (see material_texture)
     Real fuzz;             // metal
     Real refraction_index; // dielectric
 };
@@ -28,8 +30,8 @@ struct material
 // before
 struct material_texture
 {
-    int texture_index;      // lambertian: an index into the textures, or -1 when its texture is one solid color,
-                            // which material::albedo then holds: no texture to look up at the hit
+    int texture_index;      // lambertian, diffuse_light: an index into the textures, or -1 when its texture is one
+                            // solid color, which material::albedo then holds: no texture to look up at the hit
     bool needs_uv;          // its texture reads the texture coordinates (an image, also inside a checker): only then
                             // does the hit compute them
     bool needs_exact_point; // its texture is a checker, whose colors jump across the faces of its cubes: on a sphere
@@ -76,8 +78,9 @@ __device__ Real reflectance(Real cosine, Real refraction_index)
 // The material's scatter(): what happens to a ray with the given direction at the hit. Returns false if the light is
 // absorbed: the sample is then 0. Otherwise sets the direction of the next ray and multiplies the path's throughput by
 // the attenuation. As on the CPU, a matte bounce is sampled with the material's own density (the camera's material
-// strategy: the sky scenes have no lamps to aim at), so its weight pScatter / p is exactly 1. (The first book's kernel
-// calls it for every material; the kernel for all three books for metal and glass, see trace_ray in camera.cuh.)
+// strategy, the only one the GPU has so far: see validate in renderer.cu), so its weight pScatter / p is exactly 1.
+// (The first book's kernel calls it for every material; the kernel for all three books for metal and glass, see
+// trace_ray in camera.cuh.)
 template <real_number Real>
 __device__ bool scatter(const material<Real>& mat, const vec3<Real>& direction, const hit_record<Real>& rec,
                         pcg32& rng, vec3<Real>& scattered, color<Real>& throughput)
@@ -117,6 +120,8 @@ __device__ bool scatter(const material<Real>& mat, const vec3<Real>& direction, 
         return true; // glass absorbs nothing: the throughput stays
     }
     }
-    return false; // not reached: renderer.cu accepts only the kinds above
+    // Not reached: the first book's kernel gets only these three kinds (see first_book_scene in renderer.cu), and
+    // trace_ray calls this function only for metal and glass (it handles matte surfaces and lamps itself)
+    return false;
 }
 }
