@@ -93,7 +93,8 @@ struct bvh
     std::vector<sphere_frame<Real>> sphere_frames; // by global id, for the spheres of both kinds
     int moving_base = 0;                           // the global id of moving_spheres[0]: how many spheres stand still
     int quad_base = 0;                             // the global id of quads[0]: how many spheres there are
-    std::vector<int> quad_ids;                     // the global id of each quad of the input, by its index there
+    std::vector<int> sphere_ids;                   // the global id of each sphere of the input, by its index there
+    std::vector<int> quad_ids;                     // the same for the quads
 };
 
 // Host code (it runs on the CPU, once, before the render) from here to build_bvh.
@@ -220,33 +221,34 @@ public:
     {
         // The spheres that stand still first, in the scene's order, then the moving ones. A scene whose spheres all
         // stand still then gives the builder the input of the first book's renderer, and so the same tree.
-        for (const sphere_desc& s : spheres)
+        for (std::size_t i = 0; i < spheres.size(); ++i)
         {
-            if (is_stationary(s))
+            if (is_stationary(spheres[i]))
             {
-                add_sphere(s);
+                add_sphere(spheres[i], static_cast<int>(i));
             }
         }
         tree_.moving_base = static_cast<int>(inputs_.size());
-        for (const sphere_desc& s : spheres)
+        for (std::size_t i = 0; i < spheres.size(); ++i)
         {
-            if (!is_stationary(s))
+            if (!is_stationary(spheres[i]))
             {
-                add_moving_sphere(s);
+                add_moving_sphere(spheres[i], static_cast<int>(i));
             }
         }
         tree_.quad_base = static_cast<int>(inputs_.size());
-        for (const quad_desc& q : quads)
+        for (std::size_t i = 0; i < quads.size(); ++i)
         {
-            add_quad(q);
+            add_quad(quads[i], static_cast<int>(i));
         }
+        tree_.sphere_ids.resize(spheres.size());
+        tree_.quad_ids.resize(quads.size());
     }
 
     bvh<Real> build() &&
     {
         tree_.primitive_materials.resize(inputs_.size());
         tree_.sphere_frames.resize(static_cast<std::size_t>(tree_.quad_base));
-        tree_.quad_ids.resize(quads_.size());
         std::vector<int> order(inputs_.size());
         std::iota(order.begin(), order.end(), 0); // 0, 1, 2, ...: indices into inputs_, sorted below
         if (!order.empty())
@@ -262,7 +264,8 @@ private:
     struct input
     {
         primitive_kind kind;
-        int index; // in spheres_, moving_spheres_ or quads_
+        int index;  // in spheres_, moving_spheres_ or quads_
+        int source; // in the builder's input: the spheres or the quads it was given
         int material;
         sphere_frame<Real> frame; // a sphere's
         build_box box;
@@ -280,7 +283,7 @@ private:
         return s.displacement.x == 0 && s.displacement.y == 0 && s.displacement.z == 0;
     }
 
-    void add_sphere(const sphere_desc& s)
+    void add_sphere(const sphere_desc& s, int source)
     {
         const sphere<Real> converted{to_real<Real>(s.center), static_cast<Real>(s.radius)};
         // The frame: the sphere's turn for sphere_uv, and onto_sphere's numbers k and limit, in double from the sphere
@@ -297,13 +300,14 @@ private:
                                        .limit = static_cast<Real>(2 * radius * std::sqrt(center_squared))};
         inputs_.push_back({.kind = primitive_kind::sphere,
                            .index = static_cast<int>(spheres_.size()),
+                           .source = source,
                            .material = s.material,
                            .frame = frame,
                            .box = sphere_box(converted.center, converted.center, converted.radius)});
         spheres_.push_back(converted);
     }
 
-    void add_moving_sphere(const sphere_desc& s)
+    void add_moving_sphere(const sphere_desc& s, int source)
     {
         const moving_sphere<Real> converted{.center = to_real<Real>(s.center),
                                             .radius = static_cast<Real>(s.radius),
@@ -311,6 +315,7 @@ private:
                                             .unused = 0};
         inputs_.push_back({.kind = primitive_kind::moving_sphere,
                            .index = static_cast<int>(moving_spheres_.size()),
+                           .source = source,
                            .material = s.material,
                            .frame = {.cos_theta = static_cast<Real>(s.uv_cos),
                                      .sin_theta = static_cast<Real>(s.uv_sin),
@@ -320,10 +325,11 @@ private:
         moving_spheres_.push_back(converted);
     }
 
-    void add_quad(const quad_desc& desc)
+    void add_quad(const quad_desc& desc, int source)
     {
         inputs_.push_back({.kind = primitive_kind::quad,
                            .index = static_cast<int>(quads_.size()),
+                           .source = source,
                            .material = desc.material,
                            .frame = {},
                            .box = quad_box(desc)});
@@ -349,11 +355,12 @@ private:
             id = tree_.quad_base + static_cast<int>(tree_.quads.size());
             tree_.quads.push_back(quads_[static_cast<std::size_t>(in.index)]);
             tree_.primitive_materials[static_cast<std::size_t>(id)] = in.material;
-            tree_.quad_ids[static_cast<std::size_t>(in.index)] = id; // quads_ holds the input's quads in its order
+            tree_.quad_ids[static_cast<std::size_t>(in.source)] = id;
             return; // a quad has no frame
         }
         tree_.primitive_materials[static_cast<std::size_t>(id)] = in.material;
         tree_.sphere_frames[static_cast<std::size_t>(id)] = in.frame;
+        tree_.sphere_ids[static_cast<std::size_t>(in.source)] = id;
     }
 
     // How many primitives of a kind the tree's array has so far: where a new leaf of that kind starts

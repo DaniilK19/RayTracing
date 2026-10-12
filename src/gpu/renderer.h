@@ -162,18 +162,26 @@ struct medium_desc
 // main_gpu.cpp asks it to explain a scene it can't render; renderer.cu's validate asks it again.
 bool is_convex(const std::vector<quad_desc>& quads);
 
-// --- What the lights strategy aims at: the scene's lights list (scene::lights) ---------------------------------------
+// --- What the lights and mixture strategies aim at: the scene's lights list (scene::lights) --------------------------
 
-// A shape of the lights list: a quad, so far (main_gpu.cpp says so about a sphere). Lists inside the list, such as a
-// box's six faces, are flattened, and weight is the chance that hittable_list::random aims at this shape: 1/n in a list
-// of n, multiplied down nested lists. So the weights add up to 1, and the list's density is the sum of weight × each
-// shape's density (hittable_list::pdf_value). The shapes are the lights list's own copies (see scene in scenes.ixx),
-// with their instances baked like the world's, never looked up among the world's objects. (The renderer only notes
-// which quad of the world has exactly the same numbers, if one has: a bounce that leaves that quad treats its copy as
-// itself, see lights_pdf_value in lights.cuh.)
+enum class light_shape
+{
+    quad,
+    sphere,
+};
+
+// A shape of the lights list. Lists inside the list, such as a box's six faces, are flattened, and weight is the chance
+// that hittable_list::random aims at this shape: 1/n in a list of n, multiplied down nested lists. So the weights add
+// up to 1, and the list's density is the sum of weight × each shape's density (hittable_list::pdf_value). The shapes
+// are the lights list's own copies (see scene in scenes.ixx), with their instances baked like the world's, never looked
+// up among the world's objects. (The renderer only notes which primitive of the world has exactly the same numbers, if
+// one has: a bounce that leaves that primitive treats its copy as itself, see lights_pdf_value in lights.cuh.)
 struct light_desc
 {
-    quad_desc quad; // its material is not used
+    light_shape kind = light_shape::quad;
+    quad_desc quad;    // light_shape::quad (its material is not used)
+    vec3d center;      // light_shape::sphere: its center at time 0, where sphere::pdf_value and random aim
+    double radius = 0; // light_shape::sphere
     double weight = 0;
 };
 

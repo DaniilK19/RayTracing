@@ -172,7 +172,27 @@ template <real_number Real>
 __device__ surface<Real> surface_at(const scene_view<Real>& scene, const ray<Real>& r, const bvh_hit<Real>& hit)
 {
     surface<Real> s{};
-    s.rec.p = r.at(hit.t);
+    // A quad's point as the CPU computes it: t·direction rounded, then the sum. at() lets nvcc fuse the two into one
+    // rounding, and then the points of an axis-aligned quad at 0, a floor at y = 0 say, fall just below or just above
+    // its plane about half and half. (At a coordinate far from 0 compared with how far the rays come from, such as the
+    // Cornell box's 555, they land on it.) Most of the CPU's land exactly on it, and the rest just below or just above
+    // about equally often: a few percent each for bounces at arbitrary heights, 0.2% for the Cornell camera's rays, and
+    // none below from a height that is a power of two, such as a camera at y = 2. Which side a point lies on matters
+    // where it decides something: a checker's colors jump across the faces of its cubes, and a quad can lie in one (the
+    // floor of mixed colors that at() gave); and a matte quad in its own lights list draws directions toward itself, in
+    // its own plane, which the CPU traces only when its point lies on the far side of the plane (where cos θ comes out
+    // above 0). Computed as the CPU computes them, the points fall on the CPU's side as often as the CPU's do in float,
+    // and in double exactly where they do for a quad placed in the world directly whose normal comes out exactly ±1, as
+    // every quad of the scenes does (its t is then the CPU's own number). For a quad baked out of instances the CPU
+    // finds the point in the instance's coordinates and moves it back: there the two agree only to rounding, also in
+    // double.
+    //
+    // The point is chosen once, here. When the quad's branch below computed its point a second time instead, nvcc
+    // compiled the spheres' code around it differently, with other fused multiply-adds (see first_book_scene in
+    // scene.cuh), and the first book's scenes rendered by this kernel (--all-books-kernel) no longer matched Step 46's
+    // images bit for bit.
+    const bool on_quad = hit.index >= scene.tree.quad_base && hit.index < scene.media.base;
+    s.rec.p = on_quad ? r.at_unfused(hit.t) : r.at(hit.t);
     s.texture_point = s.rec.p;
     s.from = hit.index;
     if (hit.index >= scene.media.base)
@@ -199,19 +219,6 @@ __device__ surface<Real> surface_at(const scene_view<Real>& scene, const ray<Rea
         if (shading.needs_uv)
         {
             quad_uv(face, r, hit.t, s.u, s.v);
-        }
-        if (shading.needs_exact_point)
-        {
-            // A checker's colors jump across the faces of its cubes, and a quad can lie in one (a floor at y = 0):
-            // there the point's rounding error alone decides the side it falls on, and so its color. The CPU rounds
-            // t·direction, then the sum: for rays from above, the floor's points come out at y = 0 or just above, the
-            // color of the cubes above. at() lets nvcc fuse the two into one rounding, and then about half of the
-            // points fell below: a floor of mixed colors. Computed as the CPU computes them, the points fall on the
-            // CPU's side as often as the CPU's do in float, and in double exactly where they do for a quad placed in
-            // the world directly (an axis-aligned quad's t is then the CPU's own number). For a quad baked out of
-            // instances the CPU finds the point in the instance's coordinates and moves it back: there the two agree
-            // only to rounding, also in double.
-            s.texture_point = r.at_unfused(hit.t);
         }
         return s;
     }
@@ -293,15 +300,19 @@ enum class bounce
 // Importance sampling: a direction drawn with a density p stands for the whole integral of the light coming in, as
 // the integrand divided by p. The integrand is the material's own density pScatter times the light, so a sample
 // weighs pScatter / p: exactly 1 where p is the material's own density. The strategies differ only in the noise, as
-// long as p > 0 wherever pScatter is: true for uniform, false for lights (biased, as on the CPU).
+// long as p > 0 wherever pScatter is: true for uniform and the mixture, false for lights (biased, as on the CPU).
 template <real_number Real>
 __device__ bounce diffuse_bounce(const scene_view<Real>& scene, bool matte, const hit_record<Real>& rec, int from,
                                  pcg32& rng, vec3<Real>& direction, Real& weight)
 {
-    // A particle sampled uniformly is sampled with its own density (the CPU's ratio is exactly 1.0), by the same
-    // random_unit_vector: the material strategy
-    const sampling_strategy strategy =
-        !matte && scene.sampling == sampling_strategy::uniform ? sampling_strategy::material : scene.sampling;
+    // A particle keeps its own density under uniform (the CPU's ratio is exactly 1.0, and the same random_unit_vector
+    // draws the direction) and under the mixture (isotropic::mixes_in_lights is false): the material strategy. Under
+    // lights it aims at the lamps like a surface (ray_color asks mixes_in_lights only under the mixture).
+    sampling_strategy strategy = scene.sampling;
+    if (!matte && strategy != sampling_strategy::lights)
+    {
+        strategy = sampling_strategy::material;
+    }
     if (strategy == sampling_strategy::material)
     {
         if (matte)
@@ -314,24 +325,41 @@ __device__ bounce diffuse_bounce(const scene_view<Real>& scene, bool matte, cons
         direction = random_unit_vector<Real>(rng); // sphere_pdf: 1/(4π) everywhere, never 0
         return bounce::own_density;
     }
-    // uniform (sphere_pdf, for a surface) or lights (hittable_pdf of the lights list)
-    const bool toward_lights = strategy == sampling_strategy::lights;
-    direction = toward_lights ? lights_random(scene.lights, rec.p, rng) : random_unit_vector<Real>(rng);
-    // The material's own density of that direction: the cosine density for a surface, 1/(4π) for a particle
+    // uniform (sphere_pdf, for a surface), lights (hittable_pdf of the lights list) or the mixture (mixture_pdf of the
+    // two, for a surface: half toward the lamps, half as the material scatters). Under the mixture one number picks
+    // the half that draws, the lamps' below 0.5 (mixture_pdf::generate), and the conditional operator evaluates only
+    // the chosen side, so its numbers come after the choice, as on the CPU.
+    bool toward_lights = strategy == sampling_strategy::lights;
+    if (strategy == sampling_strategy::mixture)
+    {
+        toward_lights = random_real<Real>(rng) < Real(0.5);
+    }
+    direction = toward_lights                            ? lights_random(scene.lights, rec.p, rng)
+                : strategy == sampling_strategy::uniform ? random_unit_vector<Real>(rng)
+                                                         : around(rec.normal, random_cosine_direction<Real>(rng));
+    // The material's own density of that direction: the cosine density for a surface, 1/(4π) for a particle (which
+    // gets here only under lights). Under the mixture it is also the material half's density: the same function of the
+    // same numbers.
     const Real p_scatter = matte ? cosine_density(rec.normal, direction) : uniform_sphere_density<Real>;
-    const Real p = toward_lights ? lights_pdf_value(scene.lights, rec.p, direction, from) : uniform_sphere_density<Real>;
+    Real p = uniform_sphere_density<Real>; // uniform
+    if (strategy != sampling_strategy::uniform)
+    {
+        const Real p_lights = lights_pdf_value(scene.lights, rec.p, direction, from);
+        // The mixture's density is the average of both halves', whichever drew: either could have drawn this direction
+        p = strategy == sampling_strategy::lights ? p_lights : Real(0.5) * p_lights + Real(0.5) * p_scatter;
+    }
     // !(x > 0) also catches a NaN, where x <= 0 would let it through. Under uniform this drops the half of the
     // directions below the surface, which the CPU doesn't trace either.
     if (!(p > Real(0)) || !(p_scatter > Real(0)))
     {
         return bounce::none;
     }
-    weight = p_scatter / p; // uniform: 4 cos θ
+    weight = p_scatter / p; // uniform: 4 cos θ; the mixture: at most 2
     return bounce::weighted;
 }
 
 // Traces the path's next ray in the kernel for all three books: one level of the CPU's ray_color, with the features of
-// the books so far. Returns true when the sample is complete, with its color in `sample`; otherwise the path now holds
+// all three books. Returns true when the sample is complete, with its color in `sample`; otherwise the path now holds
 // the ray to trace next.
 template <real_number Real>
 __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const camera<Real>& cam, pcg32& rng,

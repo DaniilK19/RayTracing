@@ -35,8 +35,8 @@ struct material_texture
     bool needs_uv;          // its texture reads the texture coordinates (an image, also inside a checker): only then
                             // does the hit compute them
     bool needs_exact_point; // its texture is a checker, whose colors jump across the faces of its cubes: on a sphere
-                            // it reads the hit point moved exactly onto the surface (onto_sphere in sphere.cuh), on
-                            // a quad the point computed as the CPU computes it (see surface_at in camera.cuh)
+                            // it reads the hit point moved exactly onto the surface (onto_sphere in sphere.cuh). (A
+                            // quad's points are all computed as the CPU computes them: see surface_at in camera.cuh.)
 };
 
 // Where a ray hit, as the materials need it (the CPU's hit_record without the texture coordinates)

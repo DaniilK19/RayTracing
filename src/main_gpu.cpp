@@ -1,4 +1,4 @@
-// RayTracingGPU: RayTracing's scenes rendered on an NVIDIA graphics card with CUDA (so far those in supported_scenes).
+// RayTracingGPU: RayTracing's scenes rendered on an NVIDIA graphics card with CUDA.
 // The scene comes from the CPU ray tracer's own modules: the same objects and the same camera as in RayTracing.
 // This program translates them into the plain data of the GPU renderer's interface (gpu/renderer.h), and saves the
 // image with the CPU's image class. So the two programs differ only in how they render, and the CPU stays the
@@ -28,20 +28,10 @@ import vec3;
 
 // --- The command line ------------------------------------------------------------------------------------------
 
-// The scenes of RayTracing that the GPU can render so far: all of them, those lit by lamps not yet with their default
-// strategy, the mixture (see unsupported_sampling), and with -p lights only where their lights lists hold nothing but
-// quads: not light, with its sphere lamp, nor glass, with its glass ball (see add_light).
-// In the end to_gpu decides: any scene it can translate renders, listed here or not. (earth renders without its
-// texture's file too, as the plain cyan sphere that the CPU renders then.)
-// std::to_array (C++20) counts the names itself, so the array's size can't disagree with the list.
-constexpr auto supported_scenes = std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker",
-                                                                    "earth", "perlin", "quads", "light", "cornell",
-                                                                    "smoke", "final", "aluminum", "glass"});
 constexpr std::string_view default_gpu_scene = "weekend";
 
-// The options are RayTracing's (-p takes all of its names, though the GPU doesn't sample with the mixture yet), plus
-// two of the GPU's own: --fp64 and --all-books-kernel. std::optional tells "not given: take it from the
-// scene" apart from any given value.
+// The options are RayTracing's, plus two of the GPU's own: --fp64 and --all-books-kernel. std::optional tells "not
+// given: take it from the scene" apart from any given value.
 struct options
 {
     std::string_view scene = default_gpu_scene;
@@ -58,12 +48,11 @@ struct options
 void print_usage()
 {
     std::println("Usage: RayTracingGPU [scene] [options]\n\n"
-                 "Renders RayTracing's scenes on an NVIDIA graphics card with CUDA. So far it can render\n"
-                 "these scenes (those lit by lamps with -p material or -p uniform, and with -p lights\n"
-                 "where their lights lists hold only quads: all but light and glass):");
-    for (const std::string_view name : supported_scenes)
+                 "Renders RayTracing's scenes on an NVIDIA graphics card with CUDA.\n\n"
+                 "Scenes:");
+    for (const scene_entry& entry : scene_list)
     {
-        std::println("  {:10} {}", name, find_scene(name)->description);
+        std::println("  {:10} {}", entry.name, entry.description);
     }
     std::println(R"(  Default: {}.
 
@@ -73,10 +62,8 @@ Options:
   -s, --samples N      rays per pixel: fewer is faster but noisier
                        (each scene has its own default); rounded to the nearest square k²,
                        because the rays form a k×k grid in the pixel
-  -p, --sampling NAME  how a diffuse bounce chooses the next direction, as in RayTracing:
-                       uniform, material (as the surface scatters) or lights (toward the
-                       lamps) so far; not yet mixture, the default in a scene lit by lamps,
-                       which must therefore be given one of the others
+  -p, --sampling NAME  how a diffuse bounce chooses the next direction ("p" as in pdf,
+                       probability density function): one of the strategies below
       --fp64           compute in 64-bit doubles like the CPU instead of 32-bit floats:
                        a check of the floats, many times slower on a GeForce card
       --all-books-kernel
@@ -87,8 +74,16 @@ Options:
   -o, --output FILE    where to save the image (default <scene>-gpu.png): a .png, or a .pfm that
                        keeps the linear values as floats, before gamma correction and clamping;
                        give it several times to save several files: -o out.png -o out.pfm
-  -h, --help           show this help)",
+  -h, --help           show this help
+
+Sampling (-p):)",
                  default_gpu_scene, std::numeric_limits<std::uint32_t>::max());
+    for (const sampling_entry& entry : sampling_list)
+    {
+        // camera_settings{} holds the camera's defaults
+        const bool is_default = entry.strategy == camera_settings{}.sampling;
+        std::println("  {:10} {}{}", entry.name, entry.description, is_default ? " (default)" : "");
+    }
 }
 
 std::expected<options, std::string> parse_options(std::span<char* const> args)
@@ -113,8 +108,7 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             continue;
         }
 
-        // An argument without a dash is the scene name: any of RayTracing's scenes, for a clear message if the GPU
-        // can't render it yet
+        // An argument without a dash is the scene name: any of RayTracing's scenes
         if (!arg.starts_with('-'))
         {
             if (!find_scene(arg))
@@ -152,7 +146,7 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         }
         if (is_sampling)
         {
-            // Any of RayTracing's names, for a clear message if the GPU can't sample that way yet
+            // Any of RayTracing's strategy names
             const auto it = std::ranges::find(sampling_list, value, &sampling_entry::name);
             if (it == sampling_list.end())
             {
@@ -322,7 +316,7 @@ std::expected<void, std::string> for_each_shape(const hittable& object, const pl
     return on_shape(object, where);
 }
 
-// Translates the CPU's scene into the GPU renderer's tables (renderer.h), or says why the GPU can't render it yet. It
+// Translates the CPU's scene into the GPU renderer's tables (renderer.h), or says why the GPU can't render it. It
 // reads the CPU's objects where they are, through dynamic_cast and their accessors, and changes nothing.
 class scene_translator
 {
@@ -630,9 +624,18 @@ std::expected<void, std::string> add_light(const hittable& object, const placeme
                           .weight = weight});
         return {};
     }
-    if (dynamic_cast<const sphere*>(&object))
+    if (const auto* ball = dynamic_cast<const sphere*>(&object))
     {
-        return std::unexpected("it has a sphere, and the GPU aims only at quads so far");
+        if (!(ball->radius() > 0))
+        {
+            return std::unexpected("it holds a sphere without size");
+        }
+        // sphere::pdf_value and random aim at the center at time 0, a moving sphere's too
+        lights.push_back({.kind = gpu::light_shape::sphere,
+                          .center = to_gpu(where.place(ball->center_at(0))),
+                          .radius = ball->radius(),
+                          .weight = weight});
+        return {};
     }
     // A BVH or a volume of smoke keeps hittable's pdf_value and random, which describe no density
     return std::unexpected("it holds an object the GPU can't aim at: only spheres and quads, also in lists, translate "
@@ -654,7 +657,7 @@ std::expected<std::vector<gpu::light_desc>, std::string> lights_to_gpu(const hit
 // The whole scene, or why the GPU can't render it. The GPU renders spheres, standing still or moving, and quads, also
 // in lists, BVHs, translate and rotate_y, with matte surfaces of solid, checker, image or marble textures, metal, glass
 // and lamps, and volumes of smoke or fog: every scene of the books. sampling is the strategy the CPU would render with
-// (effective_sampling); see unsupported_sampling for the ones the GPU has.
+// (effective_sampling).
 std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame,
                                                    sampling_strategy sampling)
 {
@@ -664,18 +667,6 @@ std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_
         return std::unexpected(added.error());
     }
     return std::move(translator).finish();
-}
-
-// Why the GPU can't sample diffuse bounces with this strategy yet, or nothing if it can: so far uniformly, as the
-// material scatters, and toward the lamps
-std::optional<std::string> unsupported_sampling(sampling_strategy sampling)
-{
-    if (sampling == sampling_strategy::mixture)
-    {
-        return "the GPU can't aim half of the bounces at the lamps (-p mixture, the default in a scene with lamps) "
-               "yet: add -p material, -p uniform or -p lights";
-    }
-    return std::nullopt;
 }
 
 // --- Rendering -------------------------------------------------------------------------------------------------
@@ -718,10 +709,7 @@ int main(int argc, char* argv[])
     auto gpu_scene = to_gpu(s, frame, sampling);
     if (!gpu_scene)
     {
-        // C++23 formats ranges: n drops the brackets, and the empty format after the colon prints the names
-        // without quotes
-        std::println("Error: the GPU can't render '{}' yet: {}. So far it renders: {:n:}.", opts->scene,
-                     gpu_scene.error(), supported_scenes);
+        std::println("Error: the GPU can't render '{}': {}.", opts->scene, gpu_scene.error());
         return 1;
     }
     // The lights list, for the strategies that aim at it
@@ -730,18 +718,11 @@ int main(int argc, char* argv[])
         auto lights = lights_to_gpu(s.lights);
         if (!lights)
         {
-            std::println("Error: the GPU can't aim at the lights list of '{}' yet: {}. Try -p material or -p uniform.",
+            std::println("Error: the GPU can't aim at the lights list of '{}': {}. Try -p material or -p uniform.",
                          opts->scene, lights.error());
             return 1;
         }
         gpu_scene->lights = std::move(*lights);
-    }
-    // Checked after the scene and its lights list, so that "add -p material" is said only where it makes the scene
-    // render
-    if (const auto why = unsupported_sampling(sampling))
-    {
-        std::println("Error: {}", *why);
-        return 1;
     }
 
     // Every sampling_strategy has an entry in sampling_list (see camera.ixx), so find will find it

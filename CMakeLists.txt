@@ -104,8 +104,8 @@ target_link_libraries(ImageCompare PRIVATE raytracer)
 target_compile_options(ImageCompare PRIVATE /W4)
 
 # --- GPU program (optional) --------------------------------------------------
-# RayTracingGPU renders RayTracing's scenes on an NVIDIA graphics card (so far those whose features its renderer has,
-# see main_gpu.cpp). It needs the CUDA Toolkit (nvcc and the CUDA libraries); without it, everything else builds as
+# RayTracingGPU renders RayTracing's scenes on an NVIDIA graphics card (see main_gpu.cpp). It needs the CUDA Toolkit
+# (nvcc and the CUDA libraries); without it, everything else builds as
 # before. CMake looks for nvcc in the folder named by the
 # CUDA_PATH environment variable and on the PATH, both set by the toolkit's installer: a program started before the
 # installation, such as Visual Studio or a terminal, keeps its old environment until it is restarted.

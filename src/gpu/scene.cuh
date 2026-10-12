@@ -28,7 +28,7 @@ struct scene_view
     const material<Real>* materials;
     const material_texture* material_textures; // read by the kernel for all three books only, by material index
     texture_view<Real> textures;
-    lights_view<Real> lights; // what the lights strategy aims at
+    lights_view<Real> lights; // what the lights and mixture strategies aim at
 };
 
 // The scene as the first book's kernel sees it: Step 46's arrays and nothing else, in a struct that never grows.

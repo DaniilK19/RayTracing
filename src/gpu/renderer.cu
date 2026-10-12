@@ -719,22 +719,20 @@ void validate(const scene_desc& scene)
             throw std::runtime_error("unknown material kind");
         }
     }
-    // The strategies so far: uniform, material and lights. The lights strategy needs a shape to aim at (the CPU's
-    // effective_sampling falls back to material without one), with a chance of being aimed at and an area.
-    if (camera.sampling == sampling_strategy::mixture)
+    // The lights and mixture strategies need a shape to aim at (the CPU's effective_sampling falls back to material
+    // without one), each with a chance of being aimed at and a size
+    if ((camera.sampling == sampling_strategy::lights || camera.sampling == sampling_strategy::mixture) &&
+        scene.lights.empty())
     {
-        throw std::runtime_error("the GPU renderer doesn't sample diffuse bounces with the mixture yet");
-    }
-    if (camera.sampling == sampling_strategy::lights && scene.lights.empty())
-    {
-        throw std::runtime_error("the lights strategy needs a lights list that isn't empty");
+        throw std::runtime_error("the lights and mixture strategies need a lights list that isn't empty");
     }
     for (const light_desc& l : scene.lights)
     {
         const vec3d n = cross(l.quad.u, l.quad.v);
-        if (!(l.weight > 0 && l.weight <= 1) || !(dot(n, n) > 0))
+        const bool has_size = l.kind == light_shape::quad ? dot(n, n) > 0 : l.radius > 0;
+        if (!(l.weight > 0 && l.weight <= 1) || !has_size)
         {
-            throw std::runtime_error("a light must have a weight in (0, 1] and an area");
+            throw std::runtime_error("a light must have a weight in (0, 1] and a size");
         }
     }
     for (const sphere_desc& s : scene.spheres)
@@ -842,41 +840,70 @@ media_on_device<Real> to_media(const scene_desc& scene)
     return result;
 }
 
-// The lights list in Real (see light in lights.cuh), for the lights strategy: each quad made as the BVH's quads are,
-// its area and the running sums of the weights computed in double and rounded once, and its twin, the global id of the
-// world's quad with exactly the same numbers, if there is one. A lights-list copy is built by the same function as the
-// lamp in the world (see scene in scenes.ixx) and baked through the same instances, so the numbers agree bit for bit.
+// The global id of the world's primitive with exactly the numbers of a light, its twin, or -1 if it has none: a quad
+// with the same corner and sides, or a sphere that stands still with the same center and radius (a moving one has no
+// twin: the light aims at time 0, where the bounce's point isn't). A lights-list copy is built by the same function as
+// the object in the world (see scene in scenes.ixx) and baked through the same instances, so the numbers agree bit for
+// bit.
 template <real_number Real>
-std::vector<light<Real>> to_lights(const scene_desc& scene, const bvh<Real>& tree)
+int twin_of(const light_desc& desc, const scene_desc& scene, const bvh<Real>& tree)
 {
-    std::vector<light<Real>> lights;
-    if (scene.camera.sampling != sampling_strategy::lights)
+    if (desc.kind == light_shape::quad)
     {
-        return lights; // only the lights strategy aims at them
-    }
-    double cdf = 0;
-    for (const light_desc& desc : scene.lights)
-    {
-        cdf += desc.weight;
-        int twin = -1;
         for (std::size_t i = 0; i < scene.quads.size(); ++i)
         {
             const quad_desc& q = scene.quads[i];
             if (q.q == desc.quad.q && q.u == desc.quad.u && q.v == desc.quad.v)
             {
-                twin = tree.quad_ids[i];
-                break;
+                return tree.quad_ids[i];
             }
         }
-        const vec3d n = cross(desc.quad.u, desc.quad.v);
-        lights.push_back({.shape = make_quad<Real>(desc.quad),
-                          .u = to_real<Real>(desc.quad.u),
-                          .area = static_cast<Real>(std::sqrt(dot(n, n))), // the CPU's n.length()
-                          .v = to_real<Real>(desc.quad.v),
-                          .cdf = static_cast<Real>(cdf),
-                          .weight = static_cast<Real>(desc.weight),
-                          .twin = twin,
-                          .unused = {}});
+        return -1;
+    }
+    for (std::size_t i = 0; i < scene.spheres.size(); ++i)
+    {
+        const sphere_desc& s = scene.spheres[i];
+        if (!moves(s) && s.center == desc.center && s.radius == desc.radius)
+        {
+            return tree.sphere_ids[i];
+        }
+    }
+    return -1;
+}
+
+// The lights list in Real (see light in lights.cuh), for the strategies that aim at it: each quad made as the BVH's
+// quads are, its area and the running sums of the weights computed in double and rounded once, and each light's twin
+template <real_number Real>
+std::vector<light<Real>> to_lights(const scene_desc& scene, const bvh<Real>& tree)
+{
+    std::vector<light<Real>> lights;
+    if (scene.camera.sampling != sampling_strategy::lights && scene.camera.sampling != sampling_strategy::mixture)
+    {
+        return lights; // the other strategies don't aim at them
+    }
+    double cdf = 0;
+    for (const light_desc& desc : scene.lights)
+    {
+        cdf += desc.weight;
+        light<Real> l{};
+        if (desc.kind == light_shape::quad)
+        {
+            const vec3d n = cross(desc.quad.u, desc.quad.v);
+            l.quad = make_quad<Real>(desc.quad);
+            l.u = to_real<Real>(desc.quad.u);
+            l.area = static_cast<Real>(std::sqrt(dot(n, n))); // the CPU's n.length()
+            l.v = to_real<Real>(desc.quad.v);
+        }
+        else
+        {
+            l.center = to_real<Real>(desc.center);
+            l.radius = static_cast<Real>(desc.radius);
+        }
+        l.cdf = static_cast<Real>(cdf);
+        l.weight = static_cast<Real>(desc.weight);
+        l.kind = desc.kind;
+        l.twin = twin_of(desc, scene, tree);
+        lights.push_back(l);
     }
     return lights;
 }

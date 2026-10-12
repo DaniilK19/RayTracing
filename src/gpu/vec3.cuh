@@ -202,7 +202,8 @@ struct ray
 
     // The same point computed as the CPU computes it: the product t·direction rounded, then the sum. In at(), nvcc may
     // fuse the two into one fma, rounded once: more accurate, but not the same number, and where a point's last bit
-    // decides a color (see surface_at in camera.cuh), the GPU takes the CPU's.
+    // decides something, such as which side of a quad's plane it lies on (see surface_at in camera.cuh), the GPU takes
+    // the CPU's.
     __device__ point3<Real> at_unfused(Real t) const
     {
         return {add_rn(origin.x, mul_rn(t, direction.x)), add_rn(origin.y, mul_rn(t, direction.y)),
