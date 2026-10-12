@@ -507,12 +507,22 @@ __device__ Real box_entry(const point3<Real>& box_min, const point3<Real>& box_m
     return enter <= exit ? enter : infinity<Real>;
 }
 
-// The same for a node's box
+// The same for a node's box, written out again. When it passed the node's corners on to the function above, nvcc read
+// the box of one of the two children with six 4-byte loads instead of two 16-byte loads in float, in the loop that
+// visits the nodes, and the weekend scene rendered 5% slower in float than in Step 46.
 template <real_number Real>
 __device__ Real box_entry(const bvh_node<Real>& node, const vec3<Real>& inverse_direction,
                           const vec3<Real>& origin_scaled, Real t_min, Real t_max)
 {
-    return box_entry(node.box_min, node.box_max, inverse_direction, origin_scaled, t_min, t_max);
+    const Real x0 = node.box_min.x * inverse_direction.x - origin_scaled.x;
+    const Real x1 = node.box_max.x * inverse_direction.x - origin_scaled.x;
+    const Real y0 = node.box_min.y * inverse_direction.y - origin_scaled.y;
+    const Real y1 = node.box_max.y * inverse_direction.y - origin_scaled.y;
+    const Real z0 = node.box_min.z * inverse_direction.z - origin_scaled.z;
+    const Real z1 = node.box_max.z * inverse_direction.z - origin_scaled.z;
+    const Real enter = fmax(fmax(fmin(x0, x1), fmin(y0, y1)), fmax(fmin(z0, z1), t_min));
+    const Real exit = fmin(fmin(fmax(x0, x1), fmax(y0, y1)), fmin(fmax(z0, z1), t_max));
+    return enter <= exit ? enter : infinity<Real>;
 }
 
 // What closest_hit found: the primitive's global id (-1: none), the distance to it, and whether the ray hits the front

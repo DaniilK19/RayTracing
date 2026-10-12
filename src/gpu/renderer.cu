@@ -405,6 +405,17 @@ __global__ void __launch_bounds__(block_width * block_height)
     render_pixel<Real, kernel_kind::first_book>(cam, scene, seed, work, sums, ray_count);
 }
 
+// __launch_bounds__ gives the block size alone. Its optional second number, the blocks a multiprocessor should hold at
+// once, makes the compiler fit the kernel into fewer registers and keep the rest in memory. Measured on the float
+// kernel for all three books (95 registers; the double kernel, 164, is a check mode and isn't capped): final, cornell,
+// perlin and smoke at 960 pixels wide with 4096 rays per pixel, medians of 5 runs on the test GPU. 6 blocks (at most 80
+// registers) were as fast on average, perlin 6% faster and final 3.5% slower. 7 blocks (72), timed at 480 wide with
+// 1024 rays per pixel, were 7% slower on average (final, cornell and smoke 11-12% slower, perlin 6% faster). Two ways
+// to take registers from the marble's noise didn't lower the count: a call to turbulence instead of its inlined body
+// (96 registers, 1% slower on average, perlin 6% faster and cornell 5% slower), and perlin_noise's outer loop, over di,
+// kept rolled with #pragma unroll 1 (96, 4% slower, at 480 wide with 1024 rays per pixel). Nor did reading a quad's
+// record field by field as hit_quad needs it, instead of the whole record first (2% slower). So the kernel takes the
+// registers the compiler chooses.
 template <real_number Real>
 __global__ void __launch_bounds__(block_width * block_height)
     all_books_kernel(const camera<Real> cam, const scene_view<Real> scene, const std::uint64_t seed,
