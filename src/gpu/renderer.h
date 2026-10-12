@@ -15,6 +15,7 @@
 // the std module in one file, but not after it.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -38,6 +39,7 @@ enum class texture_kind
     solid,   // solid_color: one color everywhere
     checker, // checker_texture: the cubes of space alternate between two other textures
     image,   // image_texture: a picture wrapped around the surface by its texture coordinates (u, v)
+    noise,   // noise_texture: marble made of Perlin noise
 };
 
 // A texture: its kind and the numbers of that kind (the other fields keep their defaults). Textures refer to each
@@ -51,6 +53,8 @@ struct texture_desc
     int even = -1;        // checker: the texture of the cubes whose x + y + z is even, an index into textures
     int odd = -1;         // checker: the texture of the other cubes
     int image = -1;       // image: an index into scene_desc::images
+    double scale = 1;     // noise: the frequency of the marble's stripes along z (noise_texture::scale)
+    int perlin = -1;      // noise: an index into scene_desc::perlins, the tables of its noise
 };
 
 // The pixels of an image texture as the CPU's image holds them: linear colors, rows from the top. They are the floats
@@ -60,6 +64,21 @@ struct image_desc
     int width = 0;
     int height = 0;
     std::vector<float> rgb; // width × height × 3: pixel (x, y) starts at 3·(y·width + x)
+};
+
+// The size of a perlin object's tables (perlin::point_count; main_gpu.cpp checks that the two agree)
+inline constexpr int perlin_point_count = 256;
+
+// The tables of one perlin object, which its constructor drew from the CPU's random numbers while the scene was built
+// (see perlin.ixx): 256 random unit gradients, and three permutations of 0..255 that pick one of them for every point
+// (i, j, k) of the lattice: random_vectors[perm_x[i & 255] ^ perm_y[j & 255] ^ perm_z[k & 255]]. Every noise_texture
+// has its own.
+struct perlin_desc
+{
+    std::array<vec3d, perlin_point_count> random_vectors{};
+    std::array<int, perlin_point_count> perm_x{};
+    std::array<int, perlin_point_count> perm_y{};
+    std::array<int, perlin_point_count> perm_z{};
 };
 
 // --- Materials (material.ixx) ---------------------------------------------------------------------------------------
@@ -128,6 +147,7 @@ struct scene_desc
     camera_desc camera;
     std::vector<texture_desc> textures;
     std::vector<image_desc> images;
+    std::vector<perlin_desc> perlins;
 };
 
 // The number type the GPU computes with. A GeForce card does arithmetic on 32-bit floats about
@@ -159,7 +179,9 @@ struct kernel_info
 {
     std::string name;                       // "first book" or "all books"
     int registers = 0;                      // per thread
-    int local_bytes = 0;                    // per thread: the BVH stack, and registers spilled to memory, if any
+    // per thread: the BVH stack, the scratch arrays of CUDA's math functions (sin's reduction of huge arguments takes
+    // 48 bytes in double), and registers spilled to memory, if any
+    int local_bytes = 0;
     int blocks_per_multiprocessor = 0;      // as many as fit at once
     int threads_per_block = 0;              // 128
     int max_threads_per_multiprocessor = 0; // 1536 on the test GPU

@@ -102,8 +102,8 @@ struct camera
 // Returns true when the sample is complete, with its color in `sample`; otherwise the path now holds the ray to trace
 // next.
 template <real_number Real>
-__device__ bool trace_first_book_ray(path<Real>& p, const scene_view<Real>& scene, const camera<Real>& cam, pcg32& rng,
-                                     color<Real>& sample)
+__device__ bool trace_first_book_ray(path<Real>& p, const first_book_scene<Real>& scene, const camera<Real>& cam,
+                                     pcg32& rng, color<Real>& sample)
 {
     const bvh_hit<Real> hit = closest_hit<Real, kernel_kind::first_book>(scene.tree, p.r, p.from, p.inward);
     if (hit.index < 0)
@@ -256,8 +256,8 @@ __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const ca
 // that stands still never reads it: drawing it anyway would shift every random number after it, and the first book's
 // scenes would get other noise than in Step 46 (the same picture, no longer the same bytes).
 template <real_number Real, kernel_kind Kind>
-__device__ path<Real> start_sample(const camera<Real>& cam, const scene_view<Real>& scene, int i, int j, int pass,
-                                   pcg32& rng)
+__device__ path<Real> start_sample(const camera<Real>& cam, const kernel_scene<Real, Kind>& scene, int i, int j,
+                                   int pass, pcg32& rng)
 {
     path<Real> p = cam.start_path(i, j, pass, rng);
     if constexpr (Kind == kernel_kind::all_books)
@@ -272,7 +272,7 @@ __device__ path<Real> start_sample(const camera<Real>& cam, const scene_view<Rea
 
 // One ray of the path, as the kernel's kind traces it
 template <real_number Real, kernel_kind Kind>
-__device__ bool trace(path<Real>& p, const scene_view<Real>& scene, const camera<Real>& cam, pcg32& rng,
+__device__ bool trace(path<Real>& p, const kernel_scene<Real, Kind>& scene, const camera<Real>& cam, pcg32& rng,
                       color<Real>& sample)
 {
     if constexpr (Kind == kernel_kind::first_book)

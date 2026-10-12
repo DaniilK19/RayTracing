@@ -18,6 +18,7 @@ import hittable;
 import image;
 import instance;
 import material;
+import perlin;
 import quad;
 import scenes;
 import sphere;
@@ -27,12 +28,12 @@ import vec3;
 // --- The command line ------------------------------------------------------------------------------------------
 
 // The scenes of RayTracing that the GPU can render so far. The others need features of the second and third books
-// that the GPU doesn't have yet (marble textures, quads, smoke, lamps...), and to_gpu below says which one is missing.
+// that the GPU doesn't have yet (quads, smoke, lamps...), and to_gpu below says which one is missing.
 // In the end to_gpu decides: any scene it can translate renders, listed here or not. (earth renders without its
 // texture's file too, as the plain cyan sphere that the CPU renders then.)
 // std::to_array (C++20) counts the names itself, so the array's size can't disagree with the list.
 constexpr auto supported_scenes =
-    std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker", "earth"});
+    std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker", "earth", "perlin"});
 constexpr std::string_view default_gpu_scene = "weekend";
 
 // The options are RayTracing's without -p (the GPU samples as the material scatters, as the CPU does in a scene lit
@@ -367,13 +368,28 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
         desc = {.kind = gpu::texture_kind::image, .image = static_cast<int>(desc_.images.size())};
         desc_.images.push_back(std::move(pixels));
     }
-    else if (dynamic_cast<const noise_texture*>(&tex))
+    else if (const auto* marble = dynamic_cast<const noise_texture*>(&tex))
     {
-        return std::unexpected("it has a marble (noise) texture");
+        // The tables of this texture's own perlin object, drawn while the scene was built: copied, never drawn again
+        static_assert(perlin::point_count == gpu::perlin_point_count);
+        const perlin& noise = marble->noise();
+        gpu::perlin_desc tables;
+        for (std::size_t i = 0; i < tables.random_vectors.size(); ++i)
+        {
+            tables.random_vectors[i] = to_gpu(noise.random_vectors()[i]);
+            tables.perm_x[i] = noise.perm_x()[i];
+            tables.perm_y[i] = noise.perm_y()[i];
+            tables.perm_z[i] = noise.perm_z()[i];
+        }
+        desc = {.kind = gpu::texture_kind::noise,
+                .scale = marble->scale(),
+                .perlin = static_cast<int>(desc_.perlins.size())};
+        desc_.perlins.push_back(tables);
     }
     else
     {
-        return std::unexpected("it has a texture other than solid_color, checker_texture and image_texture");
+        return std::unexpected(
+            "it has a texture other than solid_color, checker_texture, image_texture and noise_texture");
     }
     const auto index = static_cast<int>(desc_.textures.size());
     desc_.textures.push_back(desc);
@@ -382,7 +398,7 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
 }
 
 // The whole scene, or why the GPU can't render it yet. So far the GPU renders spheres, standing still or moving, with
-// matte surfaces of solid, checker or image textures, metal and glass, lit by the sky.
+// matte surfaces of solid, checker, image or marble textures, metal and glass, lit by the sky.
 std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame)
 {
     if (!s.lights.empty())

@@ -113,6 +113,10 @@ public:
         return color{0.5, 0.5, 0.5} * (1 + std::sin(scale_ * p.z + 10 * noise_.turbulence(p, 7)));
     }
 
+    // For code that copies a scene into its own format: the GPU program
+    inline double scale() const { return scale_; }
+    inline const perlin& noise() const { return noise_; }
+
 private:
     perlin noise_;
     double scale_;

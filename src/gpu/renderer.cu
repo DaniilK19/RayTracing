@@ -310,8 +310,9 @@ __device__ unsigned long long warp_sum(unsigned long long value)
 // __forceinline__ makes sure the compiler copies this function into each kernel rather than calling it: a call would
 // pass the scene and the camera through memory.
 template <real_number Real, kernel_kind Kind>
-__device__ __forceinline__ void render_pixel(const camera<Real>& cam, const scene_view<Real>& scene, std::uint64_t seed,
-                                             const launch_work& work, double* sums, unsigned long long* ray_count)
+__device__ __forceinline__ void render_pixel(const camera<Real>& cam, const kernel_scene<Real, Kind>& scene,
+                                             std::uint64_t seed, const launch_work& work, double* sums,
+                                             unsigned long long* ray_count)
 {
     // This thread's pixel: blockIdx is the block's position in the grid, blockDim the block's size and threadIdx the
     // thread's position in its block. The grid covers the launch's rows.
@@ -375,11 +376,11 @@ __device__ __forceinline__ void render_pixel(const camera<Real>& cam, const scen
 // or not. And the more registers a thread takes, the fewer threads fit on a multiprocessor (see
 // blocks_per_multiprocessor). Each feature of the second and third books (textures, moving spheres, smoke, lamps...)
 // adds code to the kernel, and it may add registers that the first book's scenes would pay for without using them
-// (the solid and checker textures added none, moving spheres and image textures some: every render prints the
-// registers of the kernel it ran, in its Kernel: line). So the scenes that need nothing beyond the first book get a
-// kernel of their own, which traces Step 46's code (trace_first_book_ray), and every other scene gets the kernel for
-// all three books. Both run render_pixel, each with its own Kind, and `if constexpr` (see trace in camera.cuh) compiles
-// into each only its own code.
+// (the solid and checker textures added none, moving spheres and images a few, the marble's Perlin noise the most:
+// every render prints the registers of the kernel it ran, in its Kernel: line). So the scenes that need nothing beyond
+// the first book get a kernel of their own, which traces Step 46's code (trace_first_book_ray), and every other scene
+// gets the kernel for all three books. Both run render_pixel, each with its own Kind, and `if constexpr` (see trace in
+// camera.cuh) compiles into each only its own code.
 //
 // They also get the scene differently. The first book's kernel takes Step 46's parameters: each of its arrays is a
 // pointer marked __restrict__, a promise to the compiler that while the kernel runs, the memory it points to is reached
@@ -396,9 +397,9 @@ __global__ void __launch_bounds__(block_width * block_height)
                       const material<Real>* __restrict__ materials, const std::uint64_t seed, const launch_work work,
                       double* __restrict__ sums, unsigned long long* __restrict__ ray_count)
 {
-    const scene_view<Real> scene{.tree = {.nodes = nodes, .spheres = spheres, .node_count = node_count},
-                                 .primitive_materials = primitive_materials,
-                                 .materials = materials};
+    const first_book_scene<Real> scene{.tree = {.nodes = nodes, .spheres = spheres, .node_count = node_count},
+                                       .primitive_materials = primitive_materials,
+                                       .materials = materials};
     render_pixel<Real, kernel_kind::first_book>(cam, scene, seed, work, sums, ray_count);
 }
 
@@ -553,16 +554,44 @@ template <real_number Real>
 std::vector<texture<Real>> to_textures(const std::vector<texture_desc>& descs)
 {
     std::vector<texture<Real>> textures;
+    int noises = 0; // the marble textures so far: see to_noises
     for (const texture_desc& desc : descs)
     {
         textures.push_back({.kind = desc.kind,
                             .even = desc.even,
                             .odd = desc.odd,
-                            .table = desc.image,
+                            .table = desc.kind == texture_kind::noise ? noises++ : desc.image,
                             .rgb = to_real<Real>(desc.rgb),
                             .inv_scale = static_cast<Real>(desc.inv_scale)});
     }
     return textures;
+}
+
+// The marble textures' numbers (see noise_texture in texture.cuh), in the order of the textures that are marble: their
+// index in this array is what to_textures stores in a noise texture's table
+template <real_number Real>
+std::vector<noise_texture<Real>> to_noises(const scene_desc& scene)
+{
+    std::vector<noise_texture<Real>> noises;
+    for (const texture_desc& t : scene.textures)
+    {
+        if (t.kind != texture_kind::noise)
+        {
+            continue;
+        }
+        const perlin_desc& tables = scene.perlins[static_cast<std::size_t>(t.perlin)];
+        noise_texture<Real> marble{}; // value-initialized: the gradients' padding is zeros
+        for (std::size_t i = 0; i < tables.random_vectors.size(); ++i)
+        {
+            marble.perlin.random_vectors[i].g = to_real<Real>(tables.random_vectors[i]);
+            marble.perlin.perm_x[i] = static_cast<std::uint8_t>(tables.perm_x[i]);
+            marble.perlin.perm_y[i] = static_cast<std::uint8_t>(tables.perm_y[i]);
+            marble.perlin.perm_z[i] = static_cast<std::uint8_t>(tables.perm_z[i]);
+        }
+        marble.scale = static_cast<Real>(t.scale);
+        noises.push_back(marble);
+    }
+    return noises;
 }
 
 // The pixels of all images in one array, one after another, and where each image is in it
@@ -608,6 +637,17 @@ void validate(const scene_desc& scene)
     {
         throw std::runtime_error("the number of rays per pixel must be from 1 to 46340²");
     }
+    // The permutations are stored as bytes on the GPU (see perlin_table in perlin.cuh)
+    for (const perlin_desc& tables : scene.perlins)
+    {
+        for (const auto* perm : {&tables.perm_x, &tables.perm_y, &tables.perm_z})
+        {
+            if (std::ranges::any_of(*perm, [](int entry) { return entry < 0 || entry >= perlin_point_count; }))
+            {
+                throw std::runtime_error("a Perlin permutation has an entry outside 0..255");
+            }
+        }
+    }
     // The texels of all images are numbered with ints (see image_info)
     std::size_t texel_count = 0;
     for (const image_desc& image : scene.images)
@@ -640,6 +680,13 @@ void validate(const scene_desc& scene)
             if (t.image < 0 || t.image >= std::ssize(scene.images))
             {
                 throw std::runtime_error("an image texture refers to an image that doesn't exist");
+            }
+        }
+        else if (t.kind == texture_kind::noise)
+        {
+            if (t.perlin < 0 || t.perlin >= std::ssize(scene.perlins))
+            {
+                throw std::runtime_error("a marble texture refers to Perlin tables that don't exist");
             }
         }
         else if (t.kind != texture_kind::solid)
@@ -710,7 +757,10 @@ public:
                 .sphere_frames = sphere_frames_.data(),
                 .materials = materials_.data(),
                 .material_textures = material_textures_.data(),
-                .textures = {.textures = textures_.data(), .images = images_.data(), .texels = texels_.data()}};
+                .textures = {.textures = textures_.data(),
+                             .images = images_.data(),
+                             .texels = texels_.data(),
+                             .noises = noises_.data()}};
     }
 
 private:
@@ -727,6 +777,7 @@ private:
           textures_(to_textures<Real>(scene.textures)),
           images_(images.infos),
           texels_(images.texels),
+          noises_(to_noises<Real>(scene)),
           motion_(std::ranges::any_of(scene.spheres, moves))
     {
     }
@@ -748,6 +799,7 @@ private:
     device_array<texture<Real>> textures_;
     device_array<image_info> images_;
     device_array<texel> texels_;
+    device_array<noise_texture<Real>> noises_;
     bool motion_;
 };
 

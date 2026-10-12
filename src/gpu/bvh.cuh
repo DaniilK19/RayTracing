@@ -14,6 +14,7 @@
 #include <numeric>
 #include <span>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include "renderer.h"
@@ -347,7 +348,7 @@ bvh<Real> build_bvh(std::span<const sphere_desc> spheres, int max_leaf_size)
 
 // Device code (it runs on the GPU) from here on.
 
-// The tree as the kernels see it: where its arrays are in the GPU's memory
+// The tree as the kernel for all three books sees it: where its arrays are in the GPU's memory
 template <real_number Real>
 struct bvh_view
 {
@@ -357,6 +358,20 @@ struct bvh_view
     const moving_sphere<Real>* moving_spheres; // global ids from moving_base on
     int moving_base;
 };
+
+// The tree as the first book's kernel sees it: Step 46's arrays, in a struct that never grows (see first_book_scene in
+// scene.cuh for why)
+template <real_number Real>
+struct first_book_tree
+{
+    const bvh_node<Real>* nodes;
+    const sphere<Real>* spheres;
+    int node_count;
+};
+
+// The tree of each kind of kernel. std::conditional_t (C++14) picks one of two types by a compile-time condition.
+template <real_number Real, kernel_kind Kind>
+using kernel_tree = std::conditional_t<Kind == kernel_kind::first_book, first_book_tree<Real>, bvh_view<Real>>;
 
 // 1 / x for the slab test below, never infinite: an x closer to 0 than 2^-80 is moved out to ±2^-80 first, as in Aila
 // and Laine's GPU traversal kernels. A direction component can be exactly 0 (about one ray in 40 million in the weekend
@@ -436,7 +451,7 @@ struct bvh_hit
 // Kind is the kernel's: the first book's kernel tests its leaves exactly as Step 46 did, and the kernel for all three
 // books tests every kind of primitive.
 template <real_number Real, kernel_kind Kind>
-__device__ bvh_hit<Real> closest_hit(const bvh_view<Real>& tree, const ray<Real>& r, int from, bool inward)
+__device__ bvh_hit<Real> closest_hit(const kernel_tree<Real, Kind>& tree, const ray<Real>& r, int from, bool inward)
 {
     const Real t_min = Real(0.001);
     bvh_hit<Real> closest{.index = -1, .t = infinity<Real>, .entering = false};

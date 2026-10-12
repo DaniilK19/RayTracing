@@ -81,8 +81,14 @@ public:
         return std::fabs(accum);
     }
 
-private:
+    // The tables, for code that copies a scene into its own format: the GPU program
     static constexpr int point_count = 256;
+    inline const std::array<vec3, point_count>& random_vectors() const { return random_vectors_; }
+    inline const std::array<int, point_count>& perm_x() const { return perm_x_; }
+    inline const std::array<int, point_count>& perm_y() const { return perm_y_; }
+    inline const std::array<int, point_count>& perm_z() const { return perm_z_; }
+
+private:
     std::array<vec3, point_count> random_vectors_;
     std::array<int, point_count> perm_x_;
     std::array<int, point_count> perm_y_;

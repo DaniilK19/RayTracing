@@ -1,6 +1,7 @@
 // The GPU's textures (see texture.ixx): plain data and a loop instead of objects with virtual functions.
 #pragma once
 
+#include "perlin.cuh"
 #include "renderer.h"
 #include "vec3.cuh"
 
@@ -13,7 +14,7 @@ struct alignas(16) texture
     texture_kind kind;
     int even;        // checker: the texture of the even cubes, an index smaller than this texture's own
     int odd;         // checker: the texture of the odd cubes
-    int table;       // image: its index in texture_view::images
+    int table;       // image: its index in texture_view::images; noise: in texture_view::noises
     color<Real> rgb; // solid: the color. (Not named `color`: a member named like the type color<Real> used above it
                      // would change what the name means inside the struct, which C++ forbids.)
     Real inv_scale;  // checker: 1 / the side of its cubes, the number the CPU multiplies by
@@ -39,6 +40,15 @@ struct alignas(16) texel
     float unused;
 };
 
+// A marble texture's numbers (the CPU's noise_texture): the tables of its own perlin object, and the frequency of its
+// stripes
+template <real_number Real>
+struct noise_texture
+{
+    perlin_table<Real> perlin;
+    Real scale;
+};
+
 // The texture arrays as the kernel sees them
 template <real_number Real>
 struct texture_view
@@ -46,6 +56,7 @@ struct texture_view
     const texture<Real>* textures;
     const image_info* images;
     const texel* texels; // the pixels of all images, one after another
+    const noise_texture<Real>* noises;
 };
 
 // The texture's color at the hit (texture::value): (u, v) are the hit's texture coordinates, p the hit point in world
@@ -68,7 +79,9 @@ __device__ color<Real> texture_value(const texture_view<Real>& view, int index, 
         const int z = static_cast<int>(floor(t.inv_scale * p.z));
         t = view.textures[(x + y + z) % 2 == 0 ? t.even : t.odd];
     }
-    if (t.kind == texture_kind::image)
+    switch (t.kind)
+    {
+    case texture_kind::image:
     {
         // image_texture::value: u and v clamped to [0, 1], v flipped (rows go from the top), and the pixel they fall in
         const image_info image = view.images[t.table];
@@ -82,6 +95,18 @@ __device__ color<Real> texture_value(const texture_view<Real>& view, int index, 
         const texel pixel = view.texels[image.offset + j * image.width + i];
         return {static_cast<Real>(pixel.r), static_cast<Real>(pixel.g), static_cast<Real>(pixel.b)};
     }
-    return t.rgb; // solid
+    case texture_kind::noise:
+    {
+        // noise_texture::value: 0.5·(1 + sin(scale·p.z + 10·turbulence(p))) in every channel. The sine makes stripes
+        // along z, and the turbulence bends them into veins. The turbulence takes p itself: the scale multiplies only
+        // p.z. A reference, not a copy: the struct holds the whole table, 4.8 KB in float and 9 KB in double.
+        const noise_texture<Real>& marble = view.noises[t.table];
+        const Real gray =
+            Real(0.5) * (Real(1) + sin(marble.scale * p.z + Real(10) * turbulence(marble.perlin, p, 7)));
+        return {gray, gray, gray};
+    }
+    default:
+        return t.rgb; // solid
+    }
 }
 }
