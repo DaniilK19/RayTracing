@@ -28,8 +28,9 @@ import vec3;
 
 // --- The command line ------------------------------------------------------------------------------------------
 
-// The scenes of RayTracing that the GPU can render so far: all of them, those lit by lamps only with -p material so far
-// (see unsupported_sampling).
+// The scenes of RayTracing that the GPU can render so far: all of them, those lit by lamps not yet with their default
+// strategy, the mixture (see unsupported_sampling), and with -p lights only where their lights lists hold nothing but
+// quads: not light, with its sphere lamp, nor glass, with its glass ball (see add_light).
 // In the end to_gpu decides: any scene it can translate renders, listed here or not. (earth renders without its
 // texture's file too, as the plain cyan sphere that the CPU renders then.)
 // std::to_array (C++20) counts the names itself, so the array's size can't disagree with the list.
@@ -38,8 +39,8 @@ constexpr auto supported_scenes = std::to_array<std::string_view>({"materials", 
                                                                     "smoke", "final", "aluminum", "glass"});
 constexpr std::string_view default_gpu_scene = "weekend";
 
-// The options are RayTracing's (-p takes all of its names, though the GPU samples only as the material scatters so
-// far), plus two of the GPU's own: --fp64 and --all-books-kernel. std::optional tells "not given: take it from the
+// The options are RayTracing's (-p takes all of its names, though the GPU doesn't sample with the mixture yet), plus
+// two of the GPU's own: --fp64 and --all-books-kernel. std::optional tells "not given: take it from the
 // scene" apart from any given value.
 struct options
 {
@@ -58,7 +59,8 @@ void print_usage()
 {
     std::println("Usage: RayTracingGPU [scene] [options]\n\n"
                  "Renders RayTracing's scenes on an NVIDIA graphics card with CUDA. So far it can render\n"
-                 "these scenes (those lit by lamps only with -p material):");
+                 "these scenes (those lit by lamps with -p material or -p uniform, and with -p lights\n"
+                 "where their lights lists hold only quads: all but light and glass):");
     for (const std::string_view name : supported_scenes)
     {
         std::println("  {:10} {}", name, find_scene(name)->description);
@@ -72,8 +74,9 @@ Options:
                        (each scene has its own default); rounded to the nearest square k²,
                        because the rays form a k×k grid in the pixel
   -p, --sampling NAME  how a diffuse bounce chooses the next direction, as in RayTracing:
-                       so far only material (as the surface scatters), which a scene lit
-                       by lamps needs to be told: its default is mixture
+                       uniform, material (as the surface scatters) or lights (toward the
+                       lamps) so far; not yet mixture, the default in a scene lit by lamps,
+                       which must therefore be given one of the others
       --fp64           compute in 64-bit doubles like the CPU instead of 32-bit floats:
                        a check of the floats, many times slower on a GeForce card
       --all-books-kernel
@@ -580,6 +583,74 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
     return index;
 }
 
+// An object of the lights list and what it holds, with `weight`, the chance of aiming at it: hittable_list::random
+// picks each of a list's n objects with the chance 1/n, so a list inside the list shares its weight among its objects.
+// Instances are baked as in the world (see placement), which keeps every density: a rigid motion maps the solid angle
+// that a shape covers from a point onto the solid angle of the moved shape from the moved point (MonteCarlo's
+// light-pdfs checks this on the CPU).
+std::expected<void, std::string> add_light(const hittable& object, const placement& where, double weight,
+                                           std::vector<gpu::light_desc>& lights)
+{
+    if (const auto* list = dynamic_cast<const hittable_list*>(&object))
+    {
+        const auto children = list->objects();
+        if (children.empty())
+        {
+            // The CPU gives it the density 0 and the direction (1, 0, 0) (see hittable_list): nothing to imitate
+            return std::unexpected("it holds an empty list");
+        }
+        for (const std::unique_ptr<hittable>& child : children)
+        {
+            if (auto added = add_light(*child, where, weight / static_cast<double>(children.size()), lights); !added)
+            {
+                return added;
+            }
+        }
+        return {};
+    }
+    if (const auto* moved = dynamic_cast<const translate*>(&object))
+    {
+        return add_light(moved->object(), where.inside(*moved), weight, lights);
+    }
+    if (const auto* turned = dynamic_cast<const rotate_y*>(&object))
+    {
+        return add_light(turned->object(), where.inside(*turned), weight, lights);
+    }
+    if (const auto* face = dynamic_cast<const quad*>(&object))
+    {
+        if (!(cross(face->u(), face->v()).length_squared() > 0))
+        {
+            return std::unexpected("it holds a quad without area");
+        }
+        // The same numbers as add_shape gives the lamp in the world, built by the same function (see scene)
+        lights.push_back({.quad = {.q = to_gpu(where.place(face->q())),
+                                   .u = to_gpu(where.turn(face->u())),
+                                   .v = to_gpu(where.turn(face->v())),
+                                   .material = 0},
+                          .weight = weight});
+        return {};
+    }
+    if (dynamic_cast<const sphere*>(&object))
+    {
+        return std::unexpected("it has a sphere, and the GPU aims only at quads so far");
+    }
+    // A BVH or a volume of smoke keeps hittable's pdf_value and random, which describe no density
+    return std::unexpected("it holds an object the GPU can't aim at: only spheres and quads, also in lists, translate "
+                           "and rotate_y, have a density to aim with");
+}
+
+// The shapes of the lights list, each with its chance of being aimed at, or why the GPU can't aim at them. Only the
+// lights and mixture strategies need them: a scene whose list the GPU can't aim at still renders with the others.
+std::expected<std::vector<gpu::light_desc>, std::string> lights_to_gpu(const hittable_list& lights)
+{
+    std::vector<gpu::light_desc> result;
+    if (const auto added = add_light(lights, placement{}, 1.0, result); !added)
+    {
+        return std::unexpected(added.error());
+    }
+    return result;
+}
+
 // The whole scene, or why the GPU can't render it. The GPU renders spheres, standing still or moving, and quads, also
 // in lists, BVHs, translate and rotate_y, with matte surfaces of solid, checker, image or marble textures, metal, glass
 // and lamps, and volumes of smoke or fog: every scene of the books. sampling is the strategy the CPU would render with
@@ -595,21 +666,14 @@ std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_
     return std::move(translator).finish();
 }
 
-// Why the GPU can't sample diffuse bounces with this strategy yet, or nothing if it can: so far only as the material
-// scatters
+// Why the GPU can't sample diffuse bounces with this strategy yet, or nothing if it can: so far uniformly, as the
+// material scatters, and toward the lamps
 std::optional<std::string> unsupported_sampling(sampling_strategy sampling)
 {
-    switch (sampling)
+    if (sampling == sampling_strategy::mixture)
     {
-    case sampling_strategy::uniform:
-        return "the GPU can't sample uniformly (-p uniform) yet: try -p material";
-    case sampling_strategy::lights:
-        return "the GPU can't aim at the lamps (-p lights) yet: try -p material";
-    case sampling_strategy::mixture:
         return "the GPU can't aim half of the bounces at the lamps (-p mixture, the default in a scene with lamps) "
-               "yet: add -p material";
-    case sampling_strategy::material:
-        break;
+               "yet: add -p material, -p uniform or -p lights";
     }
     return std::nullopt;
 }
@@ -651,7 +715,7 @@ int main(int argc, char* argv[])
     const sampling_strategy requested = s.camera.sampling;
     const sampling_strategy sampling = effective_sampling(requested, s.lights);
 
-    const auto gpu_scene = to_gpu(s, frame, sampling);
+    auto gpu_scene = to_gpu(s, frame, sampling);
     if (!gpu_scene)
     {
         // C++23 formats ranges: n drops the brackets, and the empty format after the colon prints the names
@@ -660,7 +724,20 @@ int main(int argc, char* argv[])
                      gpu_scene.error(), supported_scenes);
         return 1;
     }
-    // Checked after the scene, so that "add -p material" is said only where it makes the scene render
+    // The lights list, for the strategies that aim at it
+    if (sampling == sampling_strategy::lights || sampling == sampling_strategy::mixture)
+    {
+        auto lights = lights_to_gpu(s.lights);
+        if (!lights)
+        {
+            std::println("Error: the GPU can't aim at the lights list of '{}' yet: {}. Try -p material or -p uniform.",
+                         opts->scene, lights.error());
+            return 1;
+        }
+        gpu_scene->lights = std::move(*lights);
+    }
+    // Checked after the scene and its lights list, so that "add -p material" is said only where it makes the scene
+    // render
     if (const auto why = unsupported_sampling(sampling))
     {
         std::println("Error: {}", *why);

@@ -93,6 +93,7 @@ struct bvh
     std::vector<sphere_frame<Real>> sphere_frames; // by global id, for the spheres of both kinds
     int moving_base = 0;                           // the global id of moving_spheres[0]: how many spheres stand still
     int quad_base = 0;                             // the global id of quads[0]: how many spheres there are
+    std::vector<int> quad_ids;                     // the global id of each quad of the input, by its index there
 };
 
 // Host code (it runs on the CPU, once, before the render) from here to build_bvh.
@@ -245,6 +246,7 @@ public:
     {
         tree_.primitive_materials.resize(inputs_.size());
         tree_.sphere_frames.resize(static_cast<std::size_t>(tree_.quad_base));
+        tree_.quad_ids.resize(quads_.size());
         std::vector<int> order(inputs_.size());
         std::iota(order.begin(), order.end(), 0); // 0, 1, 2, ...: indices into inputs_, sorted below
         if (!order.empty())
@@ -347,6 +349,7 @@ private:
             id = tree_.quad_base + static_cast<int>(tree_.quads.size());
             tree_.quads.push_back(quads_[static_cast<std::size_t>(in.index)]);
             tree_.primitive_materials[static_cast<std::size_t>(id)] = in.material;
+            tree_.quad_ids[static_cast<std::size_t>(in.index)] = id; // quads_ holds the input's quads in its order
             return; // a quad has no frame
         }
         tree_.primitive_materials[static_cast<std::size_t>(id)] = in.material;

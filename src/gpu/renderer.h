@@ -30,6 +30,9 @@ struct vec3d
     double x = 0;
     double y = 0;
     double z = 0;
+
+    // Equal in every coordinate. "= default" (C++20) has the compiler write the comparison, member by member.
+    bool operator==(const vec3d&) const = default;
 };
 
 // --- Textures (texture.ixx) -----------------------------------------------------------------------------------------
@@ -159,6 +162,21 @@ struct medium_desc
 // main_gpu.cpp asks it to explain a scene it can't render; renderer.cu's validate asks it again.
 bool is_convex(const std::vector<quad_desc>& quads);
 
+// --- What the lights strategy aims at: the scene's lights list (scene::lights) ---------------------------------------
+
+// A shape of the lights list: a quad, so far (main_gpu.cpp says so about a sphere). Lists inside the list, such as a
+// box's six faces, are flattened, and weight is the chance that hittable_list::random aims at this shape: 1/n in a list
+// of n, multiplied down nested lists. So the weights add up to 1, and the list's density is the sum of weight × each
+// shape's density (hittable_list::pdf_value). The shapes are the lights list's own copies (see scene in scenes.ixx),
+// with their instances baked like the world's, never looked up among the world's objects. (The renderer only notes
+// which quad of the world has exactly the same numbers, if one has: a bounce that leaves that quad treats its copy as
+// itself, see lights_pdf_value in lights.cuh.)
+struct light_desc
+{
+    quad_desc quad; // its material is not used
+    double weight = 0;
+};
+
 // --- The camera (camera.ixx) ----------------------------------------------------------------------------------------
 
 // How a diffuse bounce chooses the next direction: the CPU's sampling_strategy
@@ -208,6 +226,7 @@ struct scene_desc
     std::vector<perlin_desc> perlins;
     std::vector<quad_desc> quads;
     std::vector<medium_desc> media;
+    std::vector<light_desc> lights; // the lights list's shapes: empty unless camera.sampling is lights or mixture
 };
 
 // The number type the GPU computes with. A GeForce card does arithmetic on 32-bit floats about

@@ -111,6 +111,7 @@ public:
     device_array& operator=(const device_array&) = delete;
 
     T* data() const { return data_; }
+    std::size_t size() const { return size_; }
 
     void fill_with_zeros()
     {
@@ -718,10 +719,23 @@ void validate(const scene_desc& scene)
             throw std::runtime_error("unknown material kind");
         }
     }
-    // Only the material strategy so far: a diffuse bounce samples as the material scatters
-    if (camera.sampling != sampling_strategy::material)
+    // The strategies so far: uniform, material and lights. The lights strategy needs a shape to aim at (the CPU's
+    // effective_sampling falls back to material without one), with a chance of being aimed at and an area.
+    if (camera.sampling == sampling_strategy::mixture)
     {
-        throw std::runtime_error("the GPU renderer samples diffuse bounces only as the material scatters so far");
+        throw std::runtime_error("the GPU renderer doesn't sample diffuse bounces with the mixture yet");
+    }
+    if (camera.sampling == sampling_strategy::lights && scene.lights.empty())
+    {
+        throw std::runtime_error("the lights strategy needs a lights list that isn't empty");
+    }
+    for (const light_desc& l : scene.lights)
+    {
+        const vec3d n = cross(l.quad.u, l.quad.v);
+        if (!(l.weight > 0 && l.weight <= 1) || !(dot(n, n) > 0))
+        {
+            throw std::runtime_error("a light must have a weight in (0, 1] and an area");
+        }
     }
     for (const sphere_desc& s : scene.spheres)
     {
@@ -828,6 +842,45 @@ media_on_device<Real> to_media(const scene_desc& scene)
     return result;
 }
 
+// The lights list in Real (see light in lights.cuh), for the lights strategy: each quad made as the BVH's quads are,
+// its area and the running sums of the weights computed in double and rounded once, and its twin, the global id of the
+// world's quad with exactly the same numbers, if there is one. A lights-list copy is built by the same function as the
+// lamp in the world (see scene in scenes.ixx) and baked through the same instances, so the numbers agree bit for bit.
+template <real_number Real>
+std::vector<light<Real>> to_lights(const scene_desc& scene, const bvh<Real>& tree)
+{
+    std::vector<light<Real>> lights;
+    if (scene.camera.sampling != sampling_strategy::lights)
+    {
+        return lights; // only the lights strategy aims at them
+    }
+    double cdf = 0;
+    for (const light_desc& desc : scene.lights)
+    {
+        cdf += desc.weight;
+        int twin = -1;
+        for (std::size_t i = 0; i < scene.quads.size(); ++i)
+        {
+            const quad_desc& q = scene.quads[i];
+            if (q.q == desc.quad.q && q.u == desc.quad.u && q.v == desc.quad.v)
+            {
+                twin = tree.quad_ids[i];
+                break;
+            }
+        }
+        const vec3d n = cross(desc.quad.u, desc.quad.v);
+        lights.push_back({.shape = make_quad<Real>(desc.quad),
+                          .u = to_real<Real>(desc.quad.u),
+                          .area = static_cast<Real>(std::sqrt(dot(n, n))), // the CPU's n.length()
+                          .v = to_real<Real>(desc.quad.v),
+                          .cdf = static_cast<Real>(cdf),
+                          .weight = static_cast<Real>(desc.weight),
+                          .twin = twin,
+                          .unused = {}});
+    }
+    return lights;
+}
+
 // Whether the first book's kernel can render the scene (see first_book_kernel): it has spheres that stand still and no
 // other shapes, every material is a lambertian of one color, a metal or a dielectric (so the sky is the only light),
 // and diffuse bounces sample as the material scatters
@@ -856,6 +909,7 @@ public:
     scene_view<Real> view() const
     {
         return {.motion = motion_,
+                .sampling = sampling_,
                 .tree = {.nodes = nodes_.data(),
                          .spheres = spheres_.data(),
                          .node_count = node_count_,
@@ -874,7 +928,8 @@ public:
                 .textures = {.textures = textures_.data(),
                              .images = images_.data(),
                              .texels = texels_.data(),
-                             .noises = noises_.data()}};
+                             .noises = noises_.data()},
+                .lights = {.lights = lights_.data(), .count = static_cast<int>(lights_.size())}};
     }
 
 private:
@@ -899,7 +954,9 @@ private:
           images_(images.infos),
           texels_(images.texels),
           noises_(to_noises<Real>(scene)),
-          motion_(motion(scene))
+          lights_(to_lights<Real>(scene, tree)),
+          motion_(motion(scene)),
+          sampling_(scene.camera.sampling)
     {
     }
 
@@ -928,7 +985,9 @@ private:
     device_array<image_info> images_;
     device_array<texel> texels_;
     device_array<noise_texture<Real>> noises_;
+    device_array<light<Real>> lights_;
     bool motion_;
+    sampling_strategy sampling_;
 };
 
 // All passes of the render with the kernel of the given kind, launch after launch: adds the samples to sums and the

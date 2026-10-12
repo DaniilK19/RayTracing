@@ -3,7 +3,9 @@
 
 #include "bvh.cuh"
 #include "constant_medium.cuh"
+#include "lights.cuh"
 #include "material.cuh"
+#include "pdf.cuh"
 #include "quad.cuh"
 #include "random.cuh"
 #include "scene.cuh"
@@ -274,6 +276,60 @@ __device__ bvh_hit<Real> closest_event(const scene_view<Real>& scene, const ray<
     return closest;
 }
 
+// How a diffuse bounce goes on: not at all (a direction the CPU doesn't trace), with the material's own density (the
+// CPU's weight pScatter / p is then exactly 1, so nothing is multiplied), or with the weight pScatter / p
+enum class bounce
+{
+    none,
+    own_density,
+    weighted,
+};
+
+// The direction of a diffuse bounce as the camera's strategy draws it (see ray_color in camera.ixx), and its weight.
+// matte: a lambertian surface, whose own density is cos θ / π around the normal; otherwise a particle of smoke, whose
+// own density is 1/(4π) in every direction. from: the global id of the primitive the bounce leaves (-1 after a
+// particle), for the lights' twin rule (see lights_pdf_value).
+//
+// Importance sampling: a direction drawn with a density p stands for the whole integral of the light coming in, as
+// the integrand divided by p. The integrand is the material's own density pScatter times the light, so a sample
+// weighs pScatter / p: exactly 1 where p is the material's own density. The strategies differ only in the noise, as
+// long as p > 0 wherever pScatter is: true for uniform, false for lights (biased, as on the CPU).
+template <real_number Real>
+__device__ bounce diffuse_bounce(const scene_view<Real>& scene, bool matte, const hit_record<Real>& rec, int from,
+                                 pcg32& rng, vec3<Real>& direction, Real& weight)
+{
+    // A particle sampled uniformly is sampled with its own density (the CPU's ratio is exactly 1.0), by the same
+    // random_unit_vector: the material strategy
+    const sampling_strategy strategy =
+        !matte && scene.sampling == sampling_strategy::uniform ? sampling_strategy::material : scene.sampling;
+    if (strategy == sampling_strategy::material)
+    {
+        if (matte)
+        {
+            // cosine_pdf: Step 46's matte bounce. The CPU doesn't trace a direction of density 0, which here means one
+            // that rounding put just below the surface.
+            direction = around(rec.normal, random_cosine_direction<Real>(rng));
+            return dot(rec.normal, direction) > Real(0) ? bounce::own_density : bounce::none;
+        }
+        direction = random_unit_vector<Real>(rng); // sphere_pdf: 1/(4π) everywhere, never 0
+        return bounce::own_density;
+    }
+    // uniform (sphere_pdf, for a surface) or lights (hittable_pdf of the lights list)
+    const bool toward_lights = strategy == sampling_strategy::lights;
+    direction = toward_lights ? lights_random(scene.lights, rec.p, rng) : random_unit_vector<Real>(rng);
+    // The material's own density of that direction: the cosine density for a surface, 1/(4π) for a particle
+    const Real p_scatter = matte ? cosine_density(rec.normal, direction) : uniform_sphere_density<Real>;
+    const Real p = toward_lights ? lights_pdf_value(scene.lights, rec.p, direction, from) : uniform_sphere_density<Real>;
+    // !(x > 0) also catches a NaN, where x <= 0 would let it through. Under uniform this drops the half of the
+    // directions below the surface, which the CPU doesn't trace either.
+    if (!(p > Real(0)) || !(p_scatter > Real(0)))
+    {
+        return bounce::none;
+    }
+    weight = p_scatter / p; // uniform: 4 cos θ
+    return bounce::weighted;
+}
+
 // Traces the path's next ray in the kernel for all three books: one level of the CPU's ray_color, with the features of
 // the books so far. Returns true when the sample is complete, with its color in `sample`; otherwise the path now holds
 // the ray to trace next.
@@ -313,21 +369,24 @@ __device__ bool trace_ray(path<Real>& p, const scene_view<Real>& scene, const ca
         sample = p.throughput * c;
         return true;
     case material_kind::lambertian:
-        // Step 46's matte bounce (see scatter in material.cuh), attenuated by the texture's color
-        direction = around(s.rec.normal, random_cosine_direction<Real>(rng));
-        if (!(dot(s.rec.normal, direction) > Real(0)))
+    case material_kind::isotropic: // a particle of smoke scatters the same in every direction
+    {
+        // A diffuse bounce, as the strategy draws it, attenuated by the texture's color
+        Real weight;
+        const bounce next = diffuse_bounce(scene, mat.kind == material_kind::lambertian, s.rec, s.from, rng,
+                                           direction, weight);
+        if (next == bounce::none)
         {
             sample = {}; // a direction the CPU doesn't trace: no light
             return true;
         }
         p.throughput *= c;
+        if (next == bounce::weighted)
+        {
+            p.throughput = weight * p.throughput;
+        }
         break;
-    case material_kind::isotropic:
-        // A particle of smoke scatters the same in every direction (sphere_pdf): sampled with its own density, the
-        // weight is exactly 1
-        direction = random_unit_vector<Real>(rng);
-        p.throughput *= c;
-        break;
+    }
     case material_kind::metal:
     case material_kind::dielectric:
         if (!scatter(mat, p.r.direction, s.rec, rng, direction, p.throughput))

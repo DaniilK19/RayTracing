@@ -78,9 +78,9 @@ __device__ Real reflectance(Real cosine, Real refraction_index)
 // The material's scatter(): what happens to a ray with the given direction at the hit. Returns false if the light is
 // absorbed: the sample is then 0. Otherwise sets the direction of the next ray and multiplies the path's throughput by
 // the attenuation. As on the CPU, a matte bounce is sampled with the material's own density (the camera's material
-// strategy, the only one the GPU has so far: see validate in renderer.cu), so its weight pScatter / p is exactly 1.
-// (The first book's kernel calls it for every material; the kernel for all three books for metal and glass, see
-// trace_ray in camera.cuh.)
+// strategy, the only one the first book's kernel renders: see first_book_scene in renderer.cu), so its weight
+// pScatter / p is exactly 1. (The first book's kernel calls it for every material; the kernel for all three books for
+// metal and glass, see trace_ray in camera.cuh.)
 template <real_number Real>
 __device__ bool scatter(const material<Real>& mat, const vec3<Real>& direction, const hit_record<Real>& rec,
                         pcg32& rng, vec3<Real>& scattered, color<Real>& throughput)

@@ -5,6 +5,7 @@
 
 #include "bvh.cuh"
 #include "constant_medium.cuh"
+#include "lights.cuh"
 #include "material.cuh"
 #include "sphere.cuh"
 #include "texture.cuh"
@@ -19,6 +20,7 @@ template <real_number Real>
 struct scene_view
 {
     bool motion; // some sphere moves, a shape or a volume's boundary: camera rays get a random time (see start_sample)
+    sampling_strategy sampling; // how a diffuse bounce chooses its direction (see diffuse_bounce in camera.cuh)
     bvh_view<Real> tree;
     media_view<Real> media; // smoke and fog, tested after the surfaces (see closest_event in camera.cuh)
     const int* primitive_materials;            // the material index of each primitive, by its global id (see bvh)
@@ -26,6 +28,7 @@ struct scene_view
     const material<Real>* materials;
     const material_texture* material_textures; // read by the kernel for all three books only, by material index
     texture_view<Real> textures;
+    lights_view<Real> lights; // what the lights strategy aims at
 };
 
 // The scene as the first book's kernel sees it: Step 46's arrays and nothing else, in a struct that never grows.
