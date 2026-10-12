@@ -1,7 +1,7 @@
 // Module bvh: the Bounding Volume Hierarchy from the second book of the series.
 //
-// Without it every ray is tested against every object in the scene; in the final scene that is
-// almost 500 spheres per ray. The BVH arranges objects into a binary tree of boxes: if the ray misses
+// Without it every ray is tested against every object in the scene; in the first book's cover (the weekend
+// scene) that is almost 500 spheres per ray. The BVH arranges objects into a binary tree of boxes: if the ray misses
 // a node's box, the whole subtree is skipped. Instead of N tests it takes on the order of log₂N.
 export module bvh;
 
@@ -12,8 +12,9 @@ import interval;
 import ray;
 
 // A tree node: two subtrees and a common box around them. The tree's leaves are the scene objects themselves.
-// The class isn't exported: from outside the tree is just a hittable, and build_bvh() builds it.
-class bvh_node : public hittable
+// To render, the tree is just a hittable, which build_bvh() builds. The class is exported only so that code that
+// copies a scene into its own format can look inside it (left and right below).
+export class bvh_node : public hittable
 {
 public:
     bvh_node(std::unique_ptr<hittable> left, std::unique_ptr<hittable> right)
@@ -36,6 +37,11 @@ public:
     }
 
     aabb bounding_box() const override { return bbox_; }
+
+    // For code that copies a scene into its own format: the GPU program, which takes the objects at the tree's leaves
+    // and builds a tree of its own over all of the world's shapes
+    inline const hittable& left() const { return *left_; }
+    inline const hittable& right() const { return *right_; }
 
 private:
     std::unique_ptr<hittable> left_;

@@ -11,6 +11,7 @@
 #include "gpu/renderer.h"
 
 import std;
+import bvh;
 import camera;
 import cli;
 import constant_medium;
@@ -27,15 +28,14 @@ import vec3;
 
 // --- The command line ------------------------------------------------------------------------------------------
 
-// The scenes of RayTracing that the GPU can render so far: all but final, which needs BVHs built inside the world (its
-// ground of boxes and its cloud of balls), as to_gpu below says. The scenes lit by lamps render only with -p material
-// so far.
+// The scenes of RayTracing that the GPU can render so far: all of them, those lit by lamps only with -p material so far
+// (see unsupported_sampling).
 // In the end to_gpu decides: any scene it can translate renders, listed here or not. (earth renders without its
 // texture's file too, as the plain cyan sphere that the CPU renders then.)
 // std::to_array (C++20) counts the names itself, so the array's size can't disagree with the list.
 constexpr auto supported_scenes = std::to_array<std::string_view>({"materials", "weekend", "bouncing", "checker",
                                                                     "earth", "perlin", "quads", "light", "cornell",
-                                                                    "smoke", "aluminum", "glass"});
+                                                                    "smoke", "final", "aluminum", "glass"});
 constexpr std::string_view default_gpu_scene = "weekend";
 
 // The options are RayTracing's (-p takes all of its names, though the GPU samples only as the material scatters so
@@ -277,11 +277,11 @@ struct placement
 };
 
 // Calls on_shape(shape, where) for every object under `object` that holds no other objects, with the placement that
-// brings it into the world. Lists (the world, a box()) hold objects; translate and rotate_y hold one and move it.
-// Other objects that hold some go to on_shape whole: add_shape translates a volume of smoke (add_medium walks its
-// boundary with this function again) and says the GPU can't render the others (a BVH built inside the world) yet.
-// Stops at the first error that on_shape returns. (An abbreviated function template, C++20: on_shape may be any
-// callable that takes a hittable and a placement, here a lambda.)
+// brings it into the world. Lists (the world, a box()) and the nodes of a BVH hold objects; translate and rotate_y hold
+// one and move it. Every other object goes to on_shape whole: add_shape translates a volume of smoke (add_medium walks
+// its boundary with this function again) and rejects a kind the GPU doesn't know. Stops at the first error that
+// on_shape returns. (An abbreviated function template, C++20: on_shape may be any callable that takes a hittable and
+// a placement, here a lambda.)
 std::expected<void, std::string> for_each_shape(const hittable& object, const placement& where, const auto& on_shape)
 {
     // dynamic_cast asks an object what it really is: dynamic_cast<const hittable_list*>(&object) gives a pointer to
@@ -296,6 +296,17 @@ std::expected<void, std::string> for_each_shape(const hittable& object, const pl
             }
         }
         return {};
+    }
+    // A BVH built inside the world (final's ground and cloud): the GPU program builds a tree of its own over all of
+    // the world's shapes (on the CPU, see build_bvh in gpu/bvh.cuh), so this walk takes only the objects at this
+    // tree's leaves
+    if (const auto* node = dynamic_cast<const bvh_node*>(&object))
+    {
+        if (auto done = for_each_shape(node->left(), where, on_shape); !done)
+        {
+            return done;
+        }
+        return for_each_shape(node->right(), where, on_shape);
     }
     if (const auto* moved = dynamic_cast<const translate*>(&object))
     {
@@ -315,7 +326,7 @@ class scene_translator
 public:
     scene_translator(const camera_frame& frame, sampling_strategy sampling) { desc_.camera = to_gpu(frame, sampling); }
 
-    // Every shape (sphere, quad) and every volume of smoke of the world, wherever it is in the world's lists and
+    // Every shape (sphere, quad) and every volume of smoke of the world, wherever it is in the world's lists, BVHs and
     // instances
     std::expected<void, std::string> add_world(const hittable_list& world)
     {
@@ -378,8 +389,8 @@ std::expected<void, std::string> scene_translator::add_shape(const hittable& sha
     {
         return add_medium(*volume, where);
     }
-    return std::unexpected(
-        "it has an object of a kind the GPU can't render yet (such as a BVH built inside the world)");
+    return std::unexpected("it has an object the GPU doesn't know (it renders spheres, quads, boxes and smoke, also in "
+                           "lists, BVHs, translate and rotate_y)");
 }
 
 std::expected<void, std::string> scene_translator::add_medium(const constant_medium& volume, const placement& where)
@@ -569,9 +580,9 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
     return index;
 }
 
-// The whole scene, or why the GPU can't render it yet. So far the GPU renders spheres, standing still or moving, and
-// quads, also in lists, translate and rotate_y, with matte surfaces of solid, checker, image or marble textures, metal,
-// glass and lamps, and volumes of smoke or fog. sampling is the strategy the CPU would render with
+// The whole scene, or why the GPU can't render it. The GPU renders spheres, standing still or moving, and quads, also
+// in lists, BVHs, translate and rotate_y, with matte surfaces of solid, checker, image or marble textures, metal, glass
+// and lamps, and volumes of smoke or fog: every scene of the books. sampling is the strategy the CPU would render with
 // (effective_sampling); see unsupported_sampling for the ones the GPU has.
 std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame,
                                                    sampling_strategy sampling)
