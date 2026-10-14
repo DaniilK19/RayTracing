@@ -148,7 +148,7 @@ if(CMAKE_CUDA_COMPILER)
     # The CPU's scenes as the renderer's data (gpu_scene.ixx): a module in a library of its own, which every GPU
     # program links. It includes the renderer's header and imports the ray tracer's modules, so it comes with both.
     add_library(gpu_scene STATIC)
-    target_sources(gpu_scene PUBLIC FILE_SET CXX_MODULES FILES src/gpu_scene.ixx)
+    target_sources(gpu_scene PUBLIC FILE_SET CXX_MODULES FILES src/gpu_scene.ixx src/view_options.ixx)
     target_link_libraries(gpu_scene PUBLIC raytracer gpu_renderer)
     target_compile_options(gpu_scene PRIVATE /W4)
 

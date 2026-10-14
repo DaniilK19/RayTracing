@@ -27,6 +27,7 @@ import scenes;
 import sphere;
 import texture;
 import vec3;
+import view_options;
 
 // --- The scene as the GPU renderer's data ----------------------------------------------------------------------
 
@@ -511,12 +512,14 @@ std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_
 
 // --- A scene ready for the GPU ---------------------------------------------------------------------------------
 
-// What a program may change in a scene's settings, as RayTracing's options do; what is empty stays the scene's own.
+// What a program may change in a scene's settings: the width, the samples and the strategy, as RayTracing's options
+// do, and the view, as the GPU programs' own options do. What is empty stays the scene's own.
 export struct scene_overrides
 {
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
     std::optional<sampling_strategy> sampling;
+    view_options view; // the image's height and the camera (view_options.ixx)
 };
 
 // A scene translated for the GPU, and what it was made from
@@ -551,6 +554,11 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
     s.camera.image_width = overrides.image_width.value_or(s.camera.image_width);
     s.camera.samples_per_pixel = overrides.samples_per_pixel.value_or(s.camera.samples_per_pixel);
     s.camera.sampling = overrides.sampling.value_or(s.camera.sampling);
+    // After the width: an exact height sets the aspect ratio from it
+    if (const auto applied = apply(overrides.view, s.camera); !applied)
+    {
+        return std::unexpected(applied.error());
+    }
 
     // The CPU's camera computes the pixel grid and the lens from the settings; the GPU renders with its numbers
     const camera_frame frame = camera(s.camera).frame();

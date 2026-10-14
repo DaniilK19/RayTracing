@@ -16,19 +16,21 @@ import cli;
 import gpu_scene;
 import image;
 import scenes;
+import view_options;
 
 // --- The command line ------------------------------------------------------------------------------------------
 
 constexpr std::string_view default_gpu_scene = "weekend";
 
-// The options are RayTracing's, plus two of the GPU's own: --fp64 and --all-books-kernel. std::optional tells "not
-// given: take it from the scene" apart from any given value.
+// The options are RayTracing's, plus the GPU programs' own: --fp64, --all-books-kernel and the view options
+// (view_options.ixx). std::optional tells "not given: take it from the scene" apart from any given value.
 struct options
 {
     std::string_view scene = default_gpu_scene;
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
     std::optional<sampling_strategy> sampling;
+    view_options view; // the camera, if not the scene's own
     std::uint32_t seed = 0;
     std::vector<std::filesystem::path> outputs; // one per -o; parse_options adds <scene name>-gpu.png if there is none
     bool fp64 = false;
@@ -48,8 +50,9 @@ void print_usage()
     std::println(R"(  Default: {}.
 
 Options:
-  -w, --width N        image width in pixels; the height follows the scene's aspect ratio
-                       (each scene has its own default)
+  -w, --width N        image width in pixels (each scene has its own default); the height follows
+                       the scene's aspect ratio, unless --height is given
+{}
   -s, --samples N      rays per pixel: fewer is faster but noisier
                        (each scene has its own default); rounded to the nearest square k²,
                        because the rays form a k×k grid in the pixel
@@ -68,7 +71,7 @@ Options:
   -h, --help           show this help
 
 Sampling (-p):)",
-                 default_gpu_scene, std::numeric_limits<std::uint32_t>::max());
+                 default_gpu_scene, view_usage, std::numeric_limits<std::uint32_t>::max());
     for (const sampling_entry& entry : sampling_list)
     {
         // camera_settings{} holds the camera's defaults
@@ -107,6 +110,20 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
                 return std::unexpected(std::format("unknown scene '{}'", arg));
             }
             opts.scene = arg;
+            continue;
+        }
+
+        // The view options: the image's height, where the camera stands and looks, its field of view and lens
+        if (is_view_option(arg))
+        {
+            if (i + 1 == args.size())
+            {
+                return std::unexpected(std::format("{} needs a value", arg));
+            }
+            if (const auto parsed = parse_view_option(arg, args[++i], opts.view); !parsed)
+            {
+                return std::unexpected(parsed.error());
+            }
             continue;
         }
 
@@ -205,7 +222,10 @@ int main(int argc, char* argv[])
     // The scene with the options' settings, translated for the GPU (gpu_scene.ixx)
     const auto built = build_gpu_scene(
         opts->scene,
-        {.image_width = opts->image_width, .samples_per_pixel = opts->samples_per_pixel, .sampling = opts->sampling});
+        {.image_width = opts->image_width,
+         .samples_per_pixel = opts->samples_per_pixel,
+         .sampling = opts->sampling,
+         .view = opts->view});
     if (!built)
     {
         std::println("Error: {}", built.error());
@@ -219,6 +239,9 @@ int main(int argc, char* argv[])
     const auto entry = std::ranges::find(sampling_list, sampling, &sampling_entry::strategy);
     std::println("Scene: {}, sampling: {}{}", opts->scene, entry->name,
                  sampling != requested ? " (no lights: the sky is the light)" : "");
+    // The view as options: pasted into a command line, they give this camera again bit for bit (and with the same
+    // other options the same image), and they are the place to start from to change it
+    std::println("View: {}", format_view(built->cpu.camera, frame.image_height));
 
     const int width = frame.image_width;
     const int height = frame.image_height;
