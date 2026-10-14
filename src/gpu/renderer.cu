@@ -41,6 +41,7 @@
 #include "bvh.cuh"
 #include "camera.cuh"
 #include "constant_medium.cuh"
+#include "display.cuh"
 #include "material.cuh"
 #include "random.cuh"
 #include "scene.cuh"
@@ -175,12 +176,16 @@ private:
 class event
 {
 public:
-    // Waiting for an event (synchronize below) is a busy loop: the thread asks the GPU again and again and keeps one
-    // CPU core at 100% for the whole render. With cudaEventBlockingSync it would sleep until the GPU signals instead,
-    // but a sleeping thread may wake up late, and the GPU waits for the next launch meanwhile. On a quiet machine that
-    // cost 0.3 ms per launch; with the other cores busy, float32 renders took up to 30% longer. A spinning thread
-    // reacts at once, so the renderer keeps CUDA's default.
-    event() { check(cudaEventCreate(&event_), "creating a CUDA event"); }
+    // Waiting for an event (synchronize below) is a busy loop by default: the thread asks the GPU again and again and
+    // keeps one CPU core at 100% for the whole render. With cudaEventBlockingSync it sleeps until the GPU signals
+    // instead, but a sleeping thread may wake up late, and the GPU waits for the next launch meanwhile. On a quiet
+    // machine that cost 0.3 ms per launch; with the other cores busy, float32 renders took up to 30% longer. So
+    // RayTracingGPU, which only renders, spins (wait_mode::spin), and the window, whose core has other work, sleeps.
+    explicit event(wait_mode wait = wait_mode::spin)
+    {
+        check(cudaEventCreateWithFlags(&event_, wait == wait_mode::sleep ? cudaEventBlockingSync : cudaEventDefault),
+              "creating a CUDA event");
+    }
     ~event() { cudaEventDestroy(event_); }
     event(const event&) = delete;
     event& operator=(const event&) = delete;
@@ -201,6 +206,42 @@ public:
 
 private:
     cudaEvent_t event_ = nullptr;
+};
+
+// Memory on the host that the GPU copies into directly ("pinned": the system never moves it), owned like device_array.
+// A copy from the GPU into ordinary memory goes through a pinned buffer of the driver's, so this saves a copy.
+template <typename T>
+class pinned_array
+{
+public:
+    pinned_array() = default;
+    explicit pinned_array(std::size_t size) : size_(size)
+    {
+        if (size_ > 0)
+        {
+            check(cudaMallocHost(&data_, size_ * sizeof(T)), "allocating pinned host memory");
+        }
+    }
+    ~pinned_array() { cudaFreeHost(data_); } // nothing to do for nullptr
+    pinned_array(const pinned_array&) = delete;
+    pinned_array& operator=(const pinned_array&) = delete;
+    pinned_array(pinned_array&& other) noexcept
+        : size_(std::exchange(other.size_, 0)), data_(std::exchange(other.data_, nullptr))
+    {
+    }
+    pinned_array& operator=(pinned_array&& other) noexcept
+    {
+        std::swap(size_, other.size_);
+        std::swap(data_, other.data_);
+        return *this;
+    }
+
+    T* data() const { return data_; }
+    std::size_t size() const { return size_; }
+
+private:
+    std::size_t size_ = 0;
+    T* data_ = nullptr;
 };
 
 // The work of one launch: passes [first_pass, first_pass + pass_count) of rows [first_row, first_row + row_count),
@@ -708,7 +749,7 @@ void validate_camera(const camera_desc& camera)
     {
         throw std::runtime_error("the image must be at least one pixel wide and high");
     }
-    // The grid of one launch has at most 65535 blocks vertically
+    // The grid of one launch has at most 65535 blocks vertically (display.cu's blocks are 8 rows high too)
     if (camera.image_height > 65535 * block_height)
     {
         throw std::runtime_error("the image is too tall for the GPU renderer");
@@ -1143,6 +1184,7 @@ struct session::impl
     virtual render_report render_to(accumulation target, const std::function<void(std::int64_t)>& on_pass) = 0;
     virtual render_report render_for(double seconds, std::int64_t pass_limit) = 0;
     virtual std::vector<double> pixels() const = 0;
+    virtual std::span<const std::uint8_t> display() = 0;
     virtual std::uint64_t rays() const = 0;
     virtual bool has_view() const = 0;
     virtual double kernel_seconds() const = 0;
@@ -1246,6 +1288,38 @@ public:
             value *= scale;
         }
         return values;
+    }
+
+    std::span<const std::uint8_t> display() override
+    {
+        const accumulation now = planner().state();
+        if (now.passes == 0)
+        {
+            throw std::logic_error("the image has no complete pass to show");
+        }
+        const int width = camera_.image_width;
+        const int height = camera_.image_height;
+        const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4;
+        // Grown when needed, as the sums (see start_view), and each on its own: after an allocation fails, the next
+        // call tries it again
+        if (rgba_.size() < bytes)
+        {
+            rgba_ = device_array<std::uint8_t>(0);
+            rgba_ = device_array<std::uint8_t>(bytes);
+        }
+        if (shown_.size() < bytes)
+        {
+            shown_ = pinned_array<std::uint8_t>();
+            shown_ = pinned_array<std::uint8_t>(bytes);
+        }
+        // Both scales are computed here as pixels() computes its own: 1.0 / the number of samples
+        const auto passes = static_cast<double>(now.passes);
+        detail::to_rgba8(sums_.data(), width, 0, now.rows, 1.0 / (passes + 1), rgba_.data());
+        detail::to_rgba8(sums_.data(), width, now.rows, height - now.rows, 1.0 / passes, rgba_.data());
+        // A synchronous copy waits for the conversion first (they are on the same stream), sleeping under
+        // wait_mode::sleep (see query_device)
+        check(cudaMemcpy(shown_.data(), rgba_.data(), bytes, cudaMemcpyDeviceToHost), "copying the image from the GPU");
+        return {shown_.data(), bytes};
     }
 
     std::uint64_t rays() const override
@@ -1379,8 +1453,10 @@ private:
     device_array<unsigned long long> ray_count_;
     double kernel_seconds_ = 0;
     std::optional<launch_planner> planner_;
-    event start_;
-    event stop_;
+    event start_{options_.wait};
+    event stop_{options_.wait};
+    device_array<std::uint8_t> rgba_{0}; // the display's bytes on the GPU (see display), and their copy on the host
+    pinned_array<std::uint8_t> shown_;
 };
 
 session::session(const scene_desc& scene, const session_options& options)
@@ -1392,6 +1468,15 @@ session::session(const scene_desc& scene, const session_options& options)
             std::format("a launch must be planned to take more than 0 and at most {} seconds", max_launch_seconds));
     }
     check(cudaSetDevice(0), "selecting the CUDA device");
+    if (options.wait == wait_mode::sleep)
+    {
+        unsigned flags = 0;
+        check(cudaGetDeviceFlags(&flags), "reading how the CUDA device waits");
+        if ((flags & cudaDeviceScheduleMask) != cudaDeviceScheduleBlockingSync)
+        {
+            throw std::logic_error("a session that sleeps needs a device that sleeps: query_device(wait_mode::sleep)");
+        }
+    }
     if (options.arithmetic == precision::float64)
     {
         impl_ = std::make_unique<impl::in<double>>(scene, options);
@@ -1434,6 +1519,11 @@ render_report session::render_for(double seconds, std::int64_t pass_limit)
 std::vector<double> session::pixels() const
 {
     return impl_->pixels();
+}
+
+std::span<const std::uint8_t> session::display()
+{
+    return impl_->display();
 }
 
 std::uint64_t session::rays() const
@@ -1497,7 +1587,7 @@ bool is_convex(const std::vector<quad_desc>& quads)
     return true;
 }
 
-device_info query_device()
+device_info query_device(wait_mode wait)
 {
     int count = 0;
     check(cudaGetDeviceCount(&count), "looking for a CUDA device");
@@ -1516,12 +1606,13 @@ device_info query_device()
     check(cudaRuntimeGetVersion(&info.runtime_version), "reading the CUDA runtime version");
     check(cudaDriverGetVersion(&info.driver_version), "reading the CUDA driver version");
 
-    // Start CUDA on the device now. The first call that needs the GPU creates its context, the driver's state for this
-    // program (its memory, its loaded kernels), and that takes a noticeable fraction of a second. cudaFree(nullptr)
-    // frees nothing: it is the customary way to make that happen at a chosen moment, here, so that render() times
-    // only the rendering.
+    // Start CUDA on the device now, so that render() times only the rendering. cudaSetDevice creates the device's
+    // context (it does since CUDA 12), the driver's state for this program (its memory, its loaded kernels), and that
+    // takes a noticeable fraction of a second.
     check(cudaSetDevice(0), "selecting the CUDA device");
-    check(cudaFree(nullptr), "starting CUDA on the device");
+    // The flag replaces the context's own, from now on. (Spinning is also what CUDA's default does, with one context.)
+    check(cudaSetDeviceFlags(wait == wait_mode::sleep ? cudaDeviceScheduleBlockingSync : cudaDeviceScheduleSpin),
+          "setting how the CUDA device waits");
     return info;
 }
 

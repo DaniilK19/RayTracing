@@ -1,10 +1,10 @@
 // The GPU renderer's interface: a scene as plain data in, an image out.
 //
-// The renderer itself (renderer.cu and the .cuh headers next to it) is compiled by nvcc, NVIDIA's CUDA compiler, which
-// can't import C++20 modules: neither ours nor `import std`. So the two sides meet in this ordinary header. renderer.cu
-// includes it, and so does the gpu_scene module (gpu_scene.ixx), which builds a scene with the CPU ray tracer's own
-// modules (the same scene, the same camera) and translates it into the structures below for the GPU programs. Only
-// plain data crosses over: no virtual functions and no pointers into the CPU's objects.
+// The renderer itself (renderer.cu, display.cu and the .cuh headers next to them) is compiled by nvcc, NVIDIA's CUDA
+// compiler, which can't import C++20 modules: neither ours nor `import std`. So the two sides meet in this ordinary
+// header. renderer.cu includes it, and so does the gpu_scene module (gpu_scene.ixx), which builds a scene with the CPU
+// ray tracer's own modules (the same scene, the same camera) and translates it into the structures below for the GPU
+// programs. Only plain data crosses over: no virtual functions and no pointers into the CPU's objects.
 //
 // The scene is a set of tables that refer to each other by index, as the CPU's objects refer to each other by pointer:
 // a sphere names its material, a material its texture, a checker two other textures, an image texture its image. Each
@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -318,9 +319,18 @@ struct device_info
     int driver_version = 0;  // the newest CUDA version the installed driver supports, not the driver's own number
 };
 
+// How the host waits for the GPU (which of its waits: see query_device and session_options)
+enum class wait_mode
+{
+    spin,  // asks the GPU again and again: reacts at once, but keeps a CPU core busy all the while (RayTracingGPU)
+    sleep, // sleeps until the GPU signals: the core is free for the rest of the program (the window)
+};
+
 // Describes the first CUDA device and starts CUDA on it (a fraction of a second, once per program), so that render()
 // times only the rendering. Throws std::runtime_error if there is no device (no NVIDIA GPU, or no driver).
-device_info query_device();
+// `wait` sets how the device's own waits wait, for the rest of the program: synchronous copies, and waits for the
+// whole device. A session's waits for its launches follow its own session_options::wait.
+device_info query_device(wait_mode wait = wait_mode::spin);
 
 // Renders the scene on the first CUDA device. Throws std::runtime_error with CUDA's message if something fails, or if
 // the scene is inconsistent (an index out of range, a checker before its textures...), and std::invalid_argument for
@@ -335,6 +345,10 @@ struct session_options
     precision arithmetic = precision::float32;
     bool all_books_kernel = false;
     double launch_seconds = 0.05; // how long a launch is planned to take (see render_options and launch_planner)
+    // How the session waits for its launches. A CUDA event is waited for by spinning unless it is created to sleep,
+    // whatever the device's flag (see query_device), so a sleeping session needs both: without the device's, its
+    // copies would still spin. The session throws std::logic_error if query_device(wait_mode::sleep) hasn't set it.
+    wait_mode wait = wait_mode::spin;
 };
 
 // How far a view's image has come: `passes` complete passes, and rows [0, rows) of the next one (a pass that takes
@@ -411,6 +425,13 @@ public:
     // The image of the complete passes: the sums of the samples divided by their number, as render_result::pixels.
     // Throws std::logic_error unless the image has complete passes and no rows of the next one.
     std::vector<double> pixels() const;
+
+    // The image as the screen shows it: 4 bytes per pixel, red, green, blue and 255, rows from the top, each channel
+    // the byte the PNG files hold (the CPU's image::save_png). Rows that the pass in progress has rendered hold one
+    // sample more than the others, and are divided by their own number of samples, so the image never shows a band
+    // brighter or darker than the rest. Computed on the GPU and copied into memory of this session's, valid until the
+    // next display() or set_camera. Throws std::logic_error unless the image has a complete pass.
+    std::span<const std::uint8_t> display();
 
     std::uint64_t rays() const;    // rays traced since the view was set
     double kernel_seconds() const; // the launches' time on the GPU since the view was set
