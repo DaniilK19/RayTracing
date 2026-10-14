@@ -512,23 +512,33 @@ std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_
 
 // --- A scene ready for the GPU ---------------------------------------------------------------------------------
 
+// The largest side of a pixel's grid of samples, the renderer's (see gpu::max_sqrt_spp)
+export constexpr int max_strata = gpu::max_sqrt_spp;
+
 // What a program may change in a scene's settings: the width, the samples and the strategy, as RayTracing's options
-// do, and the view, as the GPU programs' own options do. What is empty stays the scene's own.
+// do, and the view and the strata, as the GPU programs' own options do. What is empty stays the scene's own.
 export struct scene_overrides
 {
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
     std::optional<sampling_strategy> sampling;
     view_options view; // the image's height and the camera (view_options.ixx)
+    // Rounds of strata (see gpu::session): the side of every pixel's grid of samples. Without it the samples are
+    // rounded to one grid, as the books' camera does; with it they are exactly the samples asked for, in rounds of the
+    // grid.
+    std::optional<int> strata;
 };
 
 // A scene translated for the GPU, and what it was made from
 export struct gpu_build
 {
-    scene cpu;                  // the CPU's scene, with the overrides in cpu.camera (its strategy is the one asked for)
+    // The CPU's scene, with the overrides in cpu.camera: its strategy is the one asked for, and with strata its
+    // samples_per_pixel is the grid's strata² (the samples are `passes`)
+    scene cpu;
     camera_frame frame;         // the pixel grid and the lens, as the CPU's camera computes them from cpu.camera
     sampling_strategy sampling; // the strategy rendered with: the one the CPU would use (effective_sampling)
     gpu::scene_desc desc;       // the renderer's data, with the lights list for the strategies that aim at it
+    std::int64_t passes;        // how many to render: frame.sqrt_spp², or with strata the samples asked for
 };
 
 // Builds the scene called `name` with the CPU's code, applies the overrides and translates it, or says why the GPU
@@ -546,6 +556,11 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
     {
         return std::unexpected("the image width and the samples per pixel must be greater than zero");
     }
+    // The renderer's limit on the grid (see validate in gpu/renderer.cu)
+    if (overrides.strata && !(*overrides.strata >= 1 && *overrides.strata <= max_strata))
+    {
+        return std::unexpected(std::format("the strata must be from 1 to {}", max_strata));
+    }
     // Building a scene draws random numbers from this thread's generator (the first book's cover places its spheres at
     // random, a marble texture shuffles its Perlin tables), so a second build in the same process would make another
     // scene. Starting the generator over gives every build the scene of a fresh process, the scene RayTracing renders.
@@ -553,6 +568,11 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
     scene s = entry->build();
     s.camera.image_width = overrides.image_width.value_or(s.camera.image_width);
     s.camera.samples_per_pixel = overrides.samples_per_pixel.value_or(s.camera.samples_per_pixel);
+    const int samples = s.camera.samples_per_pixel;
+    if (overrides.strata)
+    {
+        s.camera.samples_per_pixel = *overrides.strata * *overrides.strata; // the camera's grid: strata × strata
+    }
     s.camera.sampling = overrides.sampling.value_or(s.camera.sampling);
     // After the width: an exact height sets the aspect ratio from it
     if (const auto applied = apply(overrides.view, s.camera); !applied)
@@ -583,7 +603,9 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
         }
         desc->lights = std::move(*lights);
     }
-    return gpu_build{.cpu = std::move(s), .frame = frame, .sampling = sampling, .desc = std::move(*desc)};
+    const std::int64_t passes = overrides.strata ? samples : std::int64_t{frame.sqrt_spp} * frame.sqrt_spp;
+    return gpu_build{
+        .cpu = std::move(s), .frame = frame, .sampling = sampling, .desc = std::move(*desc), .passes = passes};
 }
 
 // The renderer's pixels (rows from the top, then r, g, b) in the CPU's image class, so the mean radiance and the saved

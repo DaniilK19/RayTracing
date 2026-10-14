@@ -208,7 +208,7 @@ struct camera_desc
 {
     int image_width = 0;
     int image_height = 0;
-    int sqrt_spp = 1;   // rays per pixel: sqrt_spp²
+    int sqrt_spp = 1;   // the side of a pixel's grid of samples: a round of strata is sqrt_spp² passes (see session)
     int max_depth = 10; // at most this many rays per path: the camera ray and its bounces
     vec3d center;
     vec3d pixel00_loc;
@@ -256,9 +256,14 @@ enum class precision
 // launch_planner in renderer.cu), so this stays far below the 2 seconds after which Windows stops a kernel.
 inline constexpr double max_launch_seconds = 0.5;
 
+// The largest side of a pixel's grid of samples: a round's passes are numbered with ints, at most 46340² of them
+inline constexpr int max_sqrt_spp = 46340;
+
 struct render_options
 {
-    std::uint64_t seed = 0; // renders with different seeds have statistically independent noise
+    // Renders with different seeds have statistically independent noise, as long as the seeds differ in their lower
+    // 32 bits: a round of strata draws the random numbers of seed + round·2^32 (see round_seed_step)
+    std::uint64_t seed = 0;
     precision arithmetic = precision::float32;
     // Called on the host as passes complete (a pass adds one more sample, a camera ray and its bounces, to every pixel,
     // and one kernel launch may complete several), with the number of passes done so far and their total. May be
@@ -272,6 +277,10 @@ struct render_options
     // (std::invalid_argument otherwise; see launch_planner in renderer.cu). The image doesn't depend on it, only the
     // speed: 0.1 rendered 2.5% faster than 0.05, and 0.025 5% slower.
     double launch_seconds = 0.05;
+    // How many passes to render: 0 renders camera.sqrt_spp², one sample in each cell of every pixel's grid, the image
+    // of the books' camera; a positive number renders exactly that many, in rounds of sqrt_spp² (see session); a
+    // negative one throws std::invalid_argument
+    std::int64_t passes = 0;
 };
 
 // The kernel that rendered, as the CUDA runtime describes it: the numbers that decide how many of its threads a
@@ -315,7 +324,7 @@ device_info query_device();
 
 // Renders the scene on the first CUDA device. Throws std::runtime_error with CUDA's message if something fails, or if
 // the scene is inconsistent (an index out of range, a checker before its textures...), and std::invalid_argument for
-// options out of range (launch_seconds).
+// options out of range (launch_seconds, passes).
 render_result render(const scene_desc& scene, const render_options& options);
 
 // --- A render that goes on: the window's -------------------------------------------------------------------------
@@ -347,14 +356,27 @@ struct render_report
     double longest_launch_seconds = 0; // the longest of them
 };
 
+// The seeds of a render's rounds of strata (see session): round r draws the random numbers of seed + r·round_seed_step.
+// A seed given on a command line is a 32-bit number, so two different ones never share the seed of any round.
+inline constexpr std::uint64_t round_seed_step = std::uint64_t{1} << 32;
+
 // A render that goes on: the scene stays in the GPU's memory, and the image of one view gains samples on demand, a
 // few at a time. render() is a session whose one view is rendered to its passes; the window keeps a session for as
 // long as it shows a scene, and gives it a new camera whenever the view changes.
 //
+// Rounds of strata. Every pixel's samples are spread over a grid of k × k cells, k = camera().sqrt_spp: pass p of a
+// round samples cell (p % k, p / k) (see start_path in camera.cuh), so a round of k² passes covers every cell once.
+// The books' camera renders one round. A session renders any number of passes, round after round: pass n of a pixel
+// is pass n % k² of round n / k², with the random numbers of seed + (n / k²)·round_seed_step. So each complete round is
+// a whole grid of samples with noise of its own, round 0 is the books' image, and a render of N passes adds N samples
+// of the same image whatever the rounds. A round that is not complete has sampled only the top rows of cells of every
+// grid, and the left cells of its last row: its samples lean up, and in their last row left, by up to (k - 1) / (2k)
+// of a pixel each way, less as the round fills and diluted by the complete rounds before it. A grid of k <= 3 has
+// rounds of at most 9 passes, and a launch never spans two rounds, so such grids are a check, not a faster render.
+//
 // A session renders exactly the samples render() renders: pass n of a pixel is sample n of render(), with the same
-// random numbers, and every pixel adds its samples in the order of the passes. So however many calls and launches it
-// took, a view's sums after N passes are render()'s after its first N, and its image of all of them is render()'s bit
-// for bit.
+// random numbers, and every pixel adds its samples in the order of the passes. So a view rendered to N passes, however
+// many calls and launches that took, is render()'s image of N passes bit for bit (render_options::passes = N).
 class session
 {
 public:
@@ -377,8 +399,7 @@ public:
 
     // Renders until the image is at `target`, launch after launch. on_pass, if given, is called with the number of
     // complete passes whenever a launch completes some; it must not call the session. Throws std::invalid_argument for
-    // a target behind the image, beyond the camera's sqrt_spp² passes (the strata of a pixel's samples, see start_path
-    // in camera.cuh) or with rows past the image's.
+    // a target behind the image or with rows past the image's.
     render_report render_to(accumulation target, const std::function<void(std::int64_t passes)>& on_pass = {});
     // Renders launch after launch for about `seconds` of GPU time (0 to 3600), but never past pass_limit complete
     // passes; a pass_limit the image has reached does nothing. Below that limit, it renders at least until the view has

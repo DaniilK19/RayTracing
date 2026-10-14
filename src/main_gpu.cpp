@@ -23,13 +23,14 @@ import view_options;
 constexpr std::string_view default_gpu_scene = "weekend";
 constexpr int max_launch_ms = static_cast<int>(gpu::max_launch_seconds * 1000);
 
-// The options are RayTracing's, plus the GPU programs' own: --fp64, --all-books-kernel, --launch-ms and the view
-// options (view_options.ixx). std::optional tells "not given: take it from the scene" apart from any given value.
+// The options are RayTracing's, plus the GPU programs' own: --fp64, --all-books-kernel, --launch-ms, --strata and the
+// view options (view_options.ixx). std::optional tells "not given: take it from the scene" apart from any given value.
 struct options
 {
     std::string_view scene = default_gpu_scene;
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
+    std::optional<int> strata; // rounds of strata × strata: -s is then exact (see gpu::session)
     std::optional<sampling_strategy> sampling;
     view_options view; // the camera, if not the scene's own
     std::uint32_t seed = 0;
@@ -57,7 +58,13 @@ Options:
 {}
   -s, --samples N      rays per pixel: fewer is faster but noisier
                        (each scene has its own default); rounded to the nearest square k²,
-                       because the rays form a k×k grid in the pixel
+                       because the rays form a k×k grid in the pixel, unless --strata is given
+      --strata K       sample every pixel in rounds of a K×K grid, K from 1 to {}: the rays per
+                       pixel are then exactly -s (or the scene's), and each round has noise of its
+                       own; --strata k -s k² renders the image without --strata. A last round not
+                       complete has sampled only the top of every pixel, so the image leans up by up
+                       to half a pixel: give -s in whole rounds (multiples of K²). K below 4 makes
+                       short launches, as a launch holds at most one round: a check, not a speed-up
   -p, --sampling NAME  how a diffuse bounce chooses the next direction ("p" as in pdf,
                        probability density function): one of the strategies below
       --fp64           compute in 64-bit doubles like the CPU instead of 32-bit floats:
@@ -75,7 +82,7 @@ Options:
   -h, --help           show this help
 
 Sampling (-p):)",
-                 default_gpu_scene, view_usage, max_launch_ms, std::numeric_limits<std::uint32_t>::max());
+                 default_gpu_scene, view_usage, max_strata, max_launch_ms, std::numeric_limits<std::uint32_t>::max());
     for (const sampling_entry& entry : sampling_list)
     {
         // camera_settings{} holds the camera's defaults
@@ -137,7 +144,8 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         const bool is_seed = arg == "--seed";
         const bool is_sampling = arg == "-p" || arg == "--sampling";
         const bool is_launch = arg == "--launch-ms";
-        if (!is_width && !is_samples && !is_output && !is_seed && !is_sampling && !is_launch)
+        const bool is_strata = arg == "--strata";
+        if (!is_width && !is_samples && !is_output && !is_seed && !is_sampling && !is_launch && !is_strata)
         {
             return std::unexpected(std::format("unknown option '{}'", arg));
         }
@@ -192,6 +200,16 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             opts.launch_ms = *number;
             continue;
         }
+        if (is_strata)
+        {
+            if (!number || *number > max_strata)
+            {
+                return std::unexpected(
+                    std::format("{}: expected an integer from 1 to {}, not '{}'", arg, max_strata, value));
+            }
+            opts.strata = number;
+            continue;
+        }
         if (!number)
         {
             return std::unexpected(std::format("{}: expected an integer greater than zero, not '{}'", arg, value));
@@ -242,7 +260,8 @@ int main(int argc, char* argv[])
         {.image_width = opts->image_width,
          .samples_per_pixel = opts->samples_per_pixel,
          .sampling = opts->sampling,
-         .view = opts->view});
+         .view = opts->view,
+         .strata = opts->strata});
     if (!built)
     {
         std::println("Error: {}", built.error());
@@ -262,7 +281,7 @@ int main(int argc, char* argv[])
 
     const int width = frame.image_width;
     const int height = frame.image_height;
-    const std::int64_t rays_per_pixel = std::int64_t{frame.sqrt_spp} * frame.sqrt_spp;
+    const std::int64_t rays_per_pixel = built->passes;
     gpu::render_result result;
     try
     {
@@ -272,8 +291,8 @@ int main(int argc, char* argv[])
                      device.name, device.multiprocessors, device.compute_capability_major,
                      device.compute_capability_minor, device.memory_gib, cuda_version(device.runtime_version),
                      cuda_version(device.driver_version), opts->fp64 ? "float64" : "float32");
-        std::println("Rendering {}×{}, rays per pixel: {} ({}×{} strata)", width, height, rays_per_pixel,
-                     frame.sqrt_spp, frame.sqrt_spp);
+        std::println("Rendering {}×{}, rays per pixel: {} ({}{}×{} strata)", width, height, rays_per_pixel,
+                     opts->strata ? "rounds of " : "", frame.sqrt_spp, frame.sqrt_spp);
 
         // The GPU renders in passes, each adding one sample (a camera ray and its bounces) to every pixel, and one
         // kernel launch may complete several of them, so the count goes down in steps (484, 483, 477, 468, ...). Like
@@ -293,7 +312,8 @@ int main(int argc, char* argv[])
             .arithmetic = opts->fp64 ? gpu::precision::float64 : gpu::precision::float32,
             .progress = show_progress,
             .all_books_kernel = opts->all_books_kernel,
-            .launch_seconds = opts->launch_ms / 1000.0};
+            .launch_seconds = opts->launch_ms / 1000.0,
+            .passes = rays_per_pixel};
         result = gpu::render(built->desc, gpu_options);
     }
     catch (const std::exception& error)

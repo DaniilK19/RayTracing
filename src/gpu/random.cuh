@@ -3,7 +3,8 @@
 // The CPU ray tracer gives each image row its own generator, an mt19937_64 seeded with the render's seed and the row's
 // number (see camera::render), because each of its threads renders whole rows. The GPU runs a thread per pixel, and
 // every sample of a pixel in a separate pass (see renderer.cu), so here every sample, one camera ray with all its
-// bounces, gets its own generator, started from the render's seed, the pixel's index and the pass number. Whatever
+// bounces, gets its own generator, started from the round's seed, the pixel's index and the pass in the round (see
+// session in renderer.h). Whatever
 // order the GPU runs the threads in, and however the passes are grouped into launches, a sample gets the same random
 // numbers, so the image is the same on every run. mt19937_64 doesn't fit this: its state takes 2.5 KB, and starting it
 // takes thousands of operations, for a sample that needs a few dozen numbers.
@@ -58,7 +59,7 @@ __device__ inline std::uint64_t mix64(std::uint64_t z)
     return z ^ (z >> 31u);
 }
 
-// The generator of one sample: pass `pass` of pixel `pixel` (its index, row by row from the top) for the render's seed.
+// The generator of one sample: pass `pass` of pixel `pixel` (its index, row by row from the top) for the round's seed.
 // The starting point and the sequence come from two different hashes of the three numbers, so two samples get the same
 // numbers only if 128 bits of hashes coincide. (Two pcg32 sequences whose starting points and inc values are related
 // in simple ways can give correlated numbers; after the hashes they are unrelated.)

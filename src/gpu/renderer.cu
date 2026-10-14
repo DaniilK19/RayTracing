@@ -203,7 +203,8 @@ private:
     cudaEvent_t event_ = nullptr;
 };
 
-// The work of one launch: passes [first_pass, first_pass + pass_count) of rows [first_row, first_row + row_count)
+// The work of one launch: passes [first_pass, first_pass + pass_count) of rows [first_row, first_row + row_count),
+// counted within one round of strata, whose seed the launch gets with it (see session in renderer.h)
 struct launch_work
 {
     int first_pass;
@@ -237,13 +238,15 @@ struct launch_work
 class launch_planner
 {
 public:
-    // resident_blocks: how many of the kernel's blocks the GPU runs at once (see resident_blocks); probe_samples: the
-    // size of the first pass's first band, and band_samples the most samples any band of the first pass may have (see
-    // first_view_probe_samples)
-    launch_planner(int width, int height, int resident_blocks, double probe_samples, double band_samples)
+    // resident_blocks: how many of the kernel's blocks the GPU runs at once (see resident_blocks); round_passes: the
+    // passes of a round of strata, sqrt_spp² (see session in renderer.h); probe_samples: the size of the first pass's
+    // first band, and band_samples the most samples any band of the first pass may have (see first_view_probe_samples)
+    launch_planner(int width, int height, int resident_blocks, std::int64_t round_passes, double probe_samples,
+                   double band_samples)
         : width_(width),
           height_(height),
           min_rows_(wave_rows(width, height, resident_blocks)),
+          round_passes_(round_passes),
           probe_samples_(probe_samples),
           band_samples_(band_samples),
           row_seconds_(static_cast<std::size_t>(height))
@@ -253,6 +256,9 @@ public:
     // Where the view's image is: its complete passes, and the rows of the next one
     accumulation state() const { return {pass_, row_}; }
 
+    // The round of strata the next launch renders in
+    std::int64_t round() const { return pass_ / round_passes_; }
+
     // A view that renders nothing (max_depth 0) gets there without a launch
     void skip_to(accumulation target)
     {
@@ -261,7 +267,8 @@ public:
     }
 
     // The next launch: as much work as the budget allows, by the times measured so far, and none beyond `target`, which
-    // must be ahead of state()
+    // must be ahead of state(). Its first_pass counts within the round: a launch never spans two rounds, whose samples
+    // draw from different seeds (see round()).
     launch_work next(double budget, accumulation target) const
     {
         // The rows this pass may render: all, unless it is the target's unfinished one
@@ -276,8 +283,9 @@ public:
         if (row_ == 0 && pass_ < target.passes && pass_seconds_ <= budget)
         {
             const double passes =
-                std::min(std::floor(budget / pass_seconds_), static_cast<double>(target.passes - pass_));
-            return {static_cast<int>(pass_), static_cast<int>(passes), 0, height_};
+                std::min({std::floor(budget / pass_seconds_), static_cast<double>(target.passes - pass_),
+                          static_cast<double>(round_passes_ - pass_ % round_passes_)});
+            return {static_cast<int>(pass_ % round_passes_), static_cast<int>(passes), 0, height_};
         }
         int rows = 1;
         double seconds = row_seconds_[static_cast<std::size_t>(row_)];
@@ -318,12 +326,14 @@ private:
     // One pass of a band of `rows` rows from row_, but of at least min_rows_ rows and at most the rows up to end_row
     launch_work band(int rows, int end_row) const
     {
-        return {static_cast<int>(pass_), 1, row_, std::min(std::max(rows, min_rows_), end_row - row_)};
+        return {static_cast<int>(pass_ % round_passes_), 1, row_,
+                std::min(std::max(rows, min_rows_), end_row - row_)};
     }
 
     int width_;
     int height_;
     int min_rows_; // the fewest rows a band has, unless fewer are left: a wave's worth (see above)
+    std::int64_t round_passes_;
     double probe_samples_;
     double band_samples_;
     std::int64_t pass_ = 0; // the first pass not yet complete
@@ -703,10 +713,10 @@ void validate_camera(const camera_desc& camera)
     {
         throw std::runtime_error("the image is too tall for the GPU renderer");
     }
-    // The passes are numbered with ints: at most 46340² = 2,147,395,600 of them
-    if (camera.sqrt_spp < 1 || camera.sqrt_spp > 46340)
+    // A round's passes are numbered with ints: at most 46340² = 2,147,395,600 of them
+    if (camera.sqrt_spp < 1 || camera.sqrt_spp > max_sqrt_spp)
     {
-        throw std::runtime_error("the number of rays per pixel must be from 1 to 46340²");
+        throw std::runtime_error("the side of a pixel's grid of samples must be from 1 to 46340");
     }
 }
 
@@ -1278,7 +1288,8 @@ private:
         kernel_seconds_ = 0;
         camera_ = camera;
         cam_ = cam;
-        planner_.emplace(camera.image_width, camera.image_height, resident_blocks_, probe_samples, band_samples);
+        planner_.emplace(camera.image_width, camera.image_height, resident_blocks_,
+                         std::int64_t{camera.sqrt_spp} * camera.sqrt_spp, probe_samples, band_samples);
     }
 
     // The planner of the view; none after a set_camera that failed
@@ -1312,12 +1323,10 @@ private:
 
     void check_range(accumulation target) const
     {
-        const std::int64_t passes = std::int64_t{cam_.sqrt_spp} * cam_.sqrt_spp;
-        if (target.passes < 0 || target.rows < 0 || target.rows >= cam_.image_height || target.passes > passes ||
-            (target.passes == passes && target.rows > 0))
+        if (target.passes < 0 || target.rows < 0 || target.rows >= cam_.image_height)
         {
-            throw std::invalid_argument("a render target must be a number of passes from 0 to sqrt_spp², and rows "
-                                        "of the next pass from 0 to below the image's height");
+            throw std::invalid_argument("a render target must be a number of passes from 0 up, and rows of the next "
+                                        "pass from 0 to below the image's height");
         }
     }
 
@@ -1331,18 +1340,20 @@ private:
         }
     }
 
-    // One launch: queues the kernel, waits for it and tells the planner how long it took
+    // One launch: queues the kernel, waits for it and tells the planner how long it took. The launch's passes all lie
+    // in one round, whose seed it renders with.
     void run(const launch_work& work, render_report& report)
     {
+        const std::uint64_t seed = options_.seed + static_cast<std::uint64_t>(planner().round()) * round_seed_step;
         start_.record();
         if (first_book_)
         {
-            launch_kernel<Real, kernel_kind::first_book>(cam_, device_.view(), options_.seed, work, sums_.data(),
+            launch_kernel<Real, kernel_kind::first_book>(cam_, device_.view(), seed, work, sums_.data(),
                                                          ray_count_.data());
         }
         else
         {
-            launch_kernel<Real, kernel_kind::all_books>(cam_, device_.view(), options_.seed, work, sums_.data(),
+            launch_kernel<Real, kernel_kind::all_books>(cam_, device_.view(), seed, work, sums_.data(),
                                                         ray_count_.data());
         }
         stop_.record();
@@ -1521,7 +1532,12 @@ render_result render(const scene_desc& scene, const render_options& options)
                          .arithmetic = options.arithmetic,
                          .all_books_kernel = options.all_books_kernel,
                          .launch_seconds = options.launch_seconds});
-    const std::int64_t passes = std::int64_t{scene.camera.sqrt_spp} * scene.camera.sqrt_spp;
+    if (options.passes < 0)
+    {
+        throw std::invalid_argument("a render's passes must be 0 (one round of strata) or more");
+    }
+    const std::int64_t passes =
+        options.passes > 0 ? options.passes : std::int64_t{scene.camera.sqrt_spp} * scene.camera.sqrt_spp;
     std::function<void(std::int64_t)> on_pass;
     if (options.progress)
     {
