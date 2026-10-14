@@ -80,6 +80,8 @@ if(RAYTRACING_VIEWER AND (FETCHCONTENT_SOURCE_DIR_SDL3 OR EXISTS "${sdl3_archive
     FetchContent_MakeAvailable(SDL3)
 
     add_executable(RayTracingViewer src/main_viewer.cpp src/utf8.manifest)
+    # The viewer's own modules: its scripts (viewer_script.ixx)
+    target_sources(RayTracingViewer PRIVATE FILE_SET CXX_MODULES FILES src/viewer_script.ixx)
     target_link_libraries(RayTracingViewer PRIVATE gpu_scene SDL3::SDL3-static)
     target_compile_options(RayTracingViewer PRIVATE /W4)
 elseif(NOT RAYTRACING_VIEWER)

@@ -1,7 +1,8 @@
 // RayTracingViewer: RayTracing's scenes in a window, rendered on the GPU and refined while the view stands still.
 // The scene and the camera come from the same modules as RayTracingGPU's (gpu_scene, view_options), and the GPU renders
 // with a session (gpu/renderer.h) that keeps the scene in its memory and adds samples pass after pass. The image
-// converges to the image RayTracingGPU renders of the same view with the same samples, bit for bit.
+// converges to the image RayTracingGPU renders of the same view with the same samples, bit for bit, and every frame
+// the window shows can be rendered again: --record writes the frames as a script, which --headless renders again.
 // RayTracingViewer final
 //
 // The window comes from SDL 3 (libsdl.org), through its main callbacks: SDL calls SDL_AppInit once, SDL_AppEvent for
@@ -23,7 +24,9 @@ import cli;
 import gpu_scene;
 import image;
 import scenes;
+import vec3;
 import view_options;
+import viewer_script;
 
 namespace
 {
@@ -48,6 +51,10 @@ struct options
     std::optional<std::filesystem::path> frames; // a folder for every frame shown, as PNG
     std::optional<std::filesystem::path> stats;  // a CSV file
     std::optional<double> refresh_hz;            // pace as if the display ran at this rate
+    std::optional<std::filesystem::path> script; // play a camera script
+    bool headless = false;                       // without a window
+    std::optional<std::filesystem::path> record; // write the frames shown as a script
+    std::optional<std::filesystem::path> input;  // scripted mouse, keyboard and window events
     bool help = false;
 };
 
@@ -81,11 +88,18 @@ Options:
   -o, --output FILE    save the image when the window closes: a .png or a .pfm; several -o save
                        several files
       --exit-when-done close the window when the image has its samples (after saving -o)
-      --frames DIR     save every frame the window shows with new samples, as DIR\f00000.png...
+  -h, --help           show this help
+
+Scripts and measurements:
+      --script FILE    play a camera script instead of taking input, then close
+      --headless       no window: play the script, or render the samples; then save and exit
+      --record FILE    write every frame shown with new samples as a script line, to render again
+                       with --headless --script FILE
+      --input FILE     drive the window with scripted keyboard, mouse and window events
+      --frames DIR     save every frame shown with new samples as DIR\f00000.png...
       --stats FILE     write a line of numbers per frame to a CSV file
       --refresh-hz N   pace the frames that follow a resize as if the display ran at N Hz (for
-                       measurements; default: the display's own rate)
-  -h, --help           show this help)",
+                       measurements; default: the display's own rate))",
                  default_viewer_scene, view_usage, max_strata, default_strata,
                  std::numeric_limits<std::uint32_t>::max());
 }
@@ -93,7 +107,7 @@ Options:
 // The options that take a value, besides the view options (is_view_option); the others are flags
 constexpr auto value_options = std::to_array<std::string_view>(
     {"-w", "--width", "-s", "--samples", "--strata", "-p", "--sampling", "--seed", "-o", "--output", "--frames",
-     "--stats", "--refresh-hz"});
+     "--stats", "--script", "--record", "--input", "--refresh-hz"});
 
 std::expected<options, std::string> parse_options(std::span<char* const> args)
 {
@@ -106,10 +120,12 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             opts.help = true;
             continue;
         }
-        if (arg == "--fp64" || arg == "--all-books-kernel" || arg == "--exit-when-done")
+        if (arg == "--fp64" || arg == "--all-books-kernel" || arg == "--exit-when-done" || arg == "--headless")
         {
-            (arg == "--fp64" ? opts.fp64 : arg == "--all-books-kernel" ? opts.all_books_kernel : opts.exit_when_done) =
-                true;
+            (arg == "--fp64"               ? opts.fp64
+             : arg == "--all-books-kernel" ? opts.all_books_kernel
+             : arg == "--headless"         ? opts.headless
+                                           : opts.exit_when_done) = true;
             continue;
         }
         if (!arg.starts_with('-'))
@@ -146,9 +162,13 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             }
             opts.outputs.push_back(std::move(output));
         }
-        else if (arg == "--frames" || arg == "--stats")
+        else if (arg == "--frames" || arg == "--stats" || arg == "--script" || arg == "--record" || arg == "--input")
         {
-            (arg == "--frames" ? opts.frames : opts.stats) = std::filesystem::path(value);
+            (arg == "--frames"   ? opts.frames
+             : arg == "--stats"  ? opts.stats
+             : arg == "--script" ? opts.script
+             : arg == "--record" ? opts.record
+                                 : opts.input) = std::filesystem::path(value);
         }
         else if (arg == "-p" || arg == "--sampling")
         {
@@ -203,7 +223,32 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             }
         }
     }
+    if ((opts.headless || opts.script) && opts.input)
+    {
+        return std::unexpected("--input drives the live window: it can't go with --headless or --script");
+    }
     return opts;
+}
+
+std::expected<std::string, std::string> read_text(const std::filesystem::path& path)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        return std::unexpected(std::format("can't open {}", to_utf8(path)));
+    }
+    std::string text(std::istreambuf_iterator<char>(file), {});
+    // Text from Windows' editors and shells: UTF-8 with a byte order mark (dropped), or UTF-16 (Windows PowerShell's
+    // > and Out-File write it), which isn't read
+    if (text.starts_with("\xEF\xBB\xBF"))
+    {
+        text.erase(0, 3);
+    }
+    else if (text.starts_with("\xFF\xFE") || text.starts_with("\xFE\xFF"))
+    {
+        return std::unexpected(std::format("{} is UTF-16 text: save it as UTF-8", to_utf8(path)));
+    }
+    return text;
 }
 
 // --- Pacing ----------------------------------------------------------------------------------------------------
@@ -244,8 +289,6 @@ double display_refresh_hz(SDL_Window* window)
     return mode && mode->refresh_rate > 0 ? mode->refresh_rate : 60.0;
 }
 
-// --- The window ------------------------------------------------------------------------------------------------
-
 // The size of the window when the options don't give one: the scene's aspect ratio at 720 rows, shrunk to fit 90% of
 // the screen's usable area
 std::pair<int, int> default_size(double aspect, SDL_DisplayID display)
@@ -261,6 +304,52 @@ std::pair<int, int> default_size(double aspect, SDL_DisplayID display)
     }
     return {std::max(64, static_cast<int>(width)), std::max(36, static_cast<int>(height))};
 }
+
+// --- The viewer ------------------------------------------------------------------------------------------------
+
+// The program's own events, registered with SDL when the window opens: one wakes SDL's loop (see iterate), the other
+// carries an `after MS` event of --input: a timer pushes it, its code the event's index in the input, and the main
+// thread performs it (SDL's timers run on a thread of their own)
+Uint32 wake_type = 0;
+Uint32 timed_input_type = 0;
+
+Uint64 SDLCALL timed_input(void* index, SDL_TimerID, Uint64)
+{
+    SDL_Event event{};
+    event.type = timed_input_type;
+    event.user.code = static_cast<Sint32>(reinterpret_cast<std::intptr_t>(index));
+    SDL_PushEvent(&event);
+    return 0; // once
+}
+
+// The modifier a key sets while it is down, for the key events --input pushes
+SDL_Keymod modifier_of(SDL_Scancode key)
+{
+    switch (key)
+    {
+    case SDL_SCANCODE_LSHIFT: return SDL_KMOD_LSHIFT;
+    case SDL_SCANCODE_RSHIFT: return SDL_KMOD_RSHIFT;
+    case SDL_SCANCODE_LCTRL: return SDL_KMOD_LCTRL;
+    case SDL_SCANCODE_RCTRL: return SDL_KMOD_RCTRL;
+    case SDL_SCANCODE_LALT: return SDL_KMOD_LALT;
+    case SDL_SCANCODE_RALT: return SDL_KMOD_RALT;
+    case SDL_SCANCODE_LGUI: return SDL_KMOD_LGUI;
+    case SDL_SCANCODE_RGUI: return SDL_KMOD_RGUI;
+    default: return SDL_KMOD_NONE;
+    }
+}
+
+// What a session renders with, besides its view: a change of any of these builds the scene and the session again
+struct render_settings
+{
+    std::string scene;
+    bool fp64 = false;
+    bool all_books_kernel = false;
+    std::optional<sampling_strategy> sampling; // empty: the scene's own
+    std::uint32_t seed = 0;
+    int strata = default_strata;
+    bool operator==(const render_settings&) const = default;
+};
 
 class viewer
 {
@@ -282,13 +371,16 @@ private:
     int texture_width_ = 0;
     int texture_height_ = 0;
 
+    // The scene, its session and the view
+    render_settings settings_;
     std::optional<gpu_build> build_;
     std::optional<gpu::session> session_;
-    int width_ = 0;                // the image: the window's client area in pixels
+    camera_settings view_;          // the camera's settings: the scene's own view, changed by options or scripts
+    int width_ = 0;                 // the image: the window's client area in pixels
     int height_ = 0;
-    std::uint64_t generation_ = 0; // counts the views: a new one with every camera or size change
-    std::int64_t target_ = 0;      // passes to refine to
-    int pending_width_ = 0;        // a new size from the window, applied at the next iterate
+    std::uint64_t generation_ = 0;  // counts the views: a new one with every camera, size or settings change
+    std::int64_t target_ = 0;       // passes to refine to
+    int pending_width_ = 0;         // a new size from the window, applied at the next iterate
     int pending_height_ = 0;
 
     // The last frame shown, as the session's display() gave it, and its size: what a device reset puts back
@@ -296,6 +388,7 @@ private:
     int shown_width_ = 0;
     int shown_height_ = 0;
     bool present_needed_ = true;
+    bool upload_needed_ = false; // shown_ is newer than the texture
 
     pacing pacing_;
     std::uint64_t start_ns_ = 0;
@@ -306,21 +399,48 @@ private:
     std::uint64_t frames_saved_ = 0;
     std::uint64_t frame_ = 0;
     std::ofstream stats_;
+    std::ofstream record_;
+    std::optional<render_settings> recorded_settings_;
 
-    bool interactive() const { return !opts_.exit_when_done; }
+    // A script being played, and where it is
+    std::vector<script_line> script_;
+    std::size_t script_next_ = 0;
+    int hold_left_ = 0;            // frames left of a hold
+    std::int64_t hold_passes_ = 0; // and the passes each adds
+    std::optional<std::uint64_t> script_generation_; // the last frame line's generation
+    gpu::render_report script_report_; // what rendering the script's last frame did (for --stats)
+
+    // Scripted input: the events, the next `at F` one, and the modifiers and buttons the pushed events hold down
+    std::vector<input_event> input_;
+    std::size_t input_next_ = 0;
+    SDL_Keymod input_mods_ = SDL_KMOD_NONE;
+    SDL_MouseButtonFlags input_buttons_ = 0;
+    float input_x_ = 0;
+    float input_y_ = 0;
+
+    bool interactive() const { return !opts_.exit_when_done && !opts_.script && !opts_.headless && !opts_.input; }
+    bool headless() const { return opts_.headless; }
     SDL_AppResult fail(const std::string& message);
-    camera_settings settings_for(int width, int height) const;
-    gpu::camera_desc camera_for(int width, int height) const;
+    std::expected<void, std::string> use_settings(const render_settings& settings);
+    camera_settings settings_for(const camera_settings& view, int width, int height) const;
+    std::expected<void, std::string> show_view(const camera_settings& view, int width, int height, bool restart);
+    std::expected<void, std::string> size_window(int width, int height);
     std::string gpu_command(std::int64_t passes) const;
-    void set_size(int width, int height);
+    std::expected<void, std::string> keep_frame(std::span<const std::uint8_t> bytes);
+    std::expected<bool, std::string> play_next();
     bool make_texture(int width, int height);
     bool upload_shown();
     bool draw_and_present(bool new_samples);
-    bool save_frame();
+    bool save_frame_from_window();
+    std::expected<void, std::string> save_frame_bytes(std::span<const std::uint8_t> bytes, int width, int height);
     void update_title();
     bool save_outputs();
+    void record_frame();
+    std::expected<void, std::string> send_input(std::uint64_t frame);
+    std::expected<void, std::string> perform(const input_event& e);
     void write_stats(const gpu::render_report& report, bool new_samples, bool presented, bool moving, double wall_ms,
                      double dt_ms);
+    SDL_AppResult run_headless();
 };
 
 viewer::~viewer()
@@ -351,38 +471,138 @@ SDL_AppResult viewer::fail(const std::string& message)
     return SDL_APP_FAILURE;
 }
 
-// The scene's view (with the options' changes) for an image of width × height pixels, with the exact height (see
-// aspect_for_height): the settings RayTracingGPU's options -w width --height height give the scene's camera
-camera_settings viewer::settings_for(int width, int height) const
+// Builds the scene with these settings and a new session for it, unless they are the ones in use. The old session goes
+// first, so the GPU never holds two scenes. A new scene starts at its own view: the options' view on the scene of the
+// command line, the scene's alone on another one; another precision, kernel, sampling, seed or strata keeps the camera.
+// Building a scene starts the random numbers over (see build_gpu_scene), so a scene built again is the same scene.
+std::expected<void, std::string> viewer::use_settings(const render_settings& settings)
 {
-    camera_settings settings = build_->cpu.camera;
+    if (session_ && settings == settings_)
+    {
+        return {};
+    }
+    const bool same_scene = session_ && settings.scene == settings_.scene;
+    const camera_settings kept = view_;
+    session_.reset();
+    const bool own = settings.scene == opts_.scene;
+    auto built = build_gpu_scene(settings.scene, {.sampling = settings.sampling,
+                                                  .view = own ? opts_.view : view_options{},
+                                                  .strata = settings.strata});
+    if (!built)
+    {
+        return std::unexpected(built.error());
+    }
+    build_ = std::move(*built);
+    settings_ = settings;
+    view_ = build_->cpu.camera; // the scene's sampling and samples, with its view
+    if (same_scene)
+    {
+        view_.lookfrom = kept.lookfrom;
+        view_.lookat = kept.lookat;
+        view_.vfov = kept.vfov;
+        view_.defocus_angle = kept.defocus_angle;
+        view_.focus_dist = kept.focus_dist;
+    }
+    gpu::scene_desc desc = build_->desc;
+    desc.camera = to_gpu(camera(settings_for(view_, width_, height_)).frame(), build_->sampling);
+    try
+    {
+        session_.emplace(desc, gpu::session_options{.seed = settings.seed,
+                                                    .arithmetic = settings.fp64 ? gpu::precision::float64
+                                                                                : gpu::precision::float32,
+                                                    .all_books_kernel = settings.all_books_kernel,
+                                                    .launch_seconds = still_seconds,
+                                                    .wait = gpu::wait_mode::sleep});
+    }
+    catch (const std::exception& error)
+    {
+        return std::unexpected(error.what());
+    }
+    ++generation_;
+    // The target: the samples asked for, or the scene's rounded up to whole rounds, so that a finished image never
+    // stops inside a round (whose samples lean toward the top of the pixel, see gpu::session)
+    const std::int64_t round = std::int64_t{settings.strata} * settings.strata;
+    target_ = opts_.samples_per_pixel ? *opts_.samples_per_pixel : (build_->passes + round - 1) / round * round;
+    return {};
+}
+
+// The view's settings for an image of width × height pixels, with the exact height (see aspect_for_height): the
+// settings RayTracingGPU's options -w width --height height give the camera
+camera_settings viewer::settings_for(const camera_settings& view, int width, int height) const
+{
+    camera_settings settings = view;
     settings.image_width = width;
     settings.aspect_ratio = aspect_for_height(width, height);
     return settings;
 }
 
-// The camera the GPU renders with: the CPU's camera computes it from the settings, as for RayTracingGPU
-gpu::camera_desc viewer::camera_for(int width, int height) const
+// Points the session's camera at `view` for an image of width × height pixels. The image starts over when the camera
+// changes, and when `restart` asks for it with the same camera (a recorded frame's new generation); a session left
+// without a view by a failed set_camera gets the camera again.
+std::expected<void, std::string> viewer::show_view(const camera_settings& view, int width, int height, bool restart)
 {
-    return to_gpu(camera(settings_for(width, height)).frame(), build_->sampling);
+    const camera_settings settings = settings_for(view, width, height);
+    if (const auto checked = check_view(settings); !checked)
+    {
+        return checked;
+    }
+    const gpu::camera_desc desc = to_gpu(camera(settings).frame(), build_->sampling);
+    view_ = view;
+    width_ = width;
+    height_ = height;
+    if (restart || !session_->has_view() || !(desc == session_->camera()))
+    {
+        try
+        {
+            session_->set_camera(desc);
+        }
+        catch (const std::exception& error)
+        {
+            return std::unexpected(error.what());
+        }
+        ++generation_;
+    }
+    return {};
+}
+
+// A script's size in the window: the window takes it, or the script stops (its frames would have another size than
+// the script's). Without a window, only the image takes it.
+std::expected<void, std::string> viewer::size_window(int width, int height)
+{
+    if (headless() || (width == width_ && height == height_))
+    {
+        return {};
+    }
+    SDL_SetWindowSize(window_, width, height);
+    SDL_SyncWindow(window_);
+    int w = 0;
+    int h = 0;
+    SDL_GetWindowSizeInPixels(window_, &w, &h);
+    if (w != width || h != height)
+    {
+        return std::unexpected(
+            std::format("the window can't be {}×{} (64×36 to the screen's size): use --headless", width, height));
+    }
+    pending_width_ = 0; // the size changes here, not from the window's event
+    return {};
 }
 
 // The RayTracingGPU command that renders the image of `passes` samples of the view on screen again, bit for bit
 std::string viewer::gpu_command(std::int64_t passes) const
 {
-    std::string command = std::format("RayTracingGPU {} {} -s {} --strata {} --seed {}", opts_.scene,
-                                      format_view(settings_for(width_, height_), height_), passes, opts_.strata,
-                                      opts_.seed);
-    if (opts_.sampling)
+    std::string command = std::format("RayTracingGPU {} {} -s {} --strata {} --seed {}", settings_.scene,
+                                      format_view(settings_for(view_, width_, height_), height_), passes,
+                                      settings_.strata, settings_.seed);
+    if (settings_.sampling)
     {
         command += std::format(" -p {}",
-                               std::ranges::find(sampling_list, *opts_.sampling, &sampling_entry::strategy)->name);
+                               std::ranges::find(sampling_list, *settings_.sampling, &sampling_entry::strategy)->name);
     }
-    if (opts_.fp64)
+    if (settings_.fp64)
     {
         command += " --fp64";
     }
-    if (opts_.all_books_kernel)
+    if (settings_.all_books_kernel)
     {
         command += " --all-books-kernel";
     }
@@ -391,33 +611,120 @@ std::string viewer::gpu_command(std::int64_t passes) const
 
 SDL_AppResult viewer::init()
 {
-    // The scene, built once at its own size, for its aspect ratio. --height alone: the scene's own aspect ratio at that
-    // many rows (the scene is built without it; settings_for gives the camera any size)
+    // The settings of the command line; a script's, up to its first frame, come first (so the session that starts is
+    // the script's, and the window has the script's size from the start)
+    render_settings settings{.scene = std::string(opts_.scene),
+                             .fp64 = opts_.fp64,
+                             .all_books_kernel = opts_.all_books_kernel,
+                             .sampling = opts_.sampling,
+                             .seed = opts_.seed,
+                             .strata = opts_.strata};
+    std::optional<std::pair<int, int>> script_size;
+    if (opts_.script)
+    {
+        const auto text = read_text(*opts_.script);
+        if (!text)
+        {
+            return fail(text.error());
+        }
+        auto parsed = parse_script(*text);
+        if (!parsed)
+        {
+            return fail(std::format("{}: {}", to_utf8(*opts_.script), parsed.error()));
+        }
+        script_ = std::move(*parsed);
+        for (const script_line& line : script_)
+        {
+            const script_command& c = line.command;
+            if (const auto* scene = std::get_if<set_scene>(&c))
+            {
+                if (!find_scene(scene->name))
+                {
+                    return fail(std::format("{}: line {}: unknown scene '{}'", to_utf8(*opts_.script), line.line,
+                                            scene->name));
+                }
+                settings.scene = scene->name;
+            }
+            else if (const auto* size = std::get_if<set_size>(&c))
+            {
+                script_size = {size->width, size->height};
+            }
+            else if (const auto* f = std::get_if<frame>(&c))
+            {
+                script_size = {f->width, f->height};
+                break;
+            }
+            else if (std::holds_alternative<hold>(c) || std::holds_alternative<set_camera>(c))
+            {
+                break;
+            }
+            else if (const auto* seed = std::get_if<set_seed>(&c))
+            {
+                settings.seed = seed->seed;
+            }
+            else if (const auto* strata = std::get_if<set_strata>(&c))
+            {
+                settings.strata = strata->strata;
+            }
+            else if (const auto* precision = std::get_if<set_precision>(&c))
+            {
+                settings.fp64 = precision->fp64;
+            }
+            else if (const auto* kernel = std::get_if<set_kernel>(&c))
+            {
+                settings.all_books_kernel = kernel->all_books;
+            }
+            else if (const auto* sampling = std::get_if<set_sampling>(&c))
+            {
+                settings.sampling = sampling->strategy;
+            }
+        }
+    }
+
+    // The size: the script's, or the options', or (with a window) the default one. --height alone: the scene's own
+    // aspect ratio at that many rows (the scene's size is built without it).
     const bool height_alone = opts_.view.image_height && !opts_.image_width;
     view_options sized = opts_.view;
     if (height_alone)
     {
         sized.image_height.reset();
     }
-    auto built = build_gpu_scene(opts_.scene, {.image_width = opts_.image_width,
-                                               .samples_per_pixel = opts_.samples_per_pixel,
-                                               .sampling = opts_.sampling,
-                                               .view = sized,
-                                               .strata = opts_.strata});
+    const bool own_scene = settings.scene == opts_.scene; // the options' size and view are the command line scene's
+    auto built = build_gpu_scene(settings.scene, {.image_width = own_scene ? opts_.image_width : std::optional<int>{},
+                                                  .samples_per_pixel = opts_.samples_per_pixel,
+                                                  .sampling = settings.sampling,
+                                                  .view = own_scene ? sized : view_options{},
+                                                  .strata = settings.strata});
     if (!built)
     {
         return fail(built.error());
     }
-    build_ = std::move(*built);
-    width_ = build_->frame.image_width;
-    height_ = build_->frame.image_height;
+    width_ = built->frame.image_width;
+    height_ = built->frame.image_height;
     if (height_alone)
     {
         height_ = *opts_.view.image_height;
-        width_ = std::max(1, static_cast<int>(std::lround(height_ * build_->cpu.camera.aspect_ratio)));
+        width_ = std::max(1, static_cast<int>(std::lround(height_ * built->cpu.camera.aspect_ratio)));
     }
-    const bool explicit_size = opts_.image_width || opts_.view.image_height;
-
+    if (script_size)
+    {
+        std::tie(width_, height_) = *script_size;
+    }
+    const bool explicit_size = opts_.image_width || opts_.view.image_height || script_size;
+    if (opts_.input)
+    {
+        const auto text = read_text(*opts_.input);
+        if (!text)
+        {
+            return fail(text.error());
+        }
+        auto parsed = parse_input(*text);
+        if (!parsed)
+        {
+            return fail(std::format("{}: {}", to_utf8(*opts_.input), parsed.error()));
+        }
+        input_ = std::move(*parsed);
+    }
     if (opts_.frames)
     {
         std::error_code error;
@@ -435,91 +742,131 @@ SDL_AppResult viewer::init()
             return fail(std::format("can't write {}", to_utf8(*opts_.stats)));
         }
         stats_ << "frame,wall_ms,dt_ms,gpu_ms,launches,longest_launch_ms,passes,rows,new_samples,presented,moving,"
-                  "generation,width,height,strata\n";
+                  "generation,width,height,strata,time_ms\n";
     }
-
-    // The window: the size of the options, or the default one
-    if (!SDL_Init(SDL_INIT_VIDEO))
+    if (opts_.record)
     {
-        return fail(std::format("SDL couldn't start: {}", SDL_GetError()));
-    }
-    if (!explicit_size)
-    {
-        std::tie(width_, height_) = default_size(build_->cpu.camera.aspect_ratio, SDL_GetPrimaryDisplay());
-    }
-    const int asked_width = width_;
-    const int asked_height = height_;
-    window_ = SDL_CreateWindow(std::format("RayTracingViewer: {}", opts_.scene).c_str(), width_, height_,
-                               SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
-    if (!window_)
-    {
-        return fail(std::format("SDL couldn't open the window: {}", SDL_GetError()));
-    }
-    // Dragged smaller, the window keeps 64×36 pixels at least, or the size asked for if that is smaller
-    SDL_SetWindowMinimumSize(window_, std::min(64, width_), std::min(36, height_));
-    renderer_ = SDL_CreateRenderer(window_, nullptr);
-    if (!renderer_)
-    {
-        return fail(std::format("SDL couldn't create a renderer for the window: {}", SDL_GetError()));
-    }
-    SDL_SyncWindow(window_);
-    if (!SDL_GetWindowSizeInPixels(window_, &width_, &height_))
-    {
-        return fail(std::format("SDL couldn't tell the window's size: {}", SDL_GetError()));
-    }
-    // A size asked for that the screen can't hold: Windows makes the window smaller. Someone watching sees it and goes
-    // on at that size; a run that ends by itself (--exit-when-done) would save another size than the one asked for,
-    // which is an error.
-    if (explicit_size && (width_ != asked_width || height_ != asked_height))
-    {
-        if (!interactive())
+        record_.open(*opts_.record, std::ios::binary);
+        if (!record_)
         {
-            return fail(std::format("the window can't be {}×{} on this screen (it became {}×{})", asked_width,
-                                    asked_height, width_, height_));
+            return fail(std::format("can't write {}", to_utf8(*opts_.record)));
         }
-        std::println("Note: the window can't be {}×{} on this screen; the image is {}×{}", asked_width, asked_height,
-                     width_, height_);
-    }
-    pacing_ = pacing_for(opts_.refresh_hz.value_or(display_refresh_hz(window_)));
-    if (!SDL_SetRenderVSync(renderer_, pacing_for(display_refresh_hz(window_)).vsync) &&
-        !SDL_SetRenderVSync(renderer_, 1))
-    {
-        return fail(std::format("SDL couldn't turn on vsync: {}", SDL_GetError()));
     }
 
-    // The session. Rounds of strata: the target is the samples asked for, or the scene's rounded up to whole rounds,
-    // so that a finished image never stops inside a round (whose samples lean toward the top of the pixel, see
-    // gpu::session).
-    const std::int64_t round = std::int64_t{opts_.strata} * opts_.strata;
-    target_ = opts_.samples_per_pixel ? *opts_.samples_per_pixel : (build_->passes + round - 1) / round * round;
+    if (!headless())
+    {
+        if (!SDL_Init(SDL_INIT_VIDEO))
+        {
+            return fail(std::format("SDL couldn't start: {}", SDL_GetError()));
+        }
+        if (!explicit_size)
+        {
+            std::tie(width_, height_) = default_size(built->cpu.camera.aspect_ratio, SDL_GetPrimaryDisplay());
+        }
+        const int asked_width = width_;
+        const int asked_height = height_;
+        window_ = SDL_CreateWindow(std::format("RayTracingViewer: {}", settings.scene).c_str(), width_, height_,
+                                   SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        if (!window_)
+        {
+            return fail(std::format("SDL couldn't open the window: {}", SDL_GetError()));
+        }
+        // Dragged smaller, the window keeps 64×36 pixels at least, or the size asked for if that is smaller
+        SDL_SetWindowMinimumSize(window_, std::min(64, width_), std::min(36, height_));
+        renderer_ = SDL_CreateRenderer(window_, nullptr);
+        if (!renderer_)
+        {
+            return fail(std::format("SDL couldn't create a renderer for the window: {}", SDL_GetError()));
+        }
+        SDL_SyncWindow(window_);
+        if (!SDL_GetWindowSizeInPixels(window_, &width_, &height_))
+        {
+            return fail(std::format("SDL couldn't tell the window's size: {}", SDL_GetError()));
+        }
+        // A size asked for that the screen can't hold: Windows makes the window smaller. Someone watching sees it and
+        // goes on at that size; a run that ends by itself (--exit-when-done, a script, scripted input) would save or
+        // record another size than the one asked for, which is an error.
+        if (explicit_size && (width_ != asked_width || height_ != asked_height))
+        {
+            if (!interactive())
+            {
+                return fail(std::format("the window can't be {}×{} on this screen (it became {}×{}){}", asked_width,
+                                        asked_height, width_, height_, opts_.input ? "" : ": use --headless"));
+            }
+            std::println("Note: the window can't be {}×{} on this screen; the image is {}×{}", asked_width,
+                         asked_height, width_, height_);
+        }
+        pacing_ = pacing_for(opts_.refresh_hz.value_or(display_refresh_hz(window_)));
+        if (!SDL_SetRenderVSync(renderer_, pacing_for(display_refresh_hz(window_)).vsync) &&
+            !SDL_SetRenderVSync(renderer_, 1))
+        {
+            return fail(std::format("SDL couldn't turn on vsync: {}", SDL_GetError()));
+        }
+        wake_type = SDL_RegisterEvents(2);
+        if (wake_type == 0)
+        {
+            return fail(std::format("SDL has no events left for the program: {}", SDL_GetError()));
+        }
+        timed_input_type = wake_type + 1;
+        // --input: key names SDL knows, and the timers of the `after MS` events
+        for (std::size_t i = 0; i < input_.size(); ++i)
+        {
+            const input_event& e = input_[i];
+            if (!e.key.empty() && SDL_GetKeyFromName(e.key.c_str()) == SDLK_UNKNOWN)
+            {
+                return fail(std::format("{}: line {}: SDL knows no key '{}'", to_utf8(*opts_.input), e.line, e.key));
+            }
+            if (e.after_ms >= 0 &&
+                !SDL_AddTimerNS(static_cast<Uint64>(e.after_ms * 1e6), timed_input,
+                                reinterpret_cast<void*>(static_cast<std::intptr_t>(i))))
+            {
+                return fail(std::format("SDL couldn't start a timer: {}", SDL_GetError()));
+            }
+        }
+    }
+
     try
     {
         gpu::query_device(gpu::wait_mode::sleep);
-        gpu::scene_desc desc = build_->desc;
-        desc.camera = camera_for(width_, height_);
-        session_.emplace(desc, gpu::session_options{.seed = opts_.seed,
-                                                    .arithmetic = opts_.fp64 ? gpu::precision::float64
-                                                                             : gpu::precision::float32,
-                                                    .all_books_kernel = opts_.all_books_kernel,
-                                                    .launch_seconds = still_seconds,
-                                                    .wait = gpu::wait_mode::sleep});
     }
     catch (const std::exception& error)
     {
         return fail(error.what());
     }
+    if (const auto used = use_settings(settings); !used)
+    {
+        return fail(used.error());
+    }
     const auto entry = std::ranges::find(sampling_list, build_->sampling, &sampling_entry::strategy);
-    std::println("Scene: {}, sampling: {}, {} samples per pixel in rounds of {}×{} strata, {}", opts_.scene,
-                 entry->name, target_, opts_.strata, opts_.strata, opts_.fp64 ? "float64" : "float32");
-    std::println("View: {}", format_view(settings_for(width_, height_), height_));
+    const std::string precision = settings_.fp64 ? "float64" : "float32";
+    if (opts_.script)
+    {
+        // The script decides the frames and the views
+        std::println("Scene: {}, sampling: {}, rounds of {}×{} strata, {}", settings_.scene, entry->name,
+                     settings_.strata, settings_.strata, precision);
+    }
+    else
+    {
+        std::println("Scene: {}, sampling: {}, {} samples per pixel in rounds of {}×{} strata, {}", settings_.scene,
+                     entry->name, target_, settings_.strata, settings_.strata, precision);
+        std::println("View: {}", format_view(settings_for(view_, width_, height_), height_));
+    }
     start_ns_ = SDL_GetTicksNS();
     last_iterate_ns_ = start_ns_;
+    if (headless())
+    {
+        return run_headless();
+    }
     moving_until_ns_ = start_ns_ + moving_ns; // the first frames come quickly
     if (!make_texture(width_, height_))
     {
         return SDL_APP_FAILURE;
     }
     update_title();
+    if (const auto sent = send_input(0); !sent)
+    {
+        return fail(sent.error());
+    }
     return SDL_APP_CONTINUE;
 }
 
@@ -541,16 +888,8 @@ bool viewer::make_texture(int width, int height)
     }
     texture_width_ = width;
     texture_height_ = height;
+    upload_needed_ = true;
     return true;
-}
-
-// The window has a new size: the image follows it (a new view of the same camera)
-void viewer::set_size(int width, int height)
-{
-    width_ = std::max(1, width);
-    height_ = std::max(1, height);
-    session_->set_camera(camera_for(width_, height_));
-    ++generation_;
 }
 
 bool viewer::upload_shown()
@@ -564,6 +903,7 @@ bool viewer::upload_shown()
         fail(std::format("SDL couldn't update the image: {}", SDL_GetError()));
         return false;
     }
+    upload_needed_ = false;
     return true;
 }
 
@@ -576,7 +916,7 @@ bool viewer::draw_and_present(bool new_samples)
         const SDL_FRect where{0, 0, static_cast<float>(texture_width_), static_cast<float>(texture_height_)};
         SDL_RenderTexture(renderer_, texture_, nullptr, &where);
     }
-    if (new_samples && opts_.frames && !save_frame())
+    if (new_samples && opts_.frames && !minimized_ && !save_frame_from_window())
     {
         return false;
     }
@@ -588,7 +928,7 @@ bool viewer::draw_and_present(bool new_samples)
 }
 
 // The window's pixels of the image, read back from the renderer before the present, as a PNG
-bool viewer::save_frame()
+bool viewer::save_frame_from_window()
 {
     const SDL_Rect rect{0, 0, shown_width_, shown_height_};
     SDL_Surface* pixels = SDL_RenderReadPixels(renderer_, &rect);
@@ -608,11 +948,31 @@ bool viewer::save_frame()
     return true;
 }
 
+// The display's bytes as a PNG, without a window (--headless): SDL's PNG writer, as for the window's frames
+std::expected<void, std::string> viewer::save_frame_bytes(std::span<const std::uint8_t> bytes, int width, int height)
+{
+    SDL_Surface* surface = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32,
+                                                 const_cast<std::uint8_t*>(bytes.data()), width * 4);
+    if (!surface)
+    {
+        return std::unexpected(std::format("SDL couldn't wrap the frame: {}", SDL_GetError()));
+    }
+    const std::filesystem::path file = *opts_.frames / std::format("f{:05}.png", frames_saved_++);
+    const bool saved = SDL_SavePNG(surface, to_utf8(file).c_str());
+    SDL_DestroySurface(surface);
+    if (!saved)
+    {
+        return std::unexpected(std::format("SDL couldn't save {}: {}", to_utf8(file), SDL_GetError()));
+    }
+    return {};
+}
+
 void viewer::update_title()
 {
     const gpu::accumulation state = session_->state();
-    const std::string title = std::format("RayTracingViewer: {}, {} / {} samples", opts_.scene, state.passes, target_);
-    SDL_SetWindowTitle(window_, title.c_str());
+    SDL_SetWindowTitle(window_, std::format("RayTracingViewer: {}, {} / {} samples", settings_.scene, state.passes,
+                                            target_)
+                                    .c_str());
 }
 
 // The image of complete passes, as RayTracingGPU saves it: a pass in progress is finished first, so the file holds
@@ -662,8 +1022,364 @@ bool viewer::save_outputs()
     }
 }
 
+// A frame with new samples, after display(): kept for the window, and written by --record and by --frames (without a
+// window, or with a minimized one, which presents nothing to read back: from the bytes, which the window shows as they
+// are)
+std::expected<void, std::string> viewer::keep_frame(std::span<const std::uint8_t> bytes)
+{
+    shown_.assign(bytes.begin(), bytes.end());
+    shown_width_ = width_;
+    shown_height_ = height_;
+    upload_needed_ = true;
+    record_frame();
+    if (opts_.frames && (headless() || minimized_))
+    {
+        return save_frame_bytes(bytes, width_, height_);
+    }
+    return {};
+}
+
+// --record: the settings when they change, then the frame
+void viewer::record_frame()
+{
+    if (!record_.is_open())
+    {
+        return;
+    }
+    if (recorded_settings_ != settings_)
+    {
+        record_ << format_settings(settings_.scene, settings_.fp64, settings_.all_books_kernel, settings_.sampling,
+                                   settings_.seed, settings_.strata);
+        recorded_settings_ = settings_;
+    }
+    const gpu::accumulation state = session_->state();
+    record_ << format_frame(state.passes, state.rows, generation_, width_, height_, view_);
+    record_.flush();
+}
+
+// Plays the script up to its next frame and renders it. Returns false when the script is over.
+std::expected<bool, std::string> viewer::play_next()
+{
+    render_settings settings = settings_;
+    while (hold_left_ == 0)
+    {
+        if (script_next_ == script_.size())
+        {
+            return false;
+        }
+        const script_line& line = script_[script_next_++];
+        const auto at = [&](const std::string& message) {
+            return std::unexpected(std::format("{}: line {}: {}", to_utf8(*opts_.script), line.line, message));
+        };
+        if (std::holds_alternative<set_scene>(line.command))
+        {
+            const auto* c = &std::get<set_scene>(line.command);
+            if (!find_scene(c->name))
+            {
+                return at(std::format("unknown scene '{}'", c->name));
+            }
+            settings.scene = c->name;
+        }
+        else if (std::holds_alternative<set_size>(line.command))
+        {
+            const auto* c = &std::get<set_size>(line.command);
+            if (const auto sized = size_window(c->width, c->height); !sized)
+            {
+                return at(sized.error());
+            }
+            if (session_)
+            {
+                if (const auto shown = show_view(view_, c->width, c->height, false); !shown)
+                {
+                    return at(shown.error());
+                }
+            }
+            width_ = c->width;
+            height_ = c->height;
+        }
+        else if (std::holds_alternative<set_seed>(line.command))
+        {
+            const auto* c = &std::get<set_seed>(line.command);
+            settings.seed = c->seed;
+        }
+        else if (std::holds_alternative<set_strata>(line.command))
+        {
+            const auto* c = &std::get<set_strata>(line.command);
+            settings.strata = c->strata;
+        }
+        else if (std::holds_alternative<set_precision>(line.command))
+        {
+            const auto* c = &std::get<set_precision>(line.command);
+            settings.fp64 = c->fp64;
+        }
+        else if (std::holds_alternative<set_kernel>(line.command))
+        {
+            const auto* c = &std::get<set_kernel>(line.command);
+            settings.all_books_kernel = c->all_books;
+        }
+        else if (std::holds_alternative<set_sampling>(line.command))
+        {
+            const auto* c = &std::get<set_sampling>(line.command);
+            settings.sampling = c->strategy;
+        }
+        else if (std::holds_alternative<set_camera>(line.command))
+        {
+            const auto* c = &std::get<set_camera>(line.command);
+            if (const auto used = use_settings(settings); !used)
+            {
+                return at(used.error());
+            }
+            camera_settings view = view_;
+            view.lookfrom = c->view.lookfrom.value_or(view.lookfrom);
+            view.lookat = c->view.lookat.value_or(view.lookat);
+            view.vfov = c->view.vfov.value_or(view.vfov);
+            view.defocus_angle = c->view.defocus_angle.value_or(view.defocus_angle);
+            view.focus_dist = c->view.focus_dist.value_or(view.focus_dist);
+            if (const auto shown = show_view(view, width_, height_, false); !shown)
+            {
+                return at(shown.error());
+            }
+        }
+        else if (std::holds_alternative<hold>(line.command))
+        {
+            const auto* c = &std::get<hold>(line.command);
+            if (const auto used = use_settings(settings); !used)
+            {
+                return at(used.error());
+            }
+            hold_left_ = c->frames;
+            hold_passes_ = c->passes;
+        }
+        else if (std::holds_alternative<frame>(line.command))
+        {
+            const auto* c = &std::get<frame>(line.command);
+            // A recorded frame: that view, at its size, rendered to exactly where the window had it. A new generation
+            // starts the image over even when the camera is the same (the window's R key, or a size changed and back),
+            // and so does a frame behind the image: an image of N passes and R rows is the same whatever came before.
+            if (const auto used = use_settings(settings); !used)
+            {
+                return at(used.error());
+            }
+            if (const auto sized = size_window(c->width, c->height); !sized)
+            {
+                return at(sized.error());
+            }
+            camera_settings view = view_;
+            view.lookfrom = *c->view.lookfrom;
+            view.lookat = *c->view.lookat;
+            view.vfov = *c->view.vfov;
+            view.defocus_angle = *c->view.defocus_angle;
+            view.focus_dist = *c->view.focus_dist;
+            const gpu::accumulation want{c->passes, c->rows};
+            const bool restart =
+                !script_generation_ || c->generation != *script_generation_ || want < session_->state();
+            script_generation_ = c->generation;
+            if (const auto shown = show_view(view, c->width, c->height, restart); !shown)
+            {
+                return at(shown.error());
+            }
+            try
+            {
+                script_report_ = session_->render_to(want);
+                if (const auto kept = keep_frame(session_->display()); !kept)
+                {
+                    return at(kept.error());
+                }
+            }
+            catch (const std::exception& error)
+            {
+                return at(error.what());
+            }
+            return true;
+        }
+    }
+    // A frame of a hold
+    --hold_left_;
+    try
+    {
+        const gpu::accumulation now = session_->state();
+        script_report_ = session_->render_to({now.passes + hold_passes_, 0});
+        if (const auto kept = keep_frame(session_->display()); !kept)
+        {
+            return std::unexpected(kept.error());
+        }
+    }
+    catch (const std::exception& error)
+    {
+        return std::unexpected(std::format("{}: {}", to_utf8(*opts_.script), error.what()));
+    }
+    return true;
+}
+
+// --headless: everything here, without a window; SDL_AppInit's result ends the program
+SDL_AppResult viewer::run_headless()
+{
+    try
+    {
+        // --stats: a row per frame, its time from the end of the frame before (dt) and its own (wall)
+        const auto row = [&](const gpu::render_report& report, std::uint64_t start) {
+            const std::uint64_t now = SDL_GetTicksNS();
+            write_stats(report, true, false, false, static_cast<double>(now - start) / 1e6,
+                        static_cast<double>(now - last_iterate_ns_) / 1e6);
+            last_iterate_ns_ = now;
+            ++frame_;
+        };
+        if (opts_.script)
+        {
+            while (true)
+            {
+                const std::uint64_t start = SDL_GetTicksNS();
+                const auto played = play_next();
+                if (!played)
+                {
+                    return fail(played.error());
+                }
+                if (!*played)
+                {
+                    break;
+                }
+                row(script_report_, start);
+            }
+        }
+        else
+        {
+            const std::uint64_t start = SDL_GetTicksNS();
+            const gpu::render_report report = session_->render_to({target_, 0});
+            if (const auto kept = keep_frame(session_->display()); !kept)
+            {
+                return fail(kept.error());
+            }
+            row(report, start);
+            // As RayTracingGPU counts them: a ray is a search for the closest hit, so per sample it is the average
+            // length of a path; the speed is that of the whole render
+            const double rays = static_cast<double>(session_->rays());
+            const double samples = static_cast<double>(width_) * height_ * static_cast<double>(target_);
+            const double seconds = static_cast<double>(SDL_GetTicksNS() - start) / 1e9;
+            std::println("Rays traced: {:.1f} million ({:.2f} per sample), {:.1f} million per second", rays / 1e6,
+                         rays / samples, rays / seconds / 1e6);
+        }
+        const gpu::accumulation state = session_->state();
+        std::println("Done: {} samples per pixel, {}×{}, {:.2f} s", state.passes, width_, height_,
+                     static_cast<double>(SDL_GetTicksNS() - start_ns_) / 1e9);
+        return save_outputs() ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+    }
+    catch (const std::exception& error)
+    {
+        return fail(error.what());
+    }
+}
+
+// --input: the `at F` events of the frame about to come, sent before it (the `after MS` ones come from their timers)
+std::expected<void, std::string> viewer::send_input(std::uint64_t frame)
+{
+    while (input_next_ < input_.size() && (input_[input_next_].at_frame < 0 ||
+                                           static_cast<std::uint64_t>(input_[input_next_].at_frame) <= frame))
+    {
+        const input_event& e = input_[input_next_++];
+        if (e.at_frame >= 0)
+        {
+            if (const auto performed = perform(e); !performed)
+            {
+                return performed;
+            }
+        }
+    }
+    return {};
+}
+
+// An input event as SDL would send it: keys by name (the same key on any keyboard layout) with the modifiers the pushed
+// events hold down, the mouse with its position and buttons; a resize resizes the window itself
+std::expected<void, std::string> viewer::perform(const input_event& e)
+{
+    SDL_Event event{};
+    const SDL_WindowID window = SDL_GetWindowID(window_);
+    switch (e.kind)
+    {
+    case input_kind::resize:
+        // A real resize of the window, whose events then come as from a user's drag
+        if (!SDL_SetWindowSize(window_, static_cast<int>(e.x), static_cast<int>(e.y)))
+        {
+            return std::unexpected(std::format("{}: line {}: SDL couldn't resize the window: {}",
+                                               to_utf8(*opts_.input), e.line, SDL_GetError()));
+        }
+        SDL_SyncWindow(window_);
+        return {};
+    case input_kind::device_reset:
+        event.type = SDL_EVENT_RENDER_DEVICE_RESET;
+        break;
+    case input_kind::quit:
+        event.type = SDL_EVENT_QUIT;
+        break;
+    case input_kind::key_down:
+    case input_kind::key_up:
+    {
+        const bool down = e.kind == input_kind::key_down;
+        event.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+        event.key.windowID = window;
+        event.key.key = SDL_GetKeyFromName(e.key.c_str());
+        event.key.scancode = SDL_GetScancodeFromName(e.key.c_str());
+        if (event.key.scancode == SDL_SCANCODE_UNKNOWN)
+        {
+            event.key.scancode = SDL_GetScancodeFromKey(event.key.key, nullptr);
+        }
+        const SDL_Keymod modifier = modifier_of(event.key.scancode);
+        input_mods_ = down ? static_cast<SDL_Keymod>(input_mods_ | modifier)
+                           : static_cast<SDL_Keymod>(input_mods_ & ~modifier);
+        event.key.mod = input_mods_;
+        event.key.down = down;
+        break;
+    }
+    case input_kind::mouse_down:
+    case input_kind::mouse_up:
+    {
+        const bool down = e.kind == input_kind::mouse_down;
+        event.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+        event.button.windowID = window;
+        event.button.button = static_cast<Uint8>(e.button);
+        event.button.down = down;
+        event.button.clicks = static_cast<Uint8>(e.clicks);
+        event.button.x = input_x_ = static_cast<float>(e.x);
+        event.button.y = input_y_ = static_cast<float>(e.y);
+        const SDL_MouseButtonFlags mask = SDL_BUTTON_MASK(e.button);
+        input_buttons_ = down ? input_buttons_ | mask : input_buttons_ & ~mask;
+        break;
+    }
+    case input_kind::mouse_move:
+        event.type = SDL_EVENT_MOUSE_MOTION;
+        event.motion.windowID = window;
+        event.motion.state = input_buttons_;
+        event.motion.x = input_x_ = static_cast<float>(e.x);
+        event.motion.y = input_y_ = static_cast<float>(e.y);
+        event.motion.xrel = static_cast<float>(e.dx);
+        event.motion.yrel = static_cast<float>(e.dy);
+        break;
+    case input_kind::wheel:
+        event.type = SDL_EVENT_MOUSE_WHEEL;
+        event.wheel.windowID = window;
+        event.wheel.y = static_cast<float>(e.dy);
+        event.wheel.integer_y = static_cast<Sint32>(e.dy);
+        event.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+        event.wheel.mouse_x = input_x_;
+        event.wheel.mouse_y = input_y_;
+        break;
+    }
+    if (!SDL_PushEvent(&event))
+    {
+        return std::unexpected(std::format("{}: line {}: SDL couldn't send the event: {}", to_utf8(*opts_.input),
+                                           e.line, SDL_GetError()));
+    }
+    return {};
+}
+
 SDL_AppResult viewer::event(const SDL_Event& e)
 {
+    if (e.type == timed_input_type && timed_input_type != 0)
+    {
+        if (const auto performed = perform(input_[static_cast<std::size_t>(e.user.code)]); !performed)
+        {
+            return fail(performed.error());
+        }
+    }
     switch (e.type)
     {
     case SDL_EVENT_QUIT:
@@ -675,8 +1391,11 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         }
         break;
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
-        pending_width_ = e.window.data1;
-        pending_height_ = e.window.data2;
+        if (!opts_.script) // a script sets the size itself
+        {
+            pending_width_ = e.window.data1;
+            pending_height_ = e.window.data2;
+        }
         moving_until_ns_ = SDL_GetTicksNS() + moving_ns;
         break;
     case SDL_EVENT_WINDOW_MOVED:
@@ -734,38 +1453,63 @@ SDL_AppResult viewer::iterate()
     last_iterate_ns_ = now;
     try
     {
-        if (pending_width_ > 0 && (pending_width_ != width_ || pending_height_ != height_))
-        {
-            set_size(pending_width_, pending_height_);
-        }
-        pending_width_ = 0;
         gpu::render_report report;
         bool new_samples = false;
         bool presented = false;
-        const bool moving = now < moving_until_ns_;
+        bool moving = false;
+        bool done = false;
         // Minimized, a window someone watches waits to be restored; a run that ends by itself goes on
         const bool minimized_pause = minimized_ && interactive();
-        if (!minimized_pause && session_->state().passes < target_)
+        if (opts_.script)
         {
-            const double budget = moving ? moving_share * pacing_.frame_seconds : still_seconds;
-            report = session_->render_for(budget, target_);
-            const std::span<const std::uint8_t> bytes = session_->display();
-            shown_.assign(bytes.begin(), bytes.end());
-            shown_width_ = width_;
-            shown_height_ = height_;
-            new_samples = true;
+            // A script's frames, one per iterate, rendered to where the script says whatever the time
+            const auto played = play_next();
+            if (!played)
+            {
+                return fail(played.error());
+            }
+            new_samples = *played;
+            done = !*played;
+            if (new_samples)
+            {
+                report = script_report_;
+            }
+        }
+        else
+        {
+            if (pending_width_ > 0 && (pending_width_ != width_ || pending_height_ != height_))
+            {
+                if (const auto shown = show_view(view_, pending_width_, pending_height_, false); !shown)
+                {
+                    return fail(shown.error());
+                }
+            }
+            pending_width_ = 0;
+            moving = now < moving_until_ns_;
+            if (!minimized_pause && session_->state().passes < target_)
+            {
+                const double budget = moving ? moving_share * pacing_.frame_seconds : still_seconds;
+                report = session_->render_for(budget, target_);
+                if (const auto kept = keep_frame(session_->display()); !kept)
+                {
+                    return fail(kept.error());
+                }
+                new_samples = true;
+            }
+            done = session_->state().passes >= target_;
+        }
+        if (new_samples)
+        {
             present_needed_ = true;
         }
         if (present_needed_ && !minimized_)
         {
-            if (shown_width_ != texture_width_ || shown_height_ != texture_height_)
+            if (!shown_.empty() && (shown_width_ != texture_width_ || shown_height_ != texture_height_) &&
+                !make_texture(shown_width_, shown_height_))
             {
-                if (!shown_.empty() && !make_texture(shown_width_, shown_height_))
-                {
-                    return SDL_APP_FAILURE;
-                }
+                return SDL_APP_FAILURE;
             }
-            if ((new_samples && !upload_shown()) || !draw_and_present(new_samples))
+            if ((upload_needed_ && !upload_shown()) || !draw_and_present(new_samples))
             {
                 return SDL_APP_FAILURE;
             }
@@ -775,20 +1519,24 @@ SDL_AppResult viewer::iterate()
         const double wall_ms = static_cast<double>(SDL_GetTicksNS() - now) / 1e6;
         write_stats(report, new_samples, presented, moving, wall_ms, dt_ms);
         ++frame_;
-        const bool done = session_->state().passes >= target_;
+        if (const auto sent = send_input(frame_); !sent)
+        {
+            return fail(sent.error());
+        }
         if (done && !done_reported_)
         {
             done_reported_ = true;
-            std::println("Done: {} samples per pixel in {:.2f} s", target_,
+            std::println("Done: {} samples per pixel in {:.2f} s", session_->state().passes,
                          static_cast<double>(SDL_GetTicksNS() - start_ns_) / 1e9);
-            if (opts_.exit_when_done)
+            if (opts_.exit_when_done || opts_.script)
             {
                 return save_outputs() ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
             }
         }
         // Nothing to render and nothing new to show (or nowhere to show it): SDL waits for the next event before it
-        // calls iterate again, and the program sleeps
-        if ((minimized_pause || (done && !present_needed_)) && pending_width_ == 0)
+        // calls iterate again, and the program sleeps (not while scripted input waits for its frames; the timers of
+        // the `after MS` events end the wait themselves)
+        if ((minimized_pause || (done && !present_needed_)) && pending_width_ == 0 && input_next_ == input_.size())
         {
             SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "waitevent");
         }
@@ -799,7 +1547,7 @@ SDL_AppResult viewer::iterate()
             // event out of the queue, so when the drag ends the wait would go on, the image half refined, until the
             // next event. An event of our own ends it.
             SDL_Event wake{};
-            wake.type = SDL_EVENT_USER;
+            wake.type = wake_type;
             SDL_PushEvent(&wake);
         }
     }
@@ -810,8 +1558,9 @@ SDL_AppResult viewer::iterate()
     return SDL_APP_CONTINUE;
 }
 
-// --stats: a row per iterate. new_samples: the frame has samples the one before didn't (the frames --frames saves);
-// presented: the window was drawn and presented; moving: the frame had a moving view's budget.
+// --stats: a row per frame. new_samples: the frame has samples the one before didn't (the frames --frames saves);
+// presented: the window was drawn and presented; moving: the frame had a moving view's budget; time_ms: when the row
+// was written, from the start (the times of --input's `after MS` events count from there too).
 void viewer::write_stats(const gpu::render_report& report, bool new_samples, bool presented, bool moving,
                          double wall_ms, double dt_ms)
 {
@@ -820,10 +1569,10 @@ void viewer::write_stats(const gpu::render_report& report, bool new_samples, boo
         return;
     }
     const gpu::accumulation state = session_->state();
-    stats_ << std::format("{},{:.3f},{:.3f},{:.3f},{},{:.3f},{},{},{},{},{},{},{},{},{}\n", frame_, wall_ms, dt_ms,
-                          report.gpu_seconds * 1e3, report.launches, report.longest_launch_seconds * 1e3, state.passes,
-                          state.rows, new_samples ? 1 : 0, presented ? 1 : 0, moving ? 1 : 0, generation_, width_,
-                          height_, opts_.strata);
+    stats_ << std::format("{},{:.3f},{:.3f},{:.3f},{},{:.3f},{},{},{},{},{},{},{},{},{},{:.3f}\n", frame_, wall_ms,
+                          dt_ms, report.gpu_seconds * 1e3, report.launches, report.longest_launch_seconds * 1e3,
+                          state.passes, state.rows, new_samples ? 1 : 0, presented ? 1 : 0, moving ? 1 : 0, generation_,
+                          width_, height_, settings_.strata, static_cast<double>(SDL_GetTicksNS() - start_ns_) / 1e6);
     stats_.flush(); // a run that is stopped still leaves its lines
 }
 }

@@ -1,0 +1,614 @@
+// Module viewer_script: the window's camera scripts and input files, as text. A script says what to render, frame by
+// frame: RayTracingViewer --script plays one in the window, and --headless renders one without a window. --record
+// writes what the window showed as a script, which --headless renders again bit for bit. An input file (--input)
+// drives the window with scripted keyboard, mouse and window events, for tests. Nothing here knows SDL or the GPU: the
+// module only reads and writes the text.
+export module viewer_script;
+
+import std;
+import camera;
+import cli;
+import vec3;
+
+// --- Scripts -------------------------------------------------------------------------------------------------------
+//
+// One command per line; # starts a comment. Settings stay until changed:
+//   scene NAME | size W H | seed S | strata K | precision float|double | kernel auto|all-books |
+//   sampling NAME|scene
+//   camera [lookfrom "X,Y,Z"] [lookat "X,Y,Z"] [vfov D] [defocus-angle D] [focus-dist D]   (the view, changed)
+// The camera stays when another setting changes; a new scene starts at its own view.
+// Frames:
+//   hold F +N    F frames of the view as it is, each with N more complete passes than the frame before (N from 1)
+//   frame N R gen G size W H lookfrom "X,Y,Z" lookat "X,Y,Z" vfov D defocus-angle D focus-dist D
+//                one frame: that view at N complete passes (from 1) and R rows of the next one (below H); G numbers
+//                the views, a new G starting the image over even for the same camera (what --record writes, one line
+//                per frame shown with new samples)
+// A script ends with a frame: lines after its last hold or frame would render nothing, and are an error.
+
+// The most passes a frame may have: as many as RayTracingGPU's -s
+export constexpr std::int64_t max_script_passes = std::numeric_limits<int>::max();
+
+// The view's fields a script may set; what is empty stays as it was
+export struct view_change
+{
+    std::optional<point3> lookfrom;
+    std::optional<point3> lookat;
+    std::optional<double> vfov;
+    std::optional<double> defocus_angle;
+    std::optional<double> focus_dist;
+};
+
+export struct set_scene { std::string name; };
+export struct set_size { int width; int height; };
+export struct set_seed { std::uint32_t seed; };
+export struct set_strata { int strata; };
+export struct set_precision { bool fp64; };
+export struct set_kernel { bool all_books; };
+export struct set_sampling { std::optional<sampling_strategy> strategy; }; // empty: the scene's own
+export struct set_camera { view_change view; };
+export struct hold { int frames; std::int64_t passes; };
+export struct frame
+{
+    std::int64_t passes;
+    int rows;
+    std::uint64_t generation;
+    int width;
+    int height;
+    view_change view; // all set
+};
+
+export using script_command =
+    std::variant<set_scene, set_size, set_seed, set_strata, set_precision, set_kernel, set_sampling, set_camera, hold,
+                 frame>;
+
+export struct script_line
+{
+    int line; // in the file, from 1, for messages
+    script_command command;
+};
+
+namespace
+{
+// The words of a line, without its comment; a quoted word ("1,2,3", as format_view writes points) loses its quotes
+std::vector<std::string_view> words(std::string_view line)
+{
+    if (const std::size_t hash = line.find('#'); hash != std::string_view::npos)
+    {
+        line = line.substr(0, hash);
+    }
+    std::vector<std::string_view> result;
+    std::size_t i = 0;
+    while (i < line.size())
+    {
+        while (i < line.size() && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r'))
+        {
+            ++i;
+        }
+        if (i == line.size())
+        {
+            break;
+        }
+        std::size_t end = i;
+        while (end < line.size() && line[end] != ' ' && line[end] != '\t' && line[end] != '\r')
+        {
+            ++end;
+        }
+        std::string_view word = line.substr(i, end - i);
+        if (word.size() >= 2 && word.front() == '"' && word.back() == '"')
+        {
+            word = word.substr(1, word.size() - 2);
+        }
+        result.push_back(word);
+        i = end;
+    }
+    return result;
+}
+
+std::optional<double> finite_number(std::string_view text)
+{
+    const std::optional<double> value = parse_number<double>(text);
+    return value && std::isfinite(*value) ? value : std::nullopt;
+}
+
+std::optional<point3> point(std::string_view text)
+{
+    std::array<double, 3> xyz{};
+    std::size_t start = 0;
+    for (std::size_t k = 0; k < 3; ++k)
+    {
+        const std::size_t comma = k < 2 ? text.find(',', start) : text.size();
+        if (comma == std::string_view::npos)
+        {
+            return std::nullopt;
+        }
+        const std::optional<double> value = finite_number(text.substr(start, comma - start));
+        if (!value)
+        {
+            return std::nullopt;
+        }
+        xyz[k] = *value;
+        start = comma + 1;
+    }
+    return point3{xyz[0], xyz[1], xyz[2]};
+}
+
+// Reads `name value` pairs of view fields from w[from...] into view; returns the index of the first word it doesn't
+// know, or an error
+std::expected<std::size_t, std::string> view_fields(std::span<const std::string_view> w, std::size_t from,
+                                                    view_change& view)
+{
+    std::size_t i = from;
+    while (i + 1 < w.size())
+    {
+        const std::string_view key = w[i];
+        const std::string_view value = w[i + 1];
+        if (key == "lookfrom" || key == "lookat")
+        {
+            const std::optional<point3> p = point(value);
+            if (!p)
+            {
+                return std::unexpected(std::format("{} needs a point X,Y,Z, not '{}'", key, value));
+            }
+            (key == "lookfrom" ? view.lookfrom : view.lookat) = p;
+        }
+        else if (key == "vfov" || key == "defocus-angle" || key == "focus-dist")
+        {
+            const std::optional<double> number = finite_number(value);
+            if (!number)
+            {
+                return std::unexpected(std::format("{} needs a number, not '{}'", key, value));
+            }
+            (key == "vfov" ? view.vfov : key == "defocus-angle" ? view.defocus_angle : view.focus_dist) = number;
+        }
+        else
+        {
+            break;
+        }
+        i += 2;
+    }
+    return i;
+}
+
+// A number of passes from 1 to max_script_passes
+std::optional<std::int64_t> passes_number(std::string_view text)
+{
+    const std::optional<std::int64_t> n = parse_number<std::int64_t>(text);
+    return n && *n >= 1 && *n <= max_script_passes ? n : std::nullopt;
+}
+
+std::expected<script_command, std::string> command(std::span<const std::string_view> w)
+{
+    const std::string_view verb = w[0];
+    const auto count = [&](std::size_t n) -> std::expected<void, std::string> {
+        if (w.size() != n)
+        {
+            return std::unexpected(std::format("'{}' takes {} value{}", verb, n - 1, n == 2 ? "" : "s"));
+        }
+        return {};
+    };
+    const auto positive = [](std::string_view text) { return parse_positive_int(text); };
+    if (verb == "scene")
+    {
+        if (auto ok = count(2); !ok)
+        {
+            return std::unexpected(ok.error());
+        }
+        return set_scene{std::string(w[1])};
+    }
+    if (verb == "size")
+    {
+        if (auto ok = count(3); !ok)
+        {
+            return std::unexpected(ok.error());
+        }
+        const auto width = positive(w[1]);
+        const auto height = positive(w[2]);
+        if (!width || !height)
+        {
+            return std::unexpected("size needs a width and a height greater than zero");
+        }
+        return set_size{*width, *height};
+    }
+    if (verb == "seed")
+    {
+        const std::optional<std::uint32_t> seed = w.size() == 2 ? parse_number<std::uint32_t>(w[1]) : std::nullopt;
+        if (!seed)
+        {
+            return std::unexpected("seed needs an integer from 0 to 4294967295");
+        }
+        return set_seed{*seed};
+    }
+    if (verb == "strata")
+    {
+        // 46340: the renderer's limit (gpu::max_sqrt_spp, which this module, knowing no GPU, doesn't import)
+        const auto strata = w.size() == 2 ? positive(w[1]) : std::nullopt;
+        if (!strata || *strata > 46340)
+        {
+            return std::unexpected("strata needs an integer from 1 to 46340");
+        }
+        return set_strata{*strata};
+    }
+    if (verb == "precision")
+    {
+        if (w.size() != 2 || (w[1] != "float" && w[1] != "double"))
+        {
+            return std::unexpected("precision is float or double");
+        }
+        return set_precision{w[1] == "double"};
+    }
+    if (verb == "kernel")
+    {
+        if (w.size() != 2 || (w[1] != "auto" && w[1] != "all-books"))
+        {
+            return std::unexpected("kernel is auto or all-books");
+        }
+        return set_kernel{w[1] == "all-books"};
+    }
+    if (verb == "sampling")
+    {
+        if (w.size() == 2 && w[1] == "scene")
+        {
+            return set_sampling{};
+        }
+        const auto it = w.size() == 2 ? std::ranges::find(sampling_list, w[1], &sampling_entry::name)
+                                      : sampling_list.end();
+        if (it == sampling_list.end())
+        {
+            return std::unexpected("sampling needs a strategy's name, or scene");
+        }
+        return set_sampling{it->strategy};
+    }
+    if (verb == "camera")
+    {
+        set_camera result;
+        const auto end = view_fields(w, 1, result.view);
+        if (!end)
+        {
+            return std::unexpected(end.error());
+        }
+        if (*end != w.size())
+        {
+            return std::unexpected(std::format("camera doesn't know '{}'", w[*end]));
+        }
+        return result;
+    }
+    if (verb == "hold")
+    {
+        const auto frames = w.size() == 3 ? positive(w[1]) : std::nullopt;
+        const auto passes = w.size() == 3 && w[2].starts_with('+') ? passes_number(w[2].substr(1)) : std::nullopt;
+        if (!frames || !passes)
+        {
+            return std::unexpected(std::format("hold needs F +N: a number of frames, and the passes each adds (+1 to "
+                                               "+{})",
+                                               max_script_passes));
+        }
+        return hold{*frames, *passes};
+    }
+    if (verb == "frame")
+    {
+        // frame N R gen G size W H <view fields>
+        const std::string why = std::format("frame needs N R gen G size W H and the view's five fields: N passes from "
+                                            "1 to {}, R rows below H",
+                                            max_script_passes);
+        if (w.size() < 9 || w[3] != "gen" || w[5] != "size")
+        {
+            return std::unexpected(why);
+        }
+        const std::optional<std::int64_t> passes = passes_number(w[1]);
+        const std::optional<int> rows = parse_number<int>(w[2]);
+        const std::optional<std::uint64_t> generation = parse_number<std::uint64_t>(w[4]);
+        const auto width = positive(w[6]);
+        const auto height = positive(w[7]);
+        if (!passes || !rows || !generation || !width || !height || *rows < 0 || *rows >= *height)
+        {
+            return std::unexpected(why);
+        }
+        frame result{.passes = *passes, .rows = *rows, .generation = *generation, .width = *width, .height = *height};
+        const auto end = view_fields(w, 8, result.view);
+        if (!end)
+        {
+            return std::unexpected(end.error());
+        }
+        if (*end != w.size())
+        {
+            return std::unexpected(std::format("frame doesn't know '{}'", w[*end]));
+        }
+        const view_change& v = result.view;
+        if (!v.lookfrom || !v.lookat || !v.vfov || !v.defocus_angle || !v.focus_dist)
+        {
+            return std::unexpected("frame needs all five view fields: lookfrom, lookat, vfov, defocus-angle and "
+                                   "focus-dist");
+        }
+        return result;
+    }
+    return std::unexpected(std::format("unknown command '{}'", verb));
+}
+}
+
+// The commands of a script, or the first error with its line number
+export std::expected<std::vector<script_line>, std::string> parse_script(std::string_view text)
+{
+    std::vector<script_line> result;
+    int number = 0;
+    for (const auto line : std::views::split(text, '\n'))
+    {
+        ++number;
+        const std::vector<std::string_view> w = words(std::string_view(line.begin(), line.end()));
+        if (w.empty())
+        {
+            continue;
+        }
+        auto parsed = command(w);
+        if (!parsed)
+        {
+            return std::unexpected(std::format("line {}: {}", number, parsed.error()));
+        }
+        result.push_back({number, std::move(*parsed)});
+    }
+    const auto renders = [](const script_line& l) {
+        return std::holds_alternative<hold>(l.command) || std::holds_alternative<frame>(l.command);
+    };
+    const auto last = std::ranges::find_if(result.rbegin(), result.rend(), renders);
+    if (last == result.rend())
+    {
+        return std::unexpected("the script renders nothing: it has no hold or frame line");
+    }
+    if (last != result.rbegin())
+    {
+        return std::unexpected(std::format("line {}: nothing is rendered after this line (a script ends with a hold or "
+                                           "a frame)",
+                                           (last - 1)->line));
+    }
+    return result;
+}
+
+// --- What --record writes ------------------------------------------------------------------------------------------
+
+namespace
+{
+// A point as format_view writes it: shortest round trip, quoted
+std::string quoted(const point3& p)
+{
+    return std::format("\"{},{},{}\"", p.x, p.y, p.z);
+}
+}
+
+// The settings lines that start a recording, and that follow a change of settings
+export std::string format_settings(std::string_view scene, bool fp64, bool all_books,
+                                   std::optional<sampling_strategy> s, std::uint32_t seed, int strata)
+{
+    const std::string strategy =
+        s ? std::string(std::ranges::find(sampling_list, *s, &sampling_entry::strategy)->name) : std::string("scene");
+    return std::format("scene {}\nprecision {}\nkernel {}\nsampling {}\nseed {}\nstrata {}\n", scene,
+                       fp64 ? "double" : "float", all_books ? "all-books" : "auto", strategy, seed, strata);
+}
+
+// One frame shown: its view (from the camera's settings) and how far it was rendered
+export std::string format_frame(std::int64_t passes, int rows, std::uint64_t generation, int width, int height,
+                                const camera_settings& view)
+{
+    return std::format("frame {} {} gen {} size {} {} lookfrom {} lookat {} vfov {} defocus-angle {} focus-dist {}\n",
+                       passes, rows, generation, width, height, quoted(view.lookfrom), quoted(view.lookat), view.vfov,
+                       view.defocus_angle, view.focus_dist);
+}
+
+// --- Input files ---------------------------------------------------------------------------------------------------
+//
+// One event per line, when to send it:
+//   at F EVENT     before frame F (the window's F-th iterate, from 0); F never smaller than the line before's
+//   after MS EVENT MS milliseconds after the window opened, from a timer, whatever the frames (for latency
+//                  measurements: the window may be waiting for an event then)
+// Events:
+//   key NAME | key-down NAME | key-up NAME          (NAME as SDL names keys: W, Escape, Left Shift...)
+//   mouse-down left|middle|right X Y [CLICKS] | mouse-up left|middle|right X Y [CLICKS] | mouse-move X Y DX DY
+//   wheel DY [shift|ctrl]                           (a modifier is pressed around the wheel step)
+//   resize W H | device-reset | quit
+
+export enum class input_kind
+{
+    key_down,
+    key_up,
+    mouse_down,
+    mouse_up,
+    mouse_move,
+    wheel,
+    resize,
+    device_reset,
+    quit,
+};
+
+export struct input_event
+{
+    int line;
+    std::int64_t at_frame = -1; // at F, or -1 for after MS
+    double after_ms = -1;       // after MS, or -1 for at F
+    input_kind kind;
+    std::string key;    // keys: SDL's name of the key
+    int button = 0;     // mouse: 1 left, 2 middle, 3 right (SDL's numbers)
+    double x = 0;       // mouse: the position; resize: the width
+    double y = 0;       // mouse: the position; resize: the height
+    double dx = 0;      // mouse-move: the motion
+    double dy = 0;      // mouse-move: the motion; wheel: the steps
+    int clicks = 1;     // mouse-down, mouse-up
+};
+
+export std::expected<std::vector<input_event>, std::string> parse_input(std::string_view text)
+{
+    std::vector<input_event> result;
+    int number = 0;
+    std::int64_t last_frame = 0;
+    const auto button = [](std::string_view name) {
+        return name == "left" ? 1 : name == "middle" ? 2 : name == "right" ? 3 : 0;
+    };
+    for (const auto line : std::views::split(text, '\n'))
+    {
+        ++number;
+        const std::vector<std::string_view> w = words(std::string_view(line.begin(), line.end()));
+        if (w.empty())
+        {
+            continue;
+        }
+        const auto fail = [&](std::string_view why) {
+            return std::unexpected(std::format("line {}: {}", number, why));
+        };
+        if (w.size() < 3 || (w[0] != "at" && w[0] != "after"))
+        {
+            return fail("an event starts with 'at FRAME' or 'after MS'");
+        }
+        input_event e{.line = number};
+        if (w[0] == "at")
+        {
+            const auto f = parse_number<std::int64_t>(w[1]);
+            if (!f || *f < 0)
+            {
+                return fail("at needs a frame number from 0");
+            }
+            if (*f < last_frame)
+            {
+                return fail(std::format("at {} comes after an event at frame {}: the frames go in order", *f,
+                                        last_frame));
+            }
+            e.at_frame = last_frame = *f;
+        }
+        else
+        {
+            const auto ms = finite_number(w[1]);
+            if (!ms || *ms < 0 || *ms > 1e9)
+            {
+                return fail("after needs milliseconds from 0 to 1e9");
+            }
+            e.after_ms = *ms;
+        }
+        const std::string_view verb = w[2];
+        const std::span<const std::string_view> args(w.begin() + 3, w.end());
+        const auto numbers = [&](std::size_t n) -> std::optional<std::vector<double>> {
+            if (args.size() < n)
+            {
+                return std::nullopt;
+            }
+            std::vector<double> values;
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const auto v = finite_number(args[i]);
+                if (!v)
+                {
+                    return std::nullopt;
+                }
+                values.push_back(*v);
+            }
+            return values;
+        };
+        if (verb == "key" || verb == "key-down" || verb == "key-up")
+        {
+            if (args.empty())
+            {
+                return fail("a key event needs the key's name");
+            }
+            // A key's name may have spaces ("Left Shift"): the rest of the line
+            std::string name;
+            for (const std::string_view part : args)
+            {
+                name += (name.empty() ? "" : " ") + std::string(part);
+            }
+            e.key = name;
+            if (verb == "key")
+            {
+                e.kind = input_kind::key_down;
+                result.push_back(e);
+                e.kind = input_kind::key_up;
+            }
+            else
+            {
+                e.kind = verb == "key-down" ? input_kind::key_down : input_kind::key_up;
+            }
+        }
+        else if (verb == "mouse-down" || verb == "mouse-up")
+        {
+            if (args.size() < 3 || args.size() > 4 || !button(args[0]))
+            {
+                return fail("a mouse button event needs left, middle or right, then X Y");
+            }
+            const auto x = finite_number(args[1]);
+            const auto y = finite_number(args[2]);
+            if (!x || !y)
+            {
+                return fail("a mouse button event needs X Y");
+            }
+            e.kind = verb == "mouse-down" ? input_kind::mouse_down : input_kind::mouse_up;
+            e.button = button(args[0]);
+            e.x = *x;
+            e.y = *y;
+            if (args.size() > 3)
+            {
+                const auto clicks = parse_positive_int(args[3]);
+                if (!clicks || *clicks > 255)
+                {
+                    return fail("CLICKS is a number from 1 to 255");
+                }
+                e.clicks = *clicks;
+            }
+        }
+        else if (verb == "mouse-move")
+        {
+            const auto v = numbers(4);
+            if (!v || args.size() != 4)
+            {
+                return fail("mouse-move needs X Y DX DY");
+            }
+            e.kind = input_kind::mouse_move;
+            e.x = (*v)[0];
+            e.y = (*v)[1];
+            e.dx = (*v)[2];
+            e.dy = (*v)[3];
+        }
+        else if (verb == "wheel")
+        {
+            const auto v = numbers(1);
+            if (!v || args.size() > 2 || (args.size() == 2 && args[1] != "shift" && args[1] != "ctrl"))
+            {
+                return fail("wheel needs DY, and maybe shift or ctrl");
+            }
+            const std::string modifier = args.size() == 2 ? (args[1] == "shift" ? "Left Shift" : "Left Ctrl") : "";
+            if (!modifier.empty())
+            {
+                result.push_back({.line = number, .at_frame = e.at_frame, .after_ms = e.after_ms,
+                                  .kind = input_kind::key_down, .key = modifier});
+            }
+            e.kind = input_kind::wheel;
+            e.dy = (*v)[0];
+            result.push_back(e);
+            if (!modifier.empty())
+            {
+                result.push_back({.line = number, .at_frame = e.at_frame, .after_ms = e.after_ms,
+                                  .kind = input_kind::key_up, .key = modifier});
+            }
+            continue;
+        }
+        else if (verb == "resize")
+        {
+            const auto width = args.size() == 2 ? parse_positive_int(args[0]) : std::nullopt;
+            const auto height = args.size() == 2 ? parse_positive_int(args[1]) : std::nullopt;
+            if (!width || !height)
+            {
+                return fail("resize needs W H, whole numbers from 1");
+            }
+            e.kind = input_kind::resize;
+            e.x = *width;
+            e.y = *height;
+        }
+        else if (verb == "device-reset" || verb == "quit")
+        {
+            if (!args.empty())
+            {
+                return fail(std::format("{} takes no values", verb));
+            }
+            e.kind = verb == "quit" ? input_kind::quit : input_kind::device_reset;
+        }
+        else
+        {
+            return fail(std::format("unknown event '{}'", verb));
+        }
+        result.push_back(e);
+    }
+    return result;
+}
