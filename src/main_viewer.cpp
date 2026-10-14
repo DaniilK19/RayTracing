@@ -26,6 +26,7 @@ import image;
 import scenes;
 import vec3;
 import view_options;
+import viewer_camera;
 import viewer_script;
 
 namespace
@@ -89,6 +90,20 @@ Options:
                        several files
       --exit-when-done close the window when the image has its samples (after saving -o)
   -h, --help           show this help
+
+In the window:
+  left drag            orbit about the point looked at
+  right drag           look around
+  middle drag, Shift+left drag
+                       pan
+  wheel                move closer or farther
+  Ctrl+wheel, - and =  zoom
+  W A S D Q E          fly (Shift faster, Ctrl slower)
+  R                    back to the start view
+  P                    save the image as <scene>-view-NNN.png and .pfm in the current folder, and print
+                       the RayTracingGPU command that renders it
+  C                    copy that command
+  Esc                  close
 
 Scripts and measurements:
       --script FILE    play a camera script instead of taking input, then close
@@ -322,6 +337,10 @@ Uint64 SDLCALL timed_input(void* index, SDL_TimerID, Uint64)
     return 0; // once
 }
 
+// The keyboard and the mouse --input's events come from, so that under --input the window takes its keys and mouse
+// from the input file alone (SDL numbers real keyboards and mice from 1 up, and touch and pen as the largest ones)
+constexpr Uint32 scripted_device = 0x7E5701;
+
 // The modifier a key sets while it is down, for the key events --input pushes
 SDL_Keymod modifier_of(SDL_Scancode key)
 {
@@ -376,6 +395,9 @@ private:
     std::optional<gpu_build> build_;
     std::optional<gpu::session> session_;
     camera_settings view_;          // the camera's settings: the scene's own view, changed by options or scripts
+    camera_settings start_view_;    // the scene's view as it started (R goes back to it)
+    double min_distance_ = 0;       // how near lookfrom may come to lookat: 1/1000 of the start's distance
+    double min_focus_ = 0;          // and the focus distance: 1/1000 of the start's
     int width_ = 0;                 // the image: the window's client area in pixels
     int height_ = 0;
     std::uint64_t generation_ = 0;  // counts the views: a new one with every camera, size or settings change
@@ -418,7 +440,35 @@ private:
     float input_x_ = 0;
     float input_y_ = 0;
 
+    // The mouse and the keys. Buttons, held keys and modifiers are tracked from the events themselves (not from SDL's
+    // state functions, which events pushed by --input don't update), and cleared when the window loses the keyboard.
+    enum class drag
+    {
+        none,
+        orbit,
+        look,
+        pan,
+    };
+    drag drag_ = drag::none;
+    Uint8 drag_button_ = 0; // the button that started the drag: one drag at a time
+    std::array<bool, SDL_SCANCODE_COUNT> held_{};
+    SDL_Keymod mods_ = SDL_KMOD_NONE;
+    std::uint64_t fly_since_ns_ = 0; // the time the flight's last step covered up to
+    int views_saved_ = 0;
+    // A camera moved by this batch of events, shown at the next iterate: one new view for all of a frame's mouse moves
+    std::optional<camera_settings> pending_view_;
+
+    // A script's camera move in progress (see viewer_script)
+    std::optional<move> move_;
+    int move_done_ = 0;
+    int move_line_ = 0;
+    camera_settings move_start_;
+
     bool interactive() const { return !opts_.exit_when_done && !opts_.script && !opts_.headless && !opts_.input; }
+    camera_settings current_view() const { return pending_view_.value_or(view_); }
+    bool flying() const;
+    std::expected<void, std::string> apply_pending_view();
+    std::expected<gpu::accumulation, std::string> complete_pass();
     bool headless() const { return opts_.headless; }
     SDL_AppResult fail(const std::string& message);
     std::expected<void, std::string> use_settings(const render_settings& settings);
@@ -441,6 +491,9 @@ private:
     void write_stats(const gpu::render_report& report, bool new_samples, bool presented, bool moving, double wall_ms,
                      double dt_ms);
     SDL_AppResult run_headless();
+    bool move_camera(const camera_settings& to);
+    camera_settings moved(const move& m, double t) const;
+    void save_view();
 };
 
 viewer::~viewer()
@@ -495,6 +548,9 @@ std::expected<void, std::string> viewer::use_settings(const render_settings& set
     build_ = std::move(*built);
     settings_ = settings;
     view_ = build_->cpu.camera; // the scene's sampling and samples, with its view
+    start_view_ = view_;
+    min_distance_ = (view_.lookfrom - view_.lookat).length() / 1000;
+    min_focus_ = view_.focus_dist / 1000;
     if (same_scene)
     {
         view_.lookfrom = kept.lookfrom;
@@ -609,6 +665,124 @@ std::string viewer::gpu_command(std::int64_t passes) const
     return command;
 }
 
+// A camera move: taken when the camera can render the new view (see check_view), and ignored otherwise, as a move
+// past a limit is. The view waits for the next iterate (apply_pending_view), so all the moves of a batch of events,
+// a fast mouse's many motions, start the image over once.
+bool viewer::move_camera(const camera_settings& to)
+{
+    if (!check_view(settings_for(to, width_, height_)))
+    {
+        return false;
+    }
+    pending_view_ = to;
+    moving_until_ns_ = SDL_GetTicksNS() + moving_ns;
+    return true;
+}
+
+// The camera the last events moved, and the window's new size, given to the session
+std::expected<void, std::string> viewer::apply_pending_view()
+{
+    const int width = pending_width_ > 0 ? pending_width_ : width_;
+    const int height = pending_width_ > 0 ? pending_height_ : height_;
+    pending_width_ = 0;
+    if (pending_view_ || width != width_ || height != height_)
+    {
+        const camera_settings view = current_view();
+        pending_view_.reset();
+        return show_view(view, width, height, false);
+    }
+    return {};
+}
+
+// A fly key held: W A S D Q E
+bool viewer::flying() const
+{
+    return held_[SDL_SCANCODE_W] || held_[SDL_SCANCODE_A] || held_[SDL_SCANCODE_S] || held_[SDL_SCANCODE_D] ||
+           held_[SDL_SCANCODE_Q] || held_[SDL_SCANCODE_E];
+}
+
+// A script's move at t from 0 (the view before the move) to 1 (the whole move)
+camera_settings viewer::moved(const move& m, double t) const
+{
+    switch (m.kind)
+    {
+    case move_kind::orbit:
+        return orbit(move_start_, t * m.a, t * m.b);
+    case move_kind::look:
+        return look(move_start_, t * m.a, t * m.b);
+    case move_kind::pan:
+        return pan(move_start_, t * m.a, t * m.b, height_);
+    case move_kind::dolly:
+        return dolly(move_start_, std::pow(m.a, t), min_distance_, min_focus_);
+    case move_kind::zoom:
+        return zoom(move_start_, std::pow(m.a, t));
+    }
+    std::unreachable();
+}
+
+// The view the events moved to, with its pass in progress finished (at least one pass): the image P saves and C's
+// command renders, shown in the window too
+std::expected<gpu::accumulation, std::string> viewer::complete_pass()
+{
+    if (const auto applied = apply_pending_view(); !applied)
+    {
+        return std::unexpected(applied.error());
+    }
+    try
+    {
+        const gpu::accumulation state = session_->state();
+        if (state.passes == 0 || state.rows > 0)
+        {
+            session_->render_to({state.passes + 1, 0});
+            if (const auto kept = keep_frame(session_->display()); !kept)
+            {
+                return std::unexpected(kept.error());
+            }
+            present_needed_ = true;
+        }
+        return session_->state();
+    }
+    catch (const std::exception& error)
+    {
+        return std::unexpected(error.what());
+    }
+}
+
+// P: the image of the view on screen saved in the current folder as <scene>-view-NNN.png and .pfm, NNN the first
+// number no file has yet (nothing earlier is overwritten), and the RayTracingGPU command that renders it again, printed
+void viewer::save_view()
+{
+    const auto state = complete_pass();
+    if (!state)
+    {
+        std::println("Error: {}", state.error());
+        return;
+    }
+    const auto img = to_image(session_->pixels(), width_, height_);
+    if (!img)
+    {
+        std::println("Error: {}", img.error());
+        return;
+    }
+    std::string name;
+    do
+    {
+        name = std::format("{}-view-{:03}", settings_.scene, ++views_saved_);
+    } while (std::filesystem::exists(name + ".png") || std::filesystem::exists(name + ".pfm"));
+    for (const std::string_view extension : {".png", ".pfm"})
+    {
+        const std::filesystem::path file = name + std::string(extension);
+        if (const auto saved = img->save(file); !saved)
+        {
+            std::println("Error: {} ({})", saved.error(), to_utf8(file));
+            return;
+        }
+    }
+    std::println("Saved {} and .pfm ({} samples per pixel). The same image:",
+                 to_utf8(std::filesystem::absolute(name + ".png")), state->passes);
+    std::println("{} -o {}-gpu.pfm", gpu_command(state->passes), name);
+}
+
 SDL_AppResult viewer::init()
 {
     // The settings of the command line; a script's, up to its first frame, come first (so the session that starts is
@@ -654,7 +828,7 @@ SDL_AppResult viewer::init()
                 script_size = {f->width, f->height};
                 break;
             }
-            else if (std::holds_alternative<hold>(c) || std::holds_alternative<set_camera>(c))
+            else if (renders(c) || changes_view(c))
             {
                 break;
             }
@@ -808,19 +982,12 @@ SDL_AppResult viewer::init()
             return fail(std::format("SDL has no events left for the program: {}", SDL_GetError()));
         }
         timed_input_type = wake_type + 1;
-        // --input: key names SDL knows, and the timers of the `after MS` events
-        for (std::size_t i = 0; i < input_.size(); ++i)
+        // --input: key names SDL knows (the `after MS` events' timers start with the clock, below)
+        for (const input_event& e : input_)
         {
-            const input_event& e = input_[i];
             if (!e.key.empty() && SDL_GetKeyFromName(e.key.c_str()) == SDLK_UNKNOWN)
             {
                 return fail(std::format("{}: line {}: SDL knows no key '{}'", to_utf8(*opts_.input), e.line, e.key));
-            }
-            if (e.after_ms >= 0 &&
-                !SDL_AddTimerNS(static_cast<Uint64>(e.after_ms * 1e6), timed_input,
-                                reinterpret_cast<void*>(static_cast<std::intptr_t>(i))))
-            {
-                return fail(std::format("SDL couldn't start a timer: {}", SDL_GetError()));
             }
         }
     }
@@ -858,6 +1025,16 @@ SDL_AppResult viewer::init()
         return run_headless();
     }
     moving_until_ns_ = start_ns_ + moving_ns; // the first frames come quickly
+    // --input's `after MS` events, from now: the moment --stats' time_ms counts from too
+    for (std::size_t i = 0; i < input_.size(); ++i)
+    {
+        if (input_[i].after_ms >= 0 &&
+            !SDL_AddTimerNS(static_cast<Uint64>(input_[i].after_ms * 1e6), timed_input,
+                            reinterpret_cast<void*>(static_cast<std::intptr_t>(i))))
+        {
+            return fail(std::format("SDL couldn't start a timer: {}", SDL_GetError()));
+        }
+    }
     if (!make_texture(width_, height_))
     {
         return SDL_APP_FAILURE;
@@ -1061,6 +1238,41 @@ void viewer::record_frame()
 std::expected<bool, std::string> viewer::play_next()
 {
     render_settings settings = settings_;
+    if (move_)
+    {
+        // A frame of a move: smoothstep(i / F), so the move starts and ends at rest
+        const double s = static_cast<double>(++move_done_) / move_->frames;
+        const camera_settings to = moved(*move_, s * s * (3 - 2 * s));
+        const auto at = [&](const std::string& message) {
+            return std::unexpected(std::format("{}: line {}: {}", to_utf8(*opts_.script), move_line_, message));
+        };
+        const std::uint64_t before = generation_;
+        if (const auto shown = show_view(to, width_, height_, false); !shown)
+        {
+            return at(shown.error());
+        }
+        const std::int64_t passes = move_->passes;
+        if (move_done_ == move_->frames)
+        {
+            move_.reset();
+        }
+        // N passes of the new view; a frame that doesn't change the camera keeps the image, N more passes on
+        try
+        {
+            const gpu::accumulation now = session_->state();
+            const std::int64_t target = generation_ != before ? passes : now.passes + passes;
+            script_report_ = session_->render_to({target, 0});
+            if (const auto kept = keep_frame(session_->display()); !kept)
+            {
+                return at(kept.error());
+            }
+        }
+        catch (const std::exception& error)
+        {
+            return at(error.what());
+        }
+        return true;
+    }
     while (hold_left_ == 0)
     {
         if (script_next_ == script_.size())
@@ -1139,6 +1351,19 @@ std::expected<bool, std::string> viewer::play_next()
             {
                 return at(shown.error());
             }
+        }
+        else if (std::holds_alternative<move>(line.command))
+        {
+            const auto* c = &std::get<move>(line.command);
+            if (const auto used = use_settings(settings); !used)
+            {
+                return at(used.error());
+            }
+            move_ = *c;
+            move_done_ = 0;
+            move_line_ = line.line;
+            move_start_ = view_;
+            return play_next();
         }
         else if (std::holds_alternative<hold>(line.command))
         {
@@ -1327,6 +1552,7 @@ std::expected<void, std::string> viewer::perform(const input_event& e)
                            : static_cast<SDL_Keymod>(input_mods_ & ~modifier);
         event.key.mod = input_mods_;
         event.key.down = down;
+        event.key.which = scripted_device;
         break;
     }
     case input_kind::mouse_down:
@@ -1335,6 +1561,7 @@ std::expected<void, std::string> viewer::perform(const input_event& e)
         const bool down = e.kind == input_kind::mouse_down;
         event.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
         event.button.windowID = window;
+        event.button.which = scripted_device;
         event.button.button = static_cast<Uint8>(e.button);
         event.button.down = down;
         event.button.clicks = static_cast<Uint8>(e.clicks);
@@ -1347,6 +1574,7 @@ std::expected<void, std::string> viewer::perform(const input_event& e)
     case input_kind::mouse_move:
         event.type = SDL_EVENT_MOUSE_MOTION;
         event.motion.windowID = window;
+        event.motion.which = scripted_device;
         event.motion.state = input_buttons_;
         event.motion.x = input_x_ = static_cast<float>(e.x);
         event.motion.y = input_y_ = static_cast<float>(e.y);
@@ -1356,6 +1584,7 @@ std::expected<void, std::string> viewer::perform(const input_event& e)
     case input_kind::wheel:
         event.type = SDL_EVENT_MOUSE_WHEEL;
         event.wheel.windowID = window;
+        event.wheel.which = scripted_device;
         event.wheel.y = static_cast<float>(e.dy);
         event.wheel.integer_y = static_cast<Sint32>(e.dy);
         event.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
@@ -1380,14 +1609,177 @@ SDL_AppResult viewer::event(const SDL_Event& e)
             return fail(performed.error());
         }
     }
+    // Under --input, the keys and the mouse are the input file's alone: a real mouse or key would change what a test
+    // does
+    if (opts_.input)
+    {
+        const bool real = ((e.type == SDL_EVENT_KEY_DOWN || e.type == SDL_EVENT_KEY_UP) &&
+                           e.key.which != scripted_device) ||
+                          ((e.type == SDL_EVENT_MOUSE_BUTTON_DOWN || e.type == SDL_EVENT_MOUSE_BUTTON_UP) &&
+                           e.button.which != scripted_device) ||
+                          (e.type == SDL_EVENT_MOUSE_MOTION && e.motion.which != scripted_device) ||
+                          (e.type == SDL_EVENT_MOUSE_WHEEL && e.wheel.which != scripted_device);
+        if (real)
+        {
+            return SDL_APP_CONTINUE;
+        }
+    }
     switch (e.type)
     {
     case SDL_EVENT_QUIT:
         return save_outputs() ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
     case SDL_EVENT_KEY_DOWN:
-        if (e.key.key == SDLK_ESCAPE)
+    case SDL_EVENT_KEY_UP:
+    {
+        const bool down = e.type == SDL_EVENT_KEY_DOWN;
+        // Movement keys by scancode, the key's place on the keyboard (W A S D sit together whatever the layout);
+        // commands by keycode, the letter printed on the key (P is P). The modifiers as the event has them: both
+        // Shift keys, both Ctrl keys.
+        if (e.key.scancode < SDL_SCANCODE_COUNT)
         {
+            if (down && !flying())
+            {
+                fly_since_ns_ = SDL_GetTicksNS(); // a flight starts now, not at the last frame
+            }
+            held_[e.key.scancode] = down;
+        }
+        mods_ = e.key.mod;
+        if (!down)
+        {
+            break;
+        }
+        if (e.key.key == SDLK_ESCAPE && !e.key.repeat)
+        {
+            if (SDL_GetWindowRelativeMouseMode(window_))
+            {
+                SDL_SetWindowRelativeMouseMode(window_, false);
+                drag_ = drag::none;
+                break;
+            }
             return save_outputs() ? SDL_APP_SUCCESS : SDL_APP_FAILURE;
+        }
+        if (opts_.script)
+        {
+            break; // a script moves the camera alone
+        }
+        if (e.key.key == SDLK_MINUS || e.key.key == SDLK_EQUALS) // held, they zoom on
+        {
+            move_camera(zoom(current_view(), std::pow(wheel_zoom, e.key.key == SDLK_MINUS ? -1 : 1)));
+        }
+        if (e.key.repeat)
+        {
+            break;
+        }
+        if (e.key.key == SDLK_R)
+        {
+            move_camera(start_view_);
+        }
+        else if (e.key.key == SDLK_P)
+        {
+            save_view();
+        }
+        else if (e.key.key == SDLK_C)
+        {
+            // P's command: the view on screen, its pass in progress finished
+            if (const auto state = complete_pass(); state)
+            {
+                const std::string command = gpu_command(state->passes);
+                if (SDL_SetClipboardText(command.c_str()))
+                {
+                    std::println("Copied: {}", command);
+                }
+                else
+                {
+                    std::println("Error: SDL couldn't copy the command ({}): {}", SDL_GetError(), command);
+                }
+            }
+            else
+            {
+                std::println("Error: {}", state.error());
+            }
+        }
+        break;
+    }
+    case SDL_EVENT_WINDOW_FOCUS_LOST:
+        // A key or a button let go in another window sends nothing here: nothing counts as held any more, and the
+        // cursor is free (SDL would capture it again when the window comes back). Under --input the state is the
+        // input file's, which a desktop's focus doesn't change.
+        if (!opts_.input)
+        {
+            held_.fill(false);
+            mods_ = SDL_KMOD_NONE;
+            drag_ = drag::none;
+            drag_button_ = 0;
+            SDL_SetWindowRelativeMouseMode(window_, false);
+        }
+        break;
+    case SDL_EVENT_WINDOW_FOCUS_GAINED:
+        if (!opts_.input)
+        {
+            mods_ = SDL_GetModState(); // a Shift held while clicking into the window counts
+        }
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        if (opts_.script || drag_ != drag::none)
+        {
+            break; // a second button during a drag does nothing
+        }
+        drag_button_ = e.button.button;
+        if (e.button.button == SDL_BUTTON_LEFT)
+        {
+            drag_ = (mods_ & SDL_KMOD_SHIFT) ? drag::pan : drag::orbit;
+        }
+        else if (e.button.button == SDL_BUTTON_MIDDLE)
+        {
+            drag_ = drag::pan;
+        }
+        else if (e.button.button == SDL_BUTTON_RIGHT)
+        {
+            drag_ = drag::look;
+            // The cursor hidden and held in the window while looking around, so the view can turn without end (not
+            // under scripted input, whose motion doesn't come from a real mouse)
+            if (!opts_.input)
+            {
+                SDL_SetWindowRelativeMouseMode(window_, true);
+            }
+        }
+        else
+        {
+            drag_button_ = 0;
+        }
+        break;
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+        if (drag_ != drag::none && e.button.button == drag_button_)
+        {
+            if (drag_ == drag::look)
+            {
+                SDL_SetWindowRelativeMouseMode(window_, false);
+            }
+            drag_ = drag::none;
+            drag_button_ = 0;
+        }
+        break;
+    case SDL_EVENT_MOUSE_MOTION:
+        if (drag_ != drag::none)
+        {
+            // Window coordinates to pixels (they differ under display scaling on some systems)
+            const float density = SDL_GetWindowPixelDensity(window_);
+            const double dx = e.motion.xrel * density;
+            const double dy = e.motion.yrel * density;
+            // A quarter of a degree per pixel. Orbit and pan grab the scene: dragged to the right, it turns or moves to
+            // the right. Look turns the head the way the mouse goes.
+            move_camera(drag_ == drag::orbit  ? orbit(current_view(), -0.25 * dx, 0.25 * dy)
+                        : drag_ == drag::look ? look(current_view(), -0.25 * dx, -0.25 * dy)
+                                              : pan(current_view(), dx, dy, height_));
+        }
+        break;
+    case SDL_EVENT_MOUSE_WHEEL:
+        if (!opts_.script)
+        {
+            const double steps = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
+            move_camera((mods_ & SDL_KMOD_CTRL)
+                            ? zoom(current_view(), std::pow(wheel_zoom, steps))
+                            : dolly(current_view(), std::pow(wheel_dolly, steps), min_distance_, min_focus_));
         }
         break;
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
@@ -1477,14 +1869,25 @@ SDL_AppResult viewer::iterate()
         }
         else
         {
-            if (pending_width_ > 0 && (pending_width_ != width_ || pending_height_ != height_))
+            // Fly: half the distance to lookat per second, four times faster with Shift, four times slower with Ctrl;
+            // the step covers the time since the last one, or since the key went down (at most a tenth of a second)
+            const auto key = [&](SDL_Scancode s) { return held_[s] ? 1.0 : 0.0; };
+            const double forward = key(SDL_SCANCODE_W) - key(SDL_SCANCODE_S);
+            const double right = key(SDL_SCANCODE_D) - key(SDL_SCANCODE_A);
+            const double up = key(SDL_SCANCODE_E) - key(SDL_SCANCODE_Q);
+            if (flying())
             {
-                if (const auto shown = show_view(view_, pending_width_, pending_height_, false); !shown)
-                {
-                    return fail(shown.error());
-                }
+                const camera_settings from = current_view();
+                const double speed = 0.5 * (from.lookfrom - from.lookat).length() *
+                                     ((mods_ & SDL_KMOD_SHIFT) ? 4.0 : (mods_ & SDL_KMOD_CTRL) ? 0.25 : 1.0);
+                const double step = speed * std::min(static_cast<double>(now - fly_since_ns_) / 1e9, 0.1);
+                fly_since_ns_ = now;
+                move_camera(fly(from, forward * step, right * step, up * step));
             }
-            pending_width_ = 0;
+            if (const auto applied = apply_pending_view(); !applied)
+            {
+                return fail(applied.error());
+            }
             moving = now < moving_until_ns_;
             if (!minimized_pause && session_->state().passes < target_)
             {
@@ -1536,7 +1939,8 @@ SDL_AppResult viewer::iterate()
         // Nothing to render and nothing new to show (or nowhere to show it): SDL waits for the next event before it
         // calls iterate again, and the program sleeps (not while scripted input waits for its frames; the timers of
         // the `after MS` events end the wait themselves)
-        if ((minimized_pause || (done && !present_needed_)) && pending_width_ == 0 && input_next_ == input_.size())
+        if ((minimized_pause || (done && !present_needed_ && !flying())) && pending_width_ == 0 && !pending_view_ &&
+            input_next_ == input_.size())
         {
             SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "waitevent");
         }

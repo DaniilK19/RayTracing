@@ -9,6 +9,7 @@ import std;
 import camera;
 import cli;
 import vec3;
+import viewer_camera;
 
 // --- Scripts -------------------------------------------------------------------------------------------------------
 //
@@ -19,11 +20,18 @@ import vec3;
 // The camera stays when another setting changes; a new scene starts at its own view.
 // Frames:
 //   hold F +N    F frames of the view as it is, each with N more complete passes than the frame before (N from 1)
+//   orbit F +N yaw D [pitch D] | look F +N yaw D [pitch D] | pan F +N dx X [dy Y] |
+//   dolly F +N factor X | dolly F +N notches Y | zoom F +N factor X | zoom F +N notches Y
+//                F frames of a camera move, eased in and out (smoothstep), each frame a new view with N passes (from
+//                1). Every frame's view is computed from the view before the move, as the window's moves compute it
+//                (the same functions, viewer_camera): orbit and look turn by degrees, pan moves by pixels of the image
+//                at hand (so a script pans less at a larger size), dolly and zoom multiply the distance and the field
+//                of view, by a factor or by the wheel's notches (the very powers the wheel takes)
 //   frame N R gen G size W H lookfrom "X,Y,Z" lookat "X,Y,Z" vfov D defocus-angle D focus-dist D
 //                one frame: that view at N complete passes (from 1) and R rows of the next one (below H); G numbers
 //                the views, a new G starting the image over even for the same camera (what --record writes, one line
 //                per frame shown with new samples)
-// A script ends with a frame: lines after its last hold or frame would render nothing, and are an error.
+// A script ends with a frame: lines after its last hold, move or frame would render nothing, and are an error.
 
 // The most passes a frame may have: as many as RayTracingGPU's -s
 export constexpr std::int64_t max_script_passes = std::numeric_limits<int>::max();
@@ -47,6 +55,22 @@ export struct set_kernel { bool all_books; };
 export struct set_sampling { std::optional<sampling_strategy> strategy; }; // empty: the scene's own
 export struct set_camera { view_change view; };
 export struct hold { int frames; std::int64_t passes; };
+export enum class move_kind
+{
+    orbit,
+    look,
+    pan,
+    dolly,
+    zoom,
+};
+export struct move
+{
+    move_kind kind;
+    int frames;
+    std::int64_t passes;
+    double a = 0; // orbit, look: yaw; pan: dx; dolly, zoom: the factor
+    double b = 0; // orbit, look: pitch; pan: dy
+};
 export struct frame
 {
     std::int64_t passes;
@@ -59,13 +83,24 @@ export struct frame
 
 export using script_command =
     std::variant<set_scene, set_size, set_seed, set_strata, set_precision, set_kernel, set_sampling, set_camera, hold,
-                 frame>;
+                 move, frame>;
 
 export struct script_line
 {
     int line; // in the file, from 1, for messages
     script_command command;
 };
+
+// The commands that render frames, and those that change the view (a script's settings before both are the start's)
+export bool renders(const script_command& c)
+{
+    return std::holds_alternative<hold>(c) || std::holds_alternative<move>(c) || std::holds_alternative<frame>(c);
+}
+
+export bool changes_view(const script_command& c)
+{
+    return std::holds_alternative<set_camera>(c) || std::holds_alternative<move>(c) || std::holds_alternative<frame>(c);
+}
 
 namespace
 {
@@ -272,6 +307,63 @@ std::expected<script_command, std::string> command(std::span<const std::string_v
         }
         return result;
     }
+    if (verb == "orbit" || verb == "look" || verb == "pan" || verb == "dolly" || verb == "zoom")
+    {
+        const auto frames = w.size() >= 5 ? positive(w[1]) : std::nullopt;
+        const auto passes = w.size() >= 5 && w[2].starts_with('+') ? passes_number(w[2].substr(1)) : std::nullopt;
+        if (!frames || !passes)
+        {
+            return std::unexpected(std::format("{} needs F +N (N from 1 to {}) and its amounts", verb,
+                                               max_script_passes));
+        }
+        move result{.kind = verb == "orbit" ? move_kind::orbit
+                          : verb == "look"  ? move_kind::look
+                          : verb == "pan"   ? move_kind::pan
+                          : verb == "dolly" ? move_kind::dolly
+                                            : move_kind::zoom,
+                     .frames = *frames,
+                     .passes = *passes};
+        // The amounts: name value pairs
+        const bool turns = verb == "orbit" || verb == "look";
+        const std::string_view first = turns ? "yaw" : verb == "pan" ? "dx" : "factor";
+        const std::string_view second = turns ? "pitch" : verb == "pan" ? "dy" : "";
+        // dolly and zoom: notches of the wheel instead of a factor
+        const bool by_notches = (verb == "dolly" || verb == "zoom") && w.size() > 3 && w[3] == "notches";
+        bool has_first = false;
+        for (std::size_t i = 3; i < w.size(); i += 2)
+        {
+            const std::optional<double> value = i + 1 < w.size() ? finite_number(w[i + 1]) : std::nullopt;
+            if (!value)
+            {
+                return std::unexpected(std::format("{} needs a number after '{}'", verb, w[i]));
+            }
+            if (by_notches && w[i] == "notches" && i == 3)
+            {
+                result.a = std::pow(verb == "dolly" ? wheel_dolly : wheel_zoom, *value);
+                has_first = true;
+            }
+            else if (w[i] == first)
+            {
+                result.a = *value;
+                has_first = true;
+            }
+            else if (!second.empty() && w[i] == second)
+            {
+                result.b = *value;
+            }
+            else
+            {
+                return std::unexpected(std::format("{} doesn't know '{}'", verb, w[i]));
+            }
+        }
+        if (!has_first || ((verb == "dolly" || verb == "zoom") && !(result.a > 0)))
+        {
+            return std::unexpected(std::format("{} needs {}{}", verb, first,
+                                               verb == "dolly" || verb == "zoom" ? " greater than zero, or notches"
+                                                                                 : ""));
+        }
+        return result;
+    }
     if (verb == "hold")
     {
         const auto frames = w.size() == 3 ? positive(w[1]) : std::nullopt;
@@ -345,18 +437,16 @@ export std::expected<std::vector<script_line>, std::string> parse_script(std::st
         }
         result.push_back({number, std::move(*parsed)});
     }
-    const auto renders = [](const script_line& l) {
-        return std::holds_alternative<hold>(l.command) || std::holds_alternative<frame>(l.command);
-    };
-    const auto last = std::ranges::find_if(result.rbegin(), result.rend(), renders);
+    const auto last =
+        std::ranges::find_if(result.rbegin(), result.rend(), [](const script_line& l) { return renders(l.command); });
     if (last == result.rend())
     {
-        return std::unexpected("the script renders nothing: it has no hold or frame line");
+        return std::unexpected("the script renders nothing: it has no hold, move or frame line");
     }
     if (last != result.rbegin())
     {
-        return std::unexpected(std::format("line {}: nothing is rendered after this line (a script ends with a hold or "
-                                           "a frame)",
+        return std::unexpected(std::format("line {}: nothing is rendered after this line (a script ends with a hold, a "
+                                           "move or a frame)",
                                            (last - 1)->line));
     }
     return result;
@@ -396,8 +486,8 @@ export std::string format_frame(std::int64_t passes, int rows, std::uint64_t gen
 //
 // One event per line, when to send it:
 //   at F EVENT     before frame F (the window's F-th iterate, from 0); F never smaller than the line before's
-//   after MS EVENT MS milliseconds after the window opened, from a timer, whatever the frames (for latency
-//                  measurements: the window may be waiting for an event then)
+//   after MS EVENT MS milliseconds after the window opened (when --stats' time_ms is 0), from a timer, whatever the
+//                  frames (for latency measurements: the window may be waiting for an event then)
 // Events:
 //   key NAME | key-down NAME | key-up NAME          (NAME as SDL names keys: W, Escape, Left Shift...)
 //   mouse-down left|middle|right X Y [CLICKS] | mouse-up left|middle|right X Y [CLICKS] | mouse-move X Y DX DY
