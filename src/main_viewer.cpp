@@ -22,7 +22,12 @@ import std;
 import camera;
 import cli;
 import gpu_scene;
+import hittable;
 import image;
+import interval;
+import material;
+import random;
+import ray;
 import scenes;
 import vec3;
 import view_options;
@@ -99,6 +104,9 @@ In the window:
   wheel                move closer or farther
   Ctrl+wheel, - and =  zoom
   W A S D Q E          fly (Shift faster, Ctrl slower)
+  [ and ]              a narrower or wider lens (depth of field)
+  Shift+wheel          focus nearer or farther
+  double-click         focus on what is under the cursor
   R                    back to the start view
   P                    save the image as <scene>-view-NNN.png and .pfm in the current folder, and print
                        the RayTracingGPU command that renders it
@@ -492,6 +500,7 @@ private:
                      double dt_ms);
     SDL_AppResult run_headless();
     bool move_camera(const camera_settings& to);
+    std::optional<camera_settings> pick_focus(double x, double y) const;
     camera_settings moved(const move& m, double t) const;
     void save_view();
 };
@@ -535,6 +544,10 @@ std::expected<void, std::string> viewer::use_settings(const render_settings& set
         return {};
     }
     const bool same_scene = session_ && settings.scene == settings_.scene;
+    if (!same_scene)
+    {
+        pending_view_.reset(); // a move of the old scene's camera still waiting
+    }
     const camera_settings kept = view_;
     session_.reset();
     const bool own = settings.scene == opts_.scene;
@@ -677,6 +690,62 @@ bool viewer::move_camera(const camera_settings& to)
     pending_view_ = to;
     moving_until_ns_ = SDL_GetTicksNS() + moving_ns;
     return true;
+}
+
+// The view focused on the surface seen at pixel (x, y): the CPU's scene, the very objects the GPU renders, is asked
+// where the ray through the pixel's center (at time 0) first hits something, and the distance is measured along the
+// view's direction, as the focus distance is. The ray is the camera's at a focus distance of 1: the same direction
+// whatever the focus, so the same click gives the same hit, bit for bit, and the image doesn't start over. Smoke and
+// mist (an isotropic medium) don't stop the pick: it goes on to the surface behind them, and takes the medium's own
+// point only when nothing is behind (the second book's final scene stands in a mist that fills the whole world). They
+// are hit at random depths, so the random numbers start over first. Empty if the ray hits nothing.
+std::optional<camera_settings> viewer::pick_focus(double x, double y) const
+{
+    const camera_settings view = current_view();
+    camera_settings unit = settings_for(view, width_, height_);
+    unit.focus_dist = 1;
+    const camera_frame f = camera(unit).frame();
+    // Clamped as doubles first: a script's X of 1e10 means the last column, not an int's overflow
+    const int i = static_cast<int>(std::clamp(x, 0.0, width_ - 1.0));
+    const int j = static_cast<int>(std::clamp(y, 0.0, height_ - 1.0));
+    const point3 target = f.pixel00_loc + i * f.pixel_delta_u + j * f.pixel_delta_v;
+    const ray r{.origin = f.center, .direction = target - f.center, .time = 0};
+    seed_random(std::mt19937_64::default_seed);
+    const auto medium = [](const std::optional<hit_record>& h) { return dynamic_cast<const isotropic*>(h->mat); };
+    auto hit = build_->cpu.world.hit(r, interval{0.001, infinity});
+    std::optional<hit_record> first_medium;
+    for (int k = 0; hit && medium(hit) && k < 64; ++k)
+    {
+        if (!first_medium)
+        {
+            first_medium = hit;
+        }
+        const ray on{.origin = hit->p, .direction = r.direction, .time = 0};
+        hit = build_->cpu.world.hit(on, interval{0.001, infinity});
+    }
+    if (!hit || medium(hit))
+    {
+        hit = first_medium;
+    }
+    if (!hit)
+    {
+        std::println("Focus: nothing there at pixel ({}, {})", i, j);
+        return std::nullopt;
+    }
+    const double along = dot(hit->p - view.lookfrom, unit_vector(view.lookat - view.lookfrom));
+    const camera_settings to = with_focus(view, along);
+    if (to.focus_dist == along)
+    {
+        std::println("Focus: {} at pixel ({}, {}), the hit at {},{},{}", to.focus_dist, i, j, hit->p.x, hit->p.y,
+                     hit->p.z);
+    }
+    else
+    {
+        std::println("Focus: {} at pixel ({}, {}): the hit at {},{},{} is {} along the view, outside what a view "
+                     "allows",
+                     to.focus_dist, i, j, hit->p.x, hit->p.y, hit->p.z, along);
+    }
+    return to;
 }
 
 // The camera the last events moved, and the window's new size, given to the session
@@ -929,6 +998,9 @@ SDL_AppResult viewer::init()
 
     if (!headless())
     {
+        // A double-click focuses: its two clicks within 4 pixels, as a desktop's are (SDL's default of 32 would take
+        // two quick short orbit drags for one)
+        SDL_SetHint(SDL_HINT_MOUSE_DOUBLE_CLICK_RADIUS, "4");
         if (!SDL_Init(SDL_INIT_VIDEO))
         {
             return fail(std::format("SDL couldn't start: {}", SDL_GetError()));
@@ -1352,6 +1424,21 @@ std::expected<bool, std::string> viewer::play_next()
                 return at(shown.error());
             }
         }
+        else if (std::holds_alternative<focus_at>(line.command))
+        {
+            const auto* c = &std::get<focus_at>(line.command);
+            if (const auto used = use_settings(settings); !used)
+            {
+                return at(used.error());
+            }
+            if (const auto to = pick_focus(c->x, c->y))
+            {
+                if (const auto shown = show_view(*to, width_, height_, false); !shown)
+                {
+                    return at(shown.error());
+                }
+            }
+        }
         else if (std::holds_alternative<move>(line.command))
         {
             const auto* c = &std::get<move>(line.command);
@@ -1662,9 +1749,19 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         {
             break; // a script moves the camera alone
         }
-        if (e.key.key == SDLK_MINUS || e.key.key == SDLK_EQUALS) // held, they zoom on
+        // - = [ ] by the letter on the key, or by their place on a US keyboard, right of 0 and of P (on many layouts
+        // the brackets need AltGr, which the key event doesn't carry)
+        const auto is = [&](SDL_Keycode key, SDL_Scancode place) {
+            return e.key.key == key || e.key.scancode == place;
+        };
+        if (is(SDLK_MINUS, SDL_SCANCODE_MINUS) || is(SDLK_EQUALS, SDL_SCANCODE_EQUALS)) // held, they zoom on
         {
-            move_camera(zoom(current_view(), std::pow(wheel_zoom, e.key.key == SDLK_MINUS ? -1 : 1)));
+            move_camera(zoom(current_view(), std::pow(wheel_zoom, is(SDLK_MINUS, SDL_SCANCODE_MINUS) ? -1 : 1)));
+        }
+        else if (is(SDLK_LEFTBRACKET, SDL_SCANCODE_LEFTBRACKET) || is(SDLK_RIGHTBRACKET, SDL_SCANCODE_RIGHTBRACKET))
+        {
+            // held, they open or close the lens step by step
+            move_camera(aperture_step(current_view(), is(SDLK_RIGHTBRACKET, SDL_SCANCODE_RIGHTBRACKET)));
         }
         if (e.key.repeat)
         {
@@ -1725,7 +1822,18 @@ SDL_AppResult viewer::event(const SDL_Event& e)
             break; // a second button during a drag does nothing
         }
         drag_button_ = e.button.button;
-        if (e.button.button == SDL_BUTTON_LEFT)
+        if (e.button.button == SDL_BUTTON_LEFT && e.button.clicks == 2)
+        {
+            // A double-click focuses; it starts no drag
+            drag_ = drag::none;
+            drag_button_ = 0;
+            const float density = SDL_GetWindowPixelDensity(window_);
+            if (const auto to = pick_focus(e.button.x * density, e.button.y * density))
+            {
+                move_camera(*to);
+            }
+        }
+        else if (e.button.button == SDL_BUTTON_LEFT)
         {
             drag_ = (mods_ & SDL_KMOD_SHIFT) ? drag::pan : drag::orbit;
         }
@@ -1777,9 +1885,19 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         if (!opts_.script)
         {
             const double steps = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
-            move_camera((mods_ & SDL_KMOD_CTRL)
-                            ? zoom(current_view(), std::pow(wheel_zoom, steps))
-                            : dolly(current_view(), std::pow(wheel_dolly, steps), min_distance_, min_focus_));
+            const camera_settings from = current_view();
+            if (mods_ & SDL_KMOD_CTRL)
+            {
+                move_camera(zoom(from, std::pow(wheel_zoom, steps)));
+            }
+            else if (mods_ & SDL_KMOD_SHIFT)
+            {
+                move_camera(refocus(from, std::pow(wheel_focus, steps)));
+            }
+            else
+            {
+                move_camera(dolly(from, std::pow(wheel_dolly, steps), min_distance_, min_focus_));
+            }
         }
         break;
     case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:

@@ -17,6 +17,7 @@ import viewer_camera;
 //   scene NAME | size W H | seed S | strata K | precision float|double | kernel auto|all-books |
 //   sampling NAME|scene
 //   camera [lookfrom "X,Y,Z"] [lookat "X,Y,Z"] [vfov D] [defocus-angle D] [focus-dist D]   (the view, changed)
+//   focus-at X Y   the focus distance of the surface seen at pixel (X, Y) of the image, as a double-click sets it
 // The camera stays when another setting changes; a new scene starts at its own view.
 // Frames:
 //   hold F +N    F frames of the view as it is, each with N more complete passes than the frame before (N from 1)
@@ -54,6 +55,7 @@ export struct set_precision { bool fp64; };
 export struct set_kernel { bool all_books; };
 export struct set_sampling { std::optional<sampling_strategy> strategy; }; // empty: the scene's own
 export struct set_camera { view_change view; };
+export struct focus_at { double x; double y; };
 export struct hold { int frames; std::int64_t passes; };
 export enum class move_kind
 {
@@ -82,8 +84,8 @@ export struct frame
 };
 
 export using script_command =
-    std::variant<set_scene, set_size, set_seed, set_strata, set_precision, set_kernel, set_sampling, set_camera, hold,
-                 move, frame>;
+    std::variant<set_scene, set_size, set_seed, set_strata, set_precision, set_kernel, set_sampling, set_camera,
+                 focus_at, hold, move, frame>;
 
 export struct script_line
 {
@@ -99,7 +101,8 @@ export bool renders(const script_command& c)
 
 export bool changes_view(const script_command& c)
 {
-    return std::holds_alternative<set_camera>(c) || std::holds_alternative<move>(c) || std::holds_alternative<frame>(c);
+    return std::holds_alternative<set_camera>(c) || std::holds_alternative<focus_at>(c) ||
+           std::holds_alternative<move>(c) || std::holds_alternative<frame>(c);
 }
 
 namespace
@@ -363,6 +366,16 @@ std::expected<script_command, std::string> command(std::span<const std::string_v
                                                                                  : ""));
         }
         return result;
+    }
+    if (verb == "focus-at")
+    {
+        const std::optional<double> x = w.size() == 3 ? finite_number(w[1]) : std::nullopt;
+        const std::optional<double> y = w.size() == 3 ? finite_number(w[2]) : std::nullopt;
+        if (!x || !y || *x < 0 || *y < 0)
+        {
+            return std::unexpected("focus-at needs a pixel's X Y, from 0");
+        }
+        return focus_at{*x, *y};
     }
     if (verb == "hold")
     {

@@ -1,17 +1,19 @@
 // Module viewer_camera: the window's camera moves, as pure functions of the camera's settings. The mouse and the keys
 // call them (main_viewer.cpp), and so do the camera scripts' verbs (viewer_script), so a script moves the camera
-// exactly as the hand does. Every move works on lookfrom, lookat, vfov and focus_dist in double, and a move by nothing
-// returns the settings unchanged, bit for bit: a view the user hasn't touched is the scene's own.
+// exactly as the hand does. Every move works on lookfrom, lookat, vfov, focus_dist and defocus_angle in double, and a
+// move by nothing returns the settings unchanged, bit for bit: a view the user hasn't touched is the scene's own.
 export module viewer_camera;
 
 import std;
 import camera;
 import vec3;
 
-// What a notch of the wheel does: the distance to lookat times wheel_dolly, or with Ctrl the field of view times
-// wheel_zoom (the - and = keys too). A script's `notches` takes the same powers of the same numbers.
+// What a notch of the wheel does: the distance to lookat times wheel_dolly, with Ctrl the field of view times
+// wheel_zoom (the - and = keys too), with Shift the focus distance times wheel_focus. A script's `notches` takes the
+// same powers of the same numbers.
 export constexpr double wheel_dolly = 0.85;
 export constexpr double wheel_zoom = 0.9;
+export constexpr double wheel_focus = 1.05;
 
 namespace
 {
@@ -155,6 +157,46 @@ export camera_settings zoom(camera_settings s, double factor)
     }
     s.vfov = std::clamp(s.vfov * factor, std::min(1.0, s.vfov), std::max(160.0, s.vfov));
     return s;
+}
+
+// The lens a step wider or narrower: the defocus angle times or divided by 1.25. A closed lens (0) opens at a quarter
+// of a degree and one narrower than that closes, so a step back undoes a step forward; a wider step stops at 30
+// degrees (a lens given wider on the command line doesn't narrow).
+export camera_settings aperture_step(camera_settings s, bool wider)
+{
+    if (wider)
+    {
+        s.defocus_angle =
+            s.defocus_angle == 0 ? 0.25 : std::min(s.defocus_angle * 1.25, std::max(30.0, s.defocus_angle));
+    }
+    else if (s.defocus_angle > 0)
+    {
+        const double narrower = s.defocus_angle / 1.25;
+        s.defocus_angle = narrower < 0.25 ? 0 : narrower;
+    }
+    return s;
+}
+
+// A focus distance, kept within the range a view allows (see focus_in_range): a pick's or a script's
+export camera_settings with_focus(camera_settings s, double focus)
+{
+    s.focus_dist = focus;
+    return focus_in_range(s);
+}
+
+// Shift+wheel: the focus distance times factor. Growing, it stops at ten times the distance to lookat: the camera's
+// rays are focus_dist long and nothing nearer than a thousandth of that is seen, so a farther focus would clip the
+// scene in front of lookat away (a focus given farther on the command line doesn't come nearer).
+export camera_settings refocus(camera_settings s, double factor)
+{
+    if (factor == 1)
+    {
+        return s;
+    }
+    const double focus = s.focus_dist * factor;
+    const double distance = (s.lookfrom - s.lookat).length();
+    s.focus_dist = factor > 1 ? std::min(focus, std::max(10 * distance, s.focus_dist)) : focus;
+    return focus_in_range(s);
 }
 
 // Fly: lookfrom and lookat move together, `forward` along the view, `right` to the side and `up` along vup
