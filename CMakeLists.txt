@@ -145,8 +145,15 @@ if(CMAKE_CUDA_COMPILER)
     add_library(gpu_renderer STATIC src/gpu/renderer.cu)
     target_compile_options(gpu_renderer PRIVATE -Xcompiler=/W4 $<$<CONFIG:Debug,RelWithDebInfo>:-lineinfo>)
 
+    # The CPU's scenes as the renderer's data (gpu_scene.ixx): a module in a library of its own, which every GPU
+    # program links. It includes the renderer's header and imports the ray tracer's modules, so it comes with both.
+    add_library(gpu_scene STATIC)
+    target_sources(gpu_scene PUBLIC FILE_SET CXX_MODULES FILES src/gpu_scene.ixx)
+    target_link_libraries(gpu_scene PUBLIC raytracer gpu_renderer)
+    target_compile_options(gpu_scene PRIVATE /W4)
+
     add_executable(RayTracingGPU src/main_gpu.cpp src/utf8.manifest)
-    target_link_libraries(RayTracingGPU PRIVATE raytracer gpu_renderer)
+    target_link_libraries(RayTracingGPU PRIVATE gpu_scene)
     target_compile_options(RayTracingGPU PRIVATE /W4)
 else()
     message(STATUS "No working CUDA compiler found: RayTracingGPU, the GPU program, is skipped")

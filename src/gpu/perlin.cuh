@@ -19,7 +19,7 @@ struct alignas(4 * sizeof(Real)) perlin_gradient
 
 // The tables of one perlin object, copied from the CPU's. Its constructor drew them from the CPU's random numbers while
 // the scene was built, and they decide what the marble looks like, so the GPU must never draw its own: a scene is
-// always built by the CPU's code (see main_gpu.cpp). The permutations of 0..255 are stored as bytes: 768 bytes instead
+// always built by the CPU's code (see gpu_scene.ixx). The permutations of 0..255 are stored as bytes: 768 bytes instead
 // of 3 KB, and the whole table, 4.8 KB in float, stays in a multiprocessor's L1 cache, which every thread that hits a
 // marble surface reads.
 template <real_number Real>

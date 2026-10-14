@@ -2,9 +2,9 @@
 //
 // The renderer itself (renderer.cu and the .cuh headers next to it) is compiled by nvcc, NVIDIA's CUDA compiler, which
 // can't import C++20 modules: neither ours nor `import std`. So the two sides meet in this ordinary header. renderer.cu
-// includes it, and so does the GPU program, main_gpu.cpp, which builds a scene with the CPU ray tracer's own modules
-// (the same scene, the same camera) and translates it into the structures below. Only plain data crosses over: no
-// virtual functions and no pointers into the CPU's objects.
+// includes it, and so does the gpu_scene module (gpu_scene.ixx), which builds a scene with the CPU ray tracer's own
+// modules (the same scene, the same camera) and translates it into the structures below for the GPU programs. Only
+// plain data crosses over: no virtual functions and no pointers into the CPU's objects.
 //
 // The scene is a set of tables that refer to each other by index, as the CPU's objects refer to each other by pointer:
 // a sphere names its material, a material its texture, a checker two other textures, an image texture its image. Each
@@ -69,7 +69,7 @@ struct image_desc
     std::vector<float> rgb; // width × height × 3: pixel (x, y) starts at 3·(y·width + x)
 };
 
-// The size of a perlin object's tables (perlin::point_count; main_gpu.cpp checks that the two agree)
+// The size of a perlin object's tables (perlin::point_count; gpu_scene.ixx checks that the two agree)
 inline constexpr int perlin_point_count = 256;
 
 // The tables of one perlin object, which its constructor drew from the CPU's random numbers while the scene was built
@@ -159,7 +159,7 @@ struct medium_desc
 // one side of its plane, or on it (within 10^-9 of the largest coordinate, for the rounding of the instances' turns).
 // Then a line meets the quads at no more than two points, and the CPU's "first crossing, then the next one at least
 // 0.0001 beyond it" are the nearest and the farthest crossing (see boundary_crossings in constant_medium.cuh).
-// main_gpu.cpp asks it to explain a scene it can't render; renderer.cu's validate asks it again.
+// gpu_scene.ixx asks it to explain a scene it can't render; renderer.cu's validate asks it again.
 bool is_convex(const std::vector<quad_desc>& quads);
 
 // --- What the lights and mixture strategies aim at: the scene's lights list (scene::lights) --------------------------
