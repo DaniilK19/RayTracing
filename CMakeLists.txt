@@ -48,11 +48,11 @@ target_sources(std_module PUBLIC
     FILES "${MSVC_MODULES_DIR}/std.ixx")
 
 # --- Ray tracer library ------------------------------------------------------
-# Four programs use the ray tracer's modules: RayTracing renders the scenes; MonteCarlo runs the third book's numerical
+# Five programs use the ray tracer's modules: RayTracing renders the scenes; MonteCarlo runs the third book's numerical
 # experiments with the ray tracer's own random numbers, directions and densities, and tests its light sampling
-# (light-pdfs); ImageCompare reads and compares renders with the image module; and RayTracingGPU, the GPU program
-# (below), builds its scenes with the very same code. So the modules are compiled once into a static library, and the
-# programs link it.
+# (light-pdfs); ImageCompare reads and compares renders with the image module; and the GPU programs (below),
+# RayTracingGPU and RayTracingViewer, build their scenes with the very same code. So the modules are compiled once into
+# a static library, and the programs link it.
 add_library(raytracer STATIC)
 target_sources(raytracer PUBLIC  # PUBLIC: programs that link the library can `import` its modules
     FILE_SET CXX_MODULES FILES   # our modules: files with `export module ...`
@@ -103,10 +103,10 @@ add_executable(ImageCompare src/image_compare.cpp src/utf8.manifest)
 target_link_libraries(ImageCompare PRIVATE raytracer)
 target_compile_options(ImageCompare PRIVATE /W4)
 
-# --- GPU program (optional) --------------------------------------------------
-# RayTracingGPU renders RayTracing's scenes on an NVIDIA graphics card (see main_gpu.cpp). It needs the CUDA Toolkit
-# (nvcc and the CUDA libraries); without it, everything else builds as
-# before. CMake looks for nvcc in the folder named by the
+# --- GPU programs (optional) -------------------------------------------------
+# RayTracingGPU renders RayTracing's scenes on an NVIDIA graphics card (see main_gpu.cpp), and RayTracingViewer shows
+# them in a window as they render (main_viewer.cpp). They need the CUDA Toolkit (nvcc and the CUDA libraries); without
+# it, everything else builds as before. CMake looks for nvcc in the folder named by the
 # CUDA_PATH environment variable and on the PATH, both set by the toolkit's installer: a program started before the
 # installation, such as Visual Studio or a terminal, keeps its old environment until it is restarted.
 # check_language tries the CUDA compiler on a small test project and caches the answer, "not found" too, so after
@@ -161,7 +161,11 @@ if(CMAKE_CUDA_COMPILER)
     target_link_libraries(RayTracingGPU PRIVATE gpu_scene)
     target_compile_options(RayTracingGPU PRIVATE /W4)
 else()
-    message(STATUS "No working CUDA compiler found: RayTracingGPU, the GPU program, is skipped")
+    message(STATUS "No working CUDA compiler found: the GPU programs, RayTracingGPU and RayTracingViewer, are skipped")
     message(STATUS "After installing the CUDA Toolkit, restart Visual Studio (or the terminal) and delete the CMake "
                    "cache: Project > Delete Cache and Reconfigure (or cmake --fresh)")
 endif()
+
+# RayTracingViewer, the window, with SDL3 for the window and for drawing the image in it (cmake/sdl3.cmake). Without
+# CUDA the file only declares its options, so that giving them is no mistake.
+include(cmake/sdl3.cmake)

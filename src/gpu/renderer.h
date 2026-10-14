@@ -416,8 +416,10 @@ public:
     // a target behind the image or with rows past the image's.
     render_report render_to(accumulation target, const std::function<void(std::int64_t passes)>& on_pass = {});
     // Renders launch after launch for about `seconds` of GPU time (0 to 3600), but never past pass_limit complete
-    // passes; a pass_limit the image has reached does nothing. Below that limit, it renders at least until the view has
-    // one complete pass, however long that takes, in launches the planner sizes (see launch_planner in renderer.cu).
+    // passes; a pass_limit the image has reached does nothing. After a first launch, it ends early rather than make a
+    // launch shorter than a quarter of a full one (`seconds`, or the session's launch_seconds if that is less). Below
+    // the limit, it renders at least until the view has one complete pass, however long that takes, in launches the
+    // planner sizes (see launch_planner in renderer.cu).
     // A call may end inside a later pass (state().rows > 0); pixels() then needs the pass finished
     // (render_to({passes + 1, 0})). Throws std::invalid_argument for a pass_limit out of range or a time out of range.
     render_report render_for(double seconds, std::int64_t pass_limit);

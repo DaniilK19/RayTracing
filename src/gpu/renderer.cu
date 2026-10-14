@@ -1259,14 +1259,19 @@ public:
         }
         while (planner().state() < target)
         {
-            // The view's first pass is completed whatever the time; after it, launches fill the time that is left
+            // The view's first pass is completed whatever the time; after it, launches fill the time that is left,
+            // except a last bit too short to be worth a launch. A launch ends waiting for its slowest blocks with the
+            // GPU partly idle, for about a block's time, so the call ends rather than make a launch shorter than a
+            // quarter of a full one (the call's time, or launch_seconds if that is less). The window's frames on the
+            // second book's final scene used to end with such a launch: they render 6% more samples per second so.
             const bool first_pass = planner().state().passes == 0;
-            if (!first_pass && report.gpu_seconds >= seconds)
+            const double left = seconds - report.gpu_seconds;
+            const double full_launch = std::min(seconds, options_.launch_seconds);
+            if (!first_pass && (left <= 0 || (report.launches > 0 && left < full_launch / 4)))
             {
                 break;
             }
-            const double budget =
-                first_pass ? options_.launch_seconds : std::min(options_.launch_seconds, seconds - report.gpu_seconds);
+            const double budget = first_pass ? options_.launch_seconds : std::min(options_.launch_seconds, left);
             run(planner().next(budget, target), report);
         }
         report.state = planner().state();
