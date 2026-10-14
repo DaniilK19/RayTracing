@@ -16,8 +16,10 @@
 #pragma once
 
 #include <array>
+#include <compare>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -220,6 +222,10 @@ struct camera_desc
     // The strategy the CPU's camera renders with: effective_sampling of the one asked for, so lights and mixture come
     // only with a lights list that isn't empty
     sampling_strategy sampling = sampling_strategy::material;
+
+    // The same view in every field (0.0 and -0.0 count as equal). session::set_camera always starts the image over, so
+    // the window calls it only when its camera differs from session::camera(), or when the session has no view.
+    bool operator==(const camera_desc&) const = default;
 };
 
 // --- The scene, and how to render it --------------------------------------------------------------------------------
@@ -246,6 +252,10 @@ enum class precision
     float64,
 };
 
+// The longest a launch may be planned to take. Planned launches can run several times longer than planned (see
+// launch_planner in renderer.cu), so this stays far below the 2 seconds after which Windows stops a kernel.
+inline constexpr double max_launch_seconds = 0.5;
+
 struct render_options
 {
     std::uint64_t seed = 0; // renders with different seeds have statistically independent noise
@@ -253,11 +263,15 @@ struct render_options
     // Called on the host as passes complete (a pass adds one more sample, a camera ray and its bounces, to every pixel,
     // and one kernel launch may complete several), with the number of passes done so far and their total. May be
     // empty.
-    std::function<void(int done, int total)> progress;
+    std::function<void(std::int64_t done, std::int64_t total)> progress;
     // Render with the kernel for all three books even where the first book's kernel would do (see the kernels in
     // renderer.cu): a check that the general code computes the first book's paths as Step 46 does, and a measure of
     // what its generality costs
     bool all_books_kernel = false;
+    // How long one kernel launch should take, in seconds, more than 0 and at most max_launch_seconds
+    // (std::invalid_argument otherwise; see launch_planner in renderer.cu). The image doesn't depend on it, only the
+    // speed: 0.1 rendered 2.5% faster than 0.05, and 0.025 5% slower.
+    double launch_seconds = 0.05;
 };
 
 // The kernel that rendered, as the CUDA runtime describes it: the numbers that decide how many of its threads a
@@ -300,6 +314,89 @@ struct device_info
 device_info query_device();
 
 // Renders the scene on the first CUDA device. Throws std::runtime_error with CUDA's message if something fails, or if
-// the scene is inconsistent (an index out of range, a checker before its textures...).
+// the scene is inconsistent (an index out of range, a checker before its textures...), and std::invalid_argument for
+// options out of range (launch_seconds).
 render_result render(const scene_desc& scene, const render_options& options);
+
+// --- A render that goes on: the window's -------------------------------------------------------------------------
+
+struct session_options
+{
+    std::uint64_t seed = 0;
+    precision arithmetic = precision::float32;
+    bool all_books_kernel = false;
+    double launch_seconds = 0.05; // how long a launch is planned to take (see render_options and launch_planner)
+};
+
+// How far a view's image has come: `passes` complete passes, and rows [0, rows) of the next one (a pass that takes
+// longer than a launch should is rendered in bands of rows from the top, see launch_planner in renderer.cu). Ordered
+// by passes, then rows: "= default" has the compiler compare the members in that order.
+struct accumulation
+{
+    std::int64_t passes = 0;
+    int rows = 0;
+    auto operator<=>(const accumulation&) const = default;
+};
+
+// What one call of session::render_to or render_for did
+struct render_report
+{
+    accumulation state;                // where the image is after the call
+    int launches = 0;                  // kernel launches
+    double gpu_seconds = 0;            // their time on the GPU
+    double longest_launch_seconds = 0; // the longest of them
+};
+
+// A render that goes on: the scene stays in the GPU's memory, and the image of one view gains samples on demand, a
+// few at a time. render() is a session whose one view is rendered to its passes; the window keeps a session for as
+// long as it shows a scene, and gives it a new camera whenever the view changes.
+//
+// A session renders exactly the samples render() renders: pass n of a pixel is sample n of render(), with the same
+// random numbers, and every pixel adds its samples in the order of the passes. So however many calls and launches it
+// took, a view's sums after N passes are render()'s after its first N, and its image of all of them is render()'s bit
+// for bit.
+class session
+{
+public:
+    // Checks the scene, builds its BVH, copies it into the GPU's memory and picks the kernel (see the kernels in
+    // renderer.cu). The view is scene.camera. Throws as render() does.
+    session(const scene_desc& scene, const session_options& options);
+    ~session();
+    session(session&&) noexcept;
+    session& operator=(session&&) noexcept;
+
+    // A new view: the image starts over from no samples. The strategy must stay the scene's, as it decided the lights
+    // in the GPU's memory and the kernel (another one throws std::invalid_argument); a camera the renderer can't render
+    // throws std::runtime_error and keeps the old view. If the GPU fails on the way (its memory can't hold the new
+    // image), the session has no view: has_view() is false, and the renders and what they report throw
+    // std::logic_error until a set_camera succeeds.
+    void set_camera(const camera_desc& camera);
+    const camera_desc& camera() const; // the last view set successfully
+    bool has_view() const;
+    accumulation state() const;
+
+    // Renders until the image is at `target`, launch after launch. on_pass, if given, is called with the number of
+    // complete passes whenever a launch completes some; it must not call the session. Throws std::invalid_argument for
+    // a target behind the image, beyond the camera's sqrt_spp² passes (the strata of a pixel's samples, see start_path
+    // in camera.cuh) or with rows past the image's.
+    render_report render_to(accumulation target, const std::function<void(std::int64_t passes)>& on_pass = {});
+    // Renders launch after launch for about `seconds` of GPU time (0 to 3600), but never past pass_limit complete
+    // passes; a pass_limit the image has reached does nothing. Below that limit, it renders at least until the view has
+    // one complete pass, however long that takes, in launches the planner sizes (see launch_planner in renderer.cu).
+    // A call may end inside a later pass (state().rows > 0); pixels() then needs the pass finished
+    // (render_to({passes + 1, 0})). Throws std::invalid_argument for a pass_limit out of range or a time out of range.
+    render_report render_for(double seconds, std::int64_t pass_limit);
+
+    // The image of the complete passes: the sums of the samples divided by their number, as render_result::pixels.
+    // Throws std::logic_error unless the image has complete passes and no rows of the next one.
+    std::vector<double> pixels() const;
+
+    std::uint64_t rays() const;    // rays traced since the view was set
+    double kernel_seconds() const; // the launches' time on the GPU since the view was set
+    const kernel_info& kernel() const;
+
+private:
+    struct impl; // in renderer.cu, which knows the precision and CUDA's types
+    std::unique_ptr<impl> impl_;
+};
 }

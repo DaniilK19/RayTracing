@@ -21,9 +21,10 @@ import view_options;
 // --- The command line ------------------------------------------------------------------------------------------
 
 constexpr std::string_view default_gpu_scene = "weekend";
+constexpr int max_launch_ms = static_cast<int>(gpu::max_launch_seconds * 1000);
 
-// The options are RayTracing's, plus the GPU programs' own: --fp64, --all-books-kernel and the view options
-// (view_options.ixx). std::optional tells "not given: take it from the scene" apart from any given value.
+// The options are RayTracing's, plus the GPU programs' own: --fp64, --all-books-kernel, --launch-ms and the view
+// options (view_options.ixx). std::optional tells "not given: take it from the scene" apart from any given value.
 struct options
 {
     std::string_view scene = default_gpu_scene;
@@ -35,6 +36,7 @@ struct options
     std::vector<std::filesystem::path> outputs; // one per -o; parse_options adds <scene name>-gpu.png if there is none
     bool fp64 = false;
     bool all_books_kernel = false;
+    int launch_ms = 50; // how long one kernel launch should take (see render_options::launch_seconds)
     bool help = false;
 };
 
@@ -63,6 +65,8 @@ Options:
       --all-books-kernel
                        render with the kernel for all three books, also the first book's scenes
                        (a check: the same image, bit for bit expected; and the price of generality)
+      --launch-ms N    how long one kernel launch should take, in milliseconds, from 1 to {}
+                       (default 50): a check, as the image doesn't depend on it, only the speed
       --seed N         which random numbers to draw, from 0 (the default) to {}:
                        another seed renders the same image with independent noise
   -o, --output FILE    where to save the image (default <scene>-gpu.png): a .png, or a .pfm that
@@ -71,7 +75,7 @@ Options:
   -h, --help           show this help
 
 Sampling (-p):)",
-                 default_gpu_scene, view_usage, std::numeric_limits<std::uint32_t>::max());
+                 default_gpu_scene, view_usage, max_launch_ms, std::numeric_limits<std::uint32_t>::max());
     for (const sampling_entry& entry : sampling_list)
     {
         // camera_settings{} holds the camera's defaults
@@ -132,7 +136,8 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         const bool is_output = arg == "-o" || arg == "--output";
         const bool is_seed = arg == "--seed";
         const bool is_sampling = arg == "-p" || arg == "--sampling";
-        if (!is_width && !is_samples && !is_output && !is_seed && !is_sampling)
+        const bool is_launch = arg == "--launch-ms";
+        if (!is_width && !is_samples && !is_output && !is_seed && !is_sampling && !is_launch)
         {
             return std::unexpected(std::format("unknown option '{}'", arg));
         }
@@ -175,6 +180,18 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             continue;
         }
         const std::optional<int> number = parse_positive_int(value);
+        if (is_launch)
+        {
+            // Windows stops a kernel that runs for about 2 seconds, and a launch can run several times longer than
+            // planned (see launch_planner in renderer.cu)
+            if (!number || *number > max_launch_ms)
+            {
+                return std::unexpected(
+                    std::format("{}: expected an integer from 1 to {}, not '{}'", arg, max_launch_ms, value));
+            }
+            opts.launch_ms = *number;
+            continue;
+        }
         if (!number)
         {
             return std::unexpected(std::format("{}: expected an integer greater than zero, not '{}'", arg, value));
@@ -275,7 +292,8 @@ int main(int argc, char* argv[])
             .seed = opts->seed,
             .arithmetic = opts->fp64 ? gpu::precision::float64 : gpu::precision::float32,
             .progress = show_progress,
-            .all_books_kernel = opts->all_books_kernel};
+            .all_books_kernel = opts->all_books_kernel,
+            .launch_seconds = opts->launch_ms / 1000.0};
         result = gpu::render(built->desc, gpu_options);
     }
     catch (const std::exception& error)

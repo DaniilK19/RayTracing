@@ -25,10 +25,15 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <format>
+#include <functional>
 #include <limits>
+#include <memory>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -70,14 +75,28 @@ static_assert(block_width * block_height % 32 == 0);
 constexpr int bvh_leaf_size = 1;
 constexpr int small_scene_shapes = 8;
 
-// How long one kernel launch should take (see launch_planner): 100 ms would render 2.5% faster, 25 ms 5% slower
-constexpr double launch_seconds = 0.05;
+// The first band of rows of a view's first pass, in samples (see launch_planner). A session's first view starts with
+// Step 59's probe, so that render() plans its launches exactly as before (and its timings stay comparable). A later
+// view of the same session (the window's camera moved) starts with a larger band, so that a moving camera's frames
+// need fewer launches: at 1280×720 in float, the whole first pass is one. The last view's times say nothing about the
+// new one (a look from the sky down into glass can be dozens of times slower per sample), so every band of a later
+// view's first pass is bounded by its samples alone: no larger than the probe, smaller in float64, whose samples are
+// the slowest. (Growing by the speed measured, as the first view's bands do, was measured to go wrong: two bands on
+// cheap rows of sky, then a band four times as large on rows of glass, in float64 at 1080p a launch of 350 ms.) At the
+// slowest per-sample cost measured, about 0.4 µs inside a glass ball in float64, the probe takes about 0.1 s.
+constexpr double first_view_probe_samples = 1 << 16;
+template <real_number Real>
+constexpr double next_view_probe_samples = sizeof(Real) == sizeof(double) ? 1 << 18 : 1 << 20;
 
-// Turns a CUDA error code into an exception. Most CUDA functions return a cudaError_t instead of throwing.
+// Turns a CUDA error code into an exception. Most CUDA functions return a cudaError_t instead of throwing. The runtime
+// also keeps the last error for cudaGetLastError, which reports it again later: a caught failure (an allocation too
+// large for the GPU) would then make the next launch look as if it had failed. So an error reported here is cleared.
+// (An error in a running kernel can't be cleared: it ends CUDA in the process, and every later call reports it.)
 void check(cudaError_t result, const char* what)
 {
     if (result != cudaSuccess)
     {
+        (void)cudaGetLastError();
         throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(result));
     }
 }
@@ -106,27 +125,43 @@ public:
 
     ~device_array() { cudaFree(data_); } // nothing to do for nullptr
 
-    // A copy would free the same memory twice
+    // A copy would free the same memory twice; a move hands it over (a move-constructed array leaves the other one
+    // empty, an assignment swaps the two)
     device_array(const device_array&) = delete;
     device_array& operator=(const device_array&) = delete;
+    device_array(device_array&& other) noexcept
+        : size_(std::exchange(other.size_, 0)), data_(std::exchange(other.data_, nullptr))
+    {
+    }
+    device_array& operator=(device_array&& other) noexcept
+    {
+        std::swap(size_, other.size_);
+        std::swap(data_, other.data_);
+        return *this; // the other array frees what this one held
+    }
 
     T* data() const { return data_; }
     std::size_t size() const { return size_; }
 
-    void fill_with_zeros()
+    void fill_with_zeros() { fill_with_zeros(size_); }
+
+    // The first `count` elements only
+    void fill_with_zeros(std::size_t count)
     {
-        if (size_ > 0)
+        if (count > 0)
         {
-            check(cudaMemset(data_, 0, size_ * sizeof(T)), "clearing GPU memory");
+            check(cudaMemset(data_, 0, count * sizeof(T)), "clearing GPU memory");
         }
     }
 
-    std::vector<T> to_host() const
+    std::vector<T> to_host() const { return to_host(size_); }
+
+    std::vector<T> to_host(std::size_t count) const
     {
-        std::vector<T> values(size_);
-        if (size_ > 0)
+        std::vector<T> values(count);
+        if (count > 0)
         {
-            check(cudaMemcpy(values.data(), data_, size_ * sizeof(T), cudaMemcpyDeviceToHost), "copying from the GPU");
+            check(cudaMemcpy(values.data(), data_, count * sizeof(T), cudaMemcpyDeviceToHost), "copying from the GPU");
         }
         return values;
     }
@@ -177,15 +212,15 @@ struct launch_work
     int row_count;
 };
 
-// Decides how much work each kernel launch gets. Windows resets a GPU when one kernel runs longer than about 2 seconds
-// (TDR, Timeout Detection and Recovery: the render fails, and on a GPU that drives a display the screen flickers), and
-// while a kernel runs on such a GPU, the desktop can't redraw. So each launch should take about launch_seconds. But not
-// much less: every launch costs some microseconds to start and to wait for, and at its end the GPU is partly idle while
-// its last warps finish. How long a sample takes varies a lot: between scenes, between precisions, and between the rows
-// of one image (a ray into the sky is done at once, while one that hits glass bounces on). So the first pass measures
-// it. It starts with a small band of rows and goes on with bands sized by the speed of the last one, but at most twice
-// as large, in case the rows ahead are slower. It notes how long each row took, and the later passes are planned from
-// these times: as many whole passes per launch as fit in launch_seconds or, when not even one fits (a large image in
+// Decides how much work each kernel launch of a view gets. Windows resets a GPU when one kernel runs longer than about
+// 2 seconds (TDR, Timeout Detection and Recovery: the render fails, and on a GPU that drives a display the screen
+// flickers). So each launch should take about launch_seconds (see render_options), the budget. But not much less: every
+// launch costs some microseconds to start and to wait for, and at its end the GPU is partly idle while its last warps
+// finish. How long a sample takes varies a lot: between scenes, between precisions, and between the rows of one image
+// (a ray into the sky is done at once, while one that hits glass bounces on). So the first pass measures it. It starts
+// with a small band of rows (the probe) and goes on with bands sized by the speed of the last one, but at most twice as
+// large, in case the rows ahead are slower. It notes how long each row took, and the later passes are planned from
+// these times: as many whole passes per launch as fit in the budget or, when not even one fits (a large image in
 // float64), bands of rows that fit. The image doesn't depend on this grouping: every sample has its own random numbers
 // (see random.cuh), and every pixel adds up its samples in the order of the passes.
 //
@@ -202,42 +237,56 @@ struct launch_work
 class launch_planner
 {
 public:
-    // resident_blocks: how many of the kernel's blocks the GPU runs at once (see resident_blocks)
-    launch_planner(int width, int height, int passes, int resident_blocks)
+    // resident_blocks: how many of the kernel's blocks the GPU runs at once (see resident_blocks); probe_samples: the
+    // size of the first pass's first band, and band_samples the most samples any band of the first pass may have (see
+    // first_view_probe_samples)
+    launch_planner(int width, int height, int resident_blocks, double probe_samples, double band_samples)
         : width_(width),
           height_(height),
-          passes_(passes),
           min_rows_(wave_rows(width, height, resident_blocks)),
+          probe_samples_(probe_samples),
+          band_samples_(band_samples),
           row_seconds_(static_cast<std::size_t>(height))
     {
     }
 
-    bool done() const { return pass_ == passes_; }
-    int passes_done() const { return pass_; }
+    // Where the view's image is: its complete passes, and the rows of the next one
+    accumulation state() const { return {pass_, row_}; }
 
-    launch_work next() const
+    // A view that renders nothing (max_depth 0) gets there without a launch
+    void skip_to(accumulation target)
     {
+        pass_ = target.passes;
+        row_ = target.rows;
+    }
+
+    // The next launch: as much work as the budget allows, by the times measured so far, and none beyond `target`, which
+    // must be ahead of state()
+    launch_work next(double budget, accumulation target) const
+    {
+        // The rows this pass may render: all, unless it is the target's unfinished one
+        const int end_row = pass_ < target.passes ? height_ : target.rows;
         if (pass_ == 0)
         {
-            constexpr double probe_samples = 1 << 16;
             const double samples =
-                last_samples_ > 0 ? std::min(launch_seconds * last_speed_, 2 * last_samples_) : probe_samples;
-            return band(static_cast<int>(std::min(std::floor(samples / width_), static_cast<double>(height_))));
+                last_samples_ > 0 ? std::min({budget * last_speed_, 2 * last_samples_, band_samples_}) : probe_samples_;
+            const double rows = std::min(std::floor(samples / width_), static_cast<double>(height_));
+            return band(static_cast<int>(rows), end_row);
         }
-        if (row_ == 0 && pass_seconds_ <= launch_seconds)
+        if (row_ == 0 && pass_ < target.passes && pass_seconds_ <= budget)
         {
             const double passes =
-                std::min(std::floor(launch_seconds / pass_seconds_), static_cast<double>(passes_ - pass_));
-            return {pass_, static_cast<int>(passes), 0, height_};
+                std::min(std::floor(budget / pass_seconds_), static_cast<double>(target.passes - pass_));
+            return {static_cast<int>(pass_), static_cast<int>(passes), 0, height_};
         }
         int rows = 1;
         double seconds = row_seconds_[static_cast<std::size_t>(row_)];
-        while (row_ + rows < height_ && seconds + row_seconds_[static_cast<std::size_t>(row_ + rows)] <= launch_seconds)
+        while (row_ + rows < height_ && seconds + row_seconds_[static_cast<std::size_t>(row_ + rows)] <= budget)
         {
             seconds += row_seconds_[static_cast<std::size_t>(row_ + rows)];
             ++rows;
         }
-        return band(rows);
+        return band(rows, end_row);
     }
 
     void finished(const launch_work& work, double seconds)
@@ -266,15 +315,19 @@ private:
         return std::min(block_height * std::max(1, resident_blocks / blocks_across), height);
     }
 
-    // One pass of a band of `rows` rows from row_, but of at least min_rows_ rows and at most the rows left
-    launch_work band(int rows) const { return {pass_, 1, row_, std::min(std::max(rows, min_rows_), height_ - row_)}; }
+    // One pass of a band of `rows` rows from row_, but of at least min_rows_ rows and at most the rows up to end_row
+    launch_work band(int rows, int end_row) const
+    {
+        return {static_cast<int>(pass_), 1, row_, std::min(std::max(rows, min_rows_), end_row - row_)};
+    }
 
     int width_;
     int height_;
-    int passes_;
     int min_rows_; // the fewest rows a band has, unless fewer are left: a wave's worth (see above)
-    int pass_ = 0; // the first pass not yet complete
-    int row_ = 0;  // its first row not yet rendered
+    double probe_samples_;
+    double band_samples_;
+    std::int64_t pass_ = 0; // the first pass not yet complete
+    int row_ = 0;           // its first row not yet rendered
     double last_samples_ = 0;
     double last_speed_ = 0;          // samples per second
     std::vector<double> row_seconds_; // how long one pass of each row took when it was last rendered
@@ -638,11 +691,9 @@ images_on_device to_images(const std::vector<image_desc>& images)
     return result;
 }
 
-// Rejects what the kernels can't render, before anything is copied to the GPU. Every index the kernels follow is
-// checked here: on the GPU an index out of range may read whatever lies there without any error, or stop the kernel.
-void validate(const scene_desc& scene)
+// Rejects a view the kernels can't render (see validate)
+void validate_camera(const camera_desc& camera)
 {
-    const camera_desc& camera = scene.camera;
     if (camera.image_width < 1 || camera.image_height < 1)
     {
         throw std::runtime_error("the image must be at least one pixel wide and high");
@@ -657,6 +708,14 @@ void validate(const scene_desc& scene)
     {
         throw std::runtime_error("the number of rays per pixel must be from 1 to 46340²");
     }
+}
+
+// Rejects what the kernels can't render, before anything is copied to the GPU. Every index the kernels follow is
+// checked here: on the GPU an index out of range may read whatever lies there without any error, or stop the kernel.
+void validate(const scene_desc& scene)
+{
+    const camera_desc& camera = scene.camera;
+    validate_camera(camera);
     // The permutations are stored as bytes on the GPU (see perlin_table in perlin.cuh)
     for (const perlin_desc& tables : scene.perlins)
     {
@@ -1028,99 +1087,362 @@ private:
     sampling_strategy sampling_;
 };
 
-// All passes of the render with the kernel of the given kind, launch after launch: adds the samples to sums and the
-// rays traced to ray_count. Returns the time the passes took on the GPU.
+// The kernel of the given kind on one launch's work. <<<grid, block>>> is CUDA's syntax for a launch: the kernel runs
+// in grid.x × grid.y blocks of block.x × block.y threads each. The launch only queues the kernel and returns at once.
 template <real_number Real, kernel_kind Kind>
-double run_passes(const camera<Real>& cam, const scene_view<Real>& scene, const render_options& options, double* sums,
-                  unsigned long long* ray_count)
+void launch_kernel(const camera<Real>& cam, const scene_view<Real>& scene, std::uint64_t seed, const launch_work& work,
+                   double* sums, unsigned long long* ray_count)
 {
-    const int width = cam.image_width;
-    const int height = cam.image_height;
-    const int passes = cam.sqrt_spp * cam.sqrt_spp;
-    launch_planner planner(width, height, passes, resident_blocks<Real, Kind>());
-    event start;
-    event stop;
-    double kernel_seconds = 0;
-    while (!planner.done())
+    const dim3 block(block_width, block_height);
+    const dim3 grid(static_cast<unsigned>((cam.image_width + block_width - 1) / block_width),
+                    static_cast<unsigned>((work.row_count + block_height - 1) / block_height));
+    if constexpr (Kind == kernel_kind::first_book)
     {
-        const launch_work work = planner.next();
-        const dim3 block(block_width, block_height);
-        const dim3 grid(static_cast<unsigned>((width + block_width - 1) / block_width),
-                        static_cast<unsigned>((work.row_count + block_height - 1) / block_height));
-        start.record();
-        // <<<grid, block>>> is CUDA's syntax for a launch: the kernel runs in grid.x × grid.y blocks of
-        // block.x × block.y threads each. The launch only queues the kernel and returns at once; the GPU runs it
-        // while the CPU goes on to stop.synchronize(), which waits for it.
-        if constexpr (Kind == kernel_kind::first_book)
+        first_book_kernel<Real><<<grid, block>>>(cam, scene.tree.nodes, scene.tree.node_count, scene.tree.spheres,
+                                                 scene.primitive_materials, scene.materials, seed, work, sums,
+                                                 ray_count);
+    }
+    else
+    {
+        all_books_kernel<Real><<<grid, block>>>(cam, scene, seed, work, sums, ray_count);
+    }
+    // A launch returns no error code. If the kernel couldn't even start (an invalid grid or block size, say),
+    // cudaGetLastError reports it (check clears every error it reports, so this one is the launch's); errors while
+    // it runs come back when the host waits for it
+    check(cudaGetLastError(), "launching the kernel");
+}
+
+// The kernel is chosen by what the scene contains, and by the option that asks for the general one
+bool uses_first_book_kernel(const scene_desc& scene, const session_options& options)
+{
+    return !options.all_books_kernel && first_book_scene(scene);
+}
+}
+
+// What a session holds, behind its pointer (see session in renderer.h). The precision is chosen at run time, so the
+// session holds the interface and in<Real> the rest: the scene in the GPU's memory in Real, and the view.
+struct session::impl
+{
+    template <real_number Real>
+    class in;
+
+    virtual ~impl() = default;
+    virtual void set_camera(const camera_desc& camera) = 0;
+    virtual const camera_desc& camera() const = 0;
+    virtual accumulation state() const = 0;
+    virtual render_report render_to(accumulation target, const std::function<void(std::int64_t)>& on_pass) = 0;
+    virtual render_report render_for(double seconds, std::int64_t pass_limit) = 0;
+    virtual std::vector<double> pixels() const = 0;
+    virtual std::uint64_t rays() const = 0;
+    virtual bool has_view() const = 0;
+    virtual double kernel_seconds() const = 0;
+    virtual const kernel_info& kernel() const = 0;
+};
+
+template <real_number Real>
+class session::impl::in final : public session::impl
+{
+public:
+    in(const scene_desc& scene, const session_options& options)
+        : options_(options),
+          sampling_(scene.camera.sampling),
+          device_(scene),
+          first_book_(uses_first_book_kernel(scene, options)),
+          kernel_(first_book_ ? describe_kernel<Real, kernel_kind::first_book>()
+                              : describe_kernel<Real, kernel_kind::all_books>()),
+          resident_blocks_(first_book_ ? resident_blocks<Real, kernel_kind::first_book>()
+                                       : resident_blocks<Real, kernel_kind::all_books>()),
+          ray_count_(1)
+    {
+        start_view(scene.camera, first_view_probe_samples, std::numeric_limits<double>::infinity());
+    }
+
+    void set_camera(const camera_desc& camera) override
+    {
+        validate_camera(camera);
+        if (camera.sampling != sampling_)
         {
-            first_book_kernel<Real><<<grid, block>>>(cam, scene.tree.nodes, scene.tree.node_count, scene.tree.spheres,
-                                                     scene.primitive_materials, scene.materials, options.seed, work,
-                                                     sums, ray_count);
+            throw std::invalid_argument("a session's view must keep the scene's sampling strategy");
+        }
+        start_view(camera, next_view_probe_samples<Real>, next_view_probe_samples<Real>);
+    }
+
+    const camera_desc& camera() const override { return camera_; }
+    accumulation state() const override { return planner().state(); }
+
+    render_report render_to(accumulation target, const std::function<void(std::int64_t)>& on_pass) override
+    {
+        check_target(target);
+        render_report report;
+        if (cam_.max_depth <= 0)
+        {
+            skip_to(target);
+        }
+        while (planner().state() < target)
+        {
+            const std::int64_t passes_before = planner().state().passes;
+            run(planner().next(options_.launch_seconds, target), report);
+            if (on_pass && planner().state().passes > passes_before)
+            {
+                on_pass(planner().state().passes);
+            }
+        }
+        report.state = planner().state();
+        return report;
+    }
+
+    render_report render_for(double seconds, std::int64_t pass_limit) override
+    {
+        if (!(seconds >= 0 && seconds <= 3600))
+        {
+            throw std::invalid_argument("render_for needs a time from 0 to 3600 seconds");
+        }
+        const accumulation target{pass_limit, 0};
+        check_view();
+        check_range(target);
+        render_report report;
+        if (cam_.max_depth <= 0)
+        {
+            skip_to(target);
+        }
+        while (planner().state() < target)
+        {
+            // The view's first pass is completed whatever the time; after it, launches fill the time that is left
+            const bool first_pass = planner().state().passes == 0;
+            if (!first_pass && report.gpu_seconds >= seconds)
+            {
+                break;
+            }
+            const double budget =
+                first_pass ? options_.launch_seconds : std::min(options_.launch_seconds, seconds - report.gpu_seconds);
+            run(planner().next(budget, target), report);
+        }
+        report.state = planner().state();
+        return report;
+    }
+
+    std::vector<double> pixels() const override
+    {
+        const accumulation now = planner().state();
+        if (now.passes == 0 || now.rows != 0)
+        {
+            throw std::logic_error("the image has no complete passes, or a pass in progress");
+        }
+        std::vector<double> values = sums_.to_host(values_in_view());
+        // The average of the samples, as the CPU's pixel_samples_scale_
+        const double scale = 1.0 / static_cast<double>(now.passes);
+        for (double& value : values)
+        {
+            value *= scale;
+        }
+        return values;
+    }
+
+    std::uint64_t rays() const override
+    {
+        check_view();
+        return ray_count_.to_host().front();
+    }
+    double kernel_seconds() const override
+    {
+        check_view();
+        return kernel_seconds_;
+    }
+    bool has_view() const override { return planner_.has_value(); }
+    const kernel_info& kernel() const override { return kernel_; }
+
+private:
+    std::size_t values_in_view() const
+    {
+        return static_cast<std::size_t>(camera_.image_width) * static_cast<std::size_t>(camera_.image_height) * 3;
+    }
+
+    // The image starts over: new sums, at least as large as the view needs (they grow, never shrink, so the same
+    // views in turn don't allocate again), a new count of rays and a new planner. The old view is dropped before the
+    // old sums are freed, which keeps the memory of the old and the new sums from being needed at once; so if a step
+    // fails (the GPU's memory can't hold the new sums), the session has no view until a set_camera succeeds (see
+    // planner()).
+    void start_view(const camera_desc& camera, double probe_samples, double band_samples)
+    {
+        const gpu::camera<Real> cam = to_camera<Real>(camera);
+        planner_.reset();
+        const std::size_t values = static_cast<std::size_t>(camera.image_width) *
+                                   static_cast<std::size_t>(camera.image_height) * 3;
+        if (sums_.size() < values)
+        {
+            sums_ = device_array<double>(0); // frees the old sums before the new ones are allocated
+            sums_ = device_array<double>(values);
+        }
+        sums_.fill_with_zeros(values);
+        ray_count_.fill_with_zeros();
+        kernel_seconds_ = 0;
+        camera_ = camera;
+        cam_ = cam;
+        planner_.emplace(camera.image_width, camera.image_height, resident_blocks_, probe_samples, band_samples);
+    }
+
+    // The planner of the view; none after a set_camera that failed
+    launch_planner& planner()
+    {
+        check_view();
+        return *planner_;
+    }
+    const launch_planner& planner() const
+    {
+        check_view();
+        return *planner_;
+    }
+    void check_view() const
+    {
+        if (!planner_)
+        {
+            throw std::logic_error("the session has no view: its last set_camera failed");
+        }
+    }
+
+    void check_target(accumulation target) const
+    {
+        check_view();
+        check_range(target);
+        if (target < planner().state())
+        {
+            throw std::invalid_argument("a render target can't be behind the image");
+        }
+    }
+
+    void check_range(accumulation target) const
+    {
+        const std::int64_t passes = std::int64_t{cam_.sqrt_spp} * cam_.sqrt_spp;
+        if (target.passes < 0 || target.rows < 0 || target.rows >= cam_.image_height || target.passes > passes ||
+            (target.passes == passes && target.rows > 0))
+        {
+            throw std::invalid_argument("a render target must be a number of passes from 0 to sqrt_spp², and rows "
+                                        "of the next pass from 0 to below the image's height");
+        }
+    }
+
+    // A path of no rays brings no light: with max_depth 0 (or less) the image stays black, as on the CPU, and needs no
+    // launch
+    void skip_to(accumulation target)
+    {
+        if (planner().state() < target)
+        {
+            planner().skip_to(target);
+        }
+    }
+
+    // One launch: queues the kernel, waits for it and tells the planner how long it took
+    void run(const launch_work& work, render_report& report)
+    {
+        start_.record();
+        if (first_book_)
+        {
+            launch_kernel<Real, kernel_kind::first_book>(cam_, device_.view(), options_.seed, work, sums_.data(),
+                                                         ray_count_.data());
         }
         else
         {
-            all_books_kernel<Real><<<grid, block>>>(cam, scene, options.seed, work, sums, ray_count);
+            launch_kernel<Real, kernel_kind::all_books>(cam_, device_.view(), options_.seed, work, sums_.data(),
+                                                        ray_count_.data());
         }
-        // A launch returns no error code. If the kernel couldn't even start (an invalid grid or block size, say),
-        // cudaGetLastError reports it; errors while it runs come back at stop.synchronize()
-        check(cudaGetLastError(), "launching the kernel");
-        stop.record();
-        stop.synchronize();
-        const double seconds = event::seconds_between(start, stop);
-        kernel_seconds += seconds;
-
-        const int passes_before = planner.passes_done();
-        planner.finished(work, seconds);
-        if (options.progress && planner.passes_done() > passes_before)
-        {
-            options.progress(planner.passes_done(), passes);
-        }
+        stop_.record();
+        stop_.synchronize();
+        const double seconds = event::seconds_between(start_, stop_);
+        kernel_seconds_ += seconds;
+        ++report.launches;
+        report.gpu_seconds += seconds;
+        report.longest_launch_seconds = std::max(report.longest_launch_seconds, seconds);
+        planner().finished(work, seconds);
+        report.state = planner().state();
     }
-    return kernel_seconds;
-}
 
-// render() in one precision
-template <real_number Real>
-render_result render_in(const scene_desc& scene, const render_options& options)
+    session_options options_;
+    sampling_strategy sampling_; // the scene's
+    device_scene<Real> device_;
+    bool first_book_;
+    kernel_info kernel_;
+    int resident_blocks_;
+    camera_desc camera_;
+    gpu::camera<Real> cam_{}; // the view as the kernels take it (the bare name camera is the function above)
+    device_array<double> sums_{0};
+    device_array<unsigned long long> ray_count_;
+    double kernel_seconds_ = 0;
+    std::optional<launch_planner> planner_;
+    event start_;
+    event stop_;
+};
+
+session::session(const scene_desc& scene, const session_options& options)
 {
-    const auto start_time = std::chrono::steady_clock::now();
     validate(scene);
+    if (!(options.launch_seconds > 0 && options.launch_seconds <= max_launch_seconds))
+    {
+        throw std::invalid_argument(
+            std::format("a launch must be planned to take more than 0 and at most {} seconds", max_launch_seconds));
+    }
     check(cudaSetDevice(0), "selecting the CUDA device");
-
-    const camera<Real> cam = to_camera<Real>(scene.camera);
-    const device_scene<Real> device(scene);
-    const int width = cam.image_width;
-    const int height = cam.image_height;
-    const int passes = cam.sqrt_spp * cam.sqrt_spp;
-    device_array<double> sums(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3);
-    sums.fill_with_zeros();
-    device_array<unsigned long long> ray_count(1);
-    ray_count.fill_with_zeros();
-
-    // The kernel is chosen by what the scene contains (and by the option that asks for the general one)
-    const bool first_book = !options.all_books_kernel && first_book_scene(scene);
-    render_result result;
-    result.kernel = first_book ? describe_kernel<Real, kernel_kind::first_book>()
-                               : describe_kernel<Real, kernel_kind::all_books>();
-    // A path of no rays brings no light: with max_depth 0 the image stays black, as on the CPU
-    if (cam.max_depth > 0)
+    if (options.arithmetic == precision::float64)
     {
-        result.kernel_seconds =
-            first_book
-                ? run_passes<Real, kernel_kind::first_book>(cam, device.view(), options, sums.data(), ray_count.data())
-                : run_passes<Real, kernel_kind::all_books>(cam, device.view(), options, sums.data(), ray_count.data());
+        impl_ = std::make_unique<impl::in<double>>(scene, options);
     }
-
-    result.pixels = sums.to_host();
-    const double scale = 1.0 / passes; // the average of the samples, as the CPU's pixel_samples_scale_
-    for (double& value : result.pixels)
+    else
     {
-        value *= scale;
+        impl_ = std::make_unique<impl::in<float>>(scene, options);
     }
-    result.rays = ray_count.to_host().front();
-    result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
-    return result;
 }
+
+session::~session() = default;
+session::session(session&&) noexcept = default;
+session& session::operator=(session&&) noexcept = default;
+
+void session::set_camera(const camera_desc& camera)
+{
+    impl_->set_camera(camera);
+}
+
+const camera_desc& session::camera() const
+{
+    return impl_->camera();
+}
+
+accumulation session::state() const
+{
+    return impl_->state();
+}
+
+render_report session::render_to(accumulation target, const std::function<void(std::int64_t)>& on_pass)
+{
+    return impl_->render_to(target, on_pass);
+}
+
+render_report session::render_for(double seconds, std::int64_t pass_limit)
+{
+    return impl_->render_for(seconds, pass_limit);
+}
+
+std::vector<double> session::pixels() const
+{
+    return impl_->pixels();
+}
+
+std::uint64_t session::rays() const
+{
+    return impl_->rays();
+}
+
+bool session::has_view() const
+{
+    return impl_->has_view();
+}
+
+double session::kernel_seconds() const
+{
+    return impl_->kernel_seconds();
+}
+
+const kernel_info& session::kernel() const
+{
+    return impl_->kernel();
 }
 
 bool is_convex(const std::vector<quad_desc>& quads)
@@ -1194,7 +1516,25 @@ device_info query_device()
 
 render_result render(const scene_desc& scene, const render_options& options)
 {
-    return options.arithmetic == precision::float64 ? render_in<double>(scene, options)
-                                                    : render_in<float>(scene, options);
+    const auto start_time = std::chrono::steady_clock::now();
+    session one(scene, {.seed = options.seed,
+                         .arithmetic = options.arithmetic,
+                         .all_books_kernel = options.all_books_kernel,
+                         .launch_seconds = options.launch_seconds});
+    const std::int64_t passes = std::int64_t{scene.camera.sqrt_spp} * scene.camera.sqrt_spp;
+    std::function<void(std::int64_t)> on_pass;
+    if (options.progress)
+    {
+        on_pass = [&](std::int64_t done) { options.progress(done, passes); };
+    }
+    one.render_to({passes, 0}, on_pass);
+
+    render_result result;
+    result.pixels = one.pixels();
+    result.kernel_seconds = one.kernel_seconds();
+    result.rays = one.rays();
+    result.kernel = one.kernel();
+    result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
+    return result;
 }
 }
