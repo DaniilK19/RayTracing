@@ -1,0 +1,28 @@
+# The camera script of the README's GIF (docs/viewer.gif), which scripts/make-gif.ps1 renders with
+#   RayTracingViewer --headless --script docs\viewer-tour.txt --frames <folder>
+# and turns into a GIF of 12.5 frames a second (80 ms a frame). The samples per frame are the live window's at this
+# size, measured with --stats (--refresh-hz 60): a moving frame has those of one frame of 1/60 s (6, the median); after
+# a change the window keeps a moving view's budget for 150 ms, so the first three GIF frames add 40, 32 and 40; after
+# that, every 80 ms adds 65. The window stops refining at the scene's 1000 samples rounded up to whole rounds of 8×8,
+# 1024, where the still stretches after the orbit and after the focus end (the orbit cuts the first one short).
+scene final
+size 960 540
+strata 8
+seed 0
+hold 1 +40                     # the scene's own view: 0.8 s of refining
+hold 1 +32
+hold 1 +40
+hold 7 +65
+orbit 20 +6 yaw 35             # 1.6 s: an orbit around the point looked at, eased in and out, every frame a new view
+hold 1 +40                     # still: refining to 1024 samples (from the orbit's last 6)
+hold 1 +32
+hold 1 +40
+hold 13 +65
+hold 1 +61
+focus-at 513 412               # a double-click on the glass sphere in front...
+camera defocus-angle 1.5       # ...and the lens open: the scene behind it blurs, refining to 1024 again
+hold 1 +40
+hold 1 +32
+hold 1 +40
+hold 14 +65
+hold 1 +2

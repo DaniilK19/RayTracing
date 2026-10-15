@@ -3,6 +3,7 @@
 [RayTracing](../README.md) › Building and running
 
 - [Requirements](#requirements)
+- [SDL3 for the window](#sdl3-for-the-window)
 - [Building](#building)
 - [RayTracing options](#raytracing-options)
 - [Render times](#render-times)
@@ -11,11 +12,23 @@
 
 ## Requirements
 
-Visual Studio 2026 with the "Desktop development with C++" workload, which brings the MSVC compiler, CMake and Ninja. `RayTracingGPU` also needs an NVIDIA graphics card and the CUDA Toolkit 13; see [the CUDA renderer](gpu.md#building-and-running).
+Visual Studio 2026 with the "Desktop development with C++" workload, which brings the MSVC compiler, CMake and Ninja. `RayTracingGPU` and `RayTracingViewer` also need an NVIDIA graphics card and the CUDA Toolkit 13; see [the CUDA renderer](gpu.md#building-and-running). `RayTracingViewer` also needs SDL3, which CMake downloads.
+
+## SDL3 for the window
+
+`RayTracingViewer` draws its window with [SDL 3.4.18](https://github.com/libsdl-org/SDL/releases/tag/release-3.4.18) (zlib license). The first configure downloads SDL's release archive (about 15 MiB) into `out/downloads`, where every preset's build finds it, checks its SHA-256, and builds SDL as a static library, so the program needs no DLL. SDL is downloaded and built only when the CUDA Toolkit is found, as the window has nothing to show without it.
+
+The download never stops the configure: if it fails, or gets the wrong bytes, CMake warns that it skipped the window and builds everything else. Without a network, get `SDL3-3.4.18.tar.gz` from SDL's release page by hand and point CMake at it, or at an unpacked SDL source folder, or turn the window off:
+
+```
+cmake --preset x64-release -DRAYTRACING_SDL3_URL=file:///C:/Downloads/SDL3-3.4.18.tar.gz
+cmake --preset x64-release -DFETCHCONTENT_SOURCE_DIR_SDL3=C:/src/SDL3-3.4.18
+cmake --preset x64-release -DRAYTRACING_VIEWER=OFF
+```
 
 ## Building
 
-**In Visual Studio:** open the project folder, select the `x64 Release` preset and the `RayTracing.exe` startup item, and press Ctrl+F5. The program renders the `final` scene, its default, and prints the path to the finished image. The `MonteCarlo.exe` startup item runs the Monte Carlo experiments, and `ImageCompare.exe` compares two renders. `RayTracingGPU.exe` is there if the CUDA Toolkit is installed.
+**In Visual Studio:** open the project folder, select the `x64 Release` preset and the `RayTracing.exe` startup item, and press Ctrl+F5. The program renders the `final` scene, its default, and prints the path to the finished image. The `MonteCarlo.exe` startup item runs the Monte Carlo experiments, and `ImageCompare.exe` compares two renders. `RayTracingGPU.exe` and `RayTracingViewer.exe` are there if the CUDA Toolkit is installed.
 
 To pass options when launching from Visual Studio, open **Debug → Debug and Launch Settings for RayTracing** and add `"args": ["cornell", "-s", "100"]` to the configuration.
 
@@ -103,6 +116,7 @@ The 13 scenes as the CPU renderer draws them, 480 pixels wide. The scene name is
 
 ## The other programs
 
-- **`RayTracingGPU`** takes the same options and adds `--fp64` and `--all-books-kernel`; see [the CUDA renderer](gpu.md#building-and-running).
+- **`RayTracingGPU`** takes the same options and adds the image's height and the camera (`--height`, `--lookfrom`, `--lookat`, `--vfov`, `--defocus-angle`, `--focus-dist`), `--strata`, `--fp64`, `--all-books-kernel` and `--launch-ms`; see [the CUDA renderer](gpu.md#building-and-running).
+- **`RayTracingViewer`** shows a scene in a window and refines it while the camera stands still, with `RayTracingGPU`'s options for the scene, the size, the camera, the sampling and the precision; see [the viewer](viewer.md).
 - **`ImageCompare A.pfm B.pfm`** tests whether two renders are the same picture up to noise; see [ImageCompare](image-compare.md).
 - **`MonteCarlo [experiment...]`** runs the third book's numerical experiments; see [the MonteCarlo program](sampling.md#the-montecarlo-program).

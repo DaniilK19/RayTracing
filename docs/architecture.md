@@ -48,25 +48,37 @@ The CPU renderer implements the techniques of [the three books](#third-party-cod
   - two kernels from that source: the first book's scenes keep a kernel of their own, as fast as before the second and third books were ported, and on that machine the general kernel renders them 17 to 28% slower;
   - deterministic like the CPU: every sample has its own random numbers, so the image doesn't depend on how the GPU schedules its threads;
   - robust in `float`: self-intersection rules for spheres and quads, a discriminant with fused multiply-adds, a slab test safe for directions with a zero component, camera rays built relative to the camera, the hit point moved onto the sphere for a checker, and quad points computed as on the CPU ([what float costs](gpu.md#what-float-costs)).
+- **The viewer** ([details](viewer.md)):
+  - `RayTracingViewer` shows any scene in an SDL3 window and refines it while the camera stands still, through a rendering session that keeps the scene on the GPU and adds samples pass by pass;
+  - rounds of strata: grid after grid of stratified samples, each with random numbers of its own, so a render can have any number of samples, and `RayTracingGPU --strata K -s N` renders the same ones;
+  - camera control with the mouse and the keys (orbit, look, pan, dolly, fly, zoom), the lens and click-to-focus, scene and precision switches, the numbers and the help on screen;
+  - every frame it shows can be rendered again, bit for bit: by `RayTracingGPU` from the command P prints, or by the viewer itself without a window from a recording;
+  - frames paced to the display while the camera moves and 50 ms of GPU work each while it stands still; waits for the GPU that sleep, so the CPU stays nearly idle;
+  - camera scripts and scripted input, which make the window's behavior testable: a recording of a live window driven by scripted events, replayed without a window, gives the same frames.
 
 ## Library and programs
 
-Each `.ixx` file in `src/` is a C++20 module (`export module ...`). The modules are compiled once into a static library, `raytracer`, and the four programs link it. The CUDA renderer is a separate static library, `gpu_renderer`, compiled by `nvcc`; it and `RayTracingGPU` are built only when CMake finds the CUDA Toolkit.
+Each `.ixx` file in `src/` is a C++20 module (`export module ...`). Twenty of them are compiled once into a static library, `raytracer`, and every program links it. The CUDA renderer is a separate static library, `gpu_renderer`, compiled by `nvcc`, and `gpu_scene` is a library of two modules shared by the GPU programs: `gpu_scene`, which translates a scene for the renderer, and `view_options`, the camera's options. These, `RayTracingGPU` and `RayTracingViewer` are built only when CMake finds the CUDA Toolkit; the viewer also needs SDL3, which CMake downloads ([building](building.md#sdl3-for-the-window)).
 
 ```mermaid
 flowchart LR
-    std["std module, built from the std.ixx that ships with MSVC"] --> lib["raytracer: the 20 modules in src"]
+    std["std module, built from the std.ixx that ships with MSVC"] --> lib["raytracer: 20 modules in src"]
     lib --> rt["RayTracing: renders on the CPU"]
     lib --> mc["MonteCarlo: the numerical experiments"]
     lib --> ic["ImageCompare: the statistical test"]
-    lib --> gp["RayTracingGPU: builds a scene and translates it"]
+    lib --> gs["gpu_scene: a scene translated into plain numbers, the camera's options"]
+    gs --> gp["RayTracingGPU: renders a scene on the GPU"]
+    gs --> vw["RayTracingViewer: the window, its camera moves and scripts"]
     cu["gpu_renderer: src/gpu, CUDA C++20 compiled by nvcc"] --> gp
+    cu --> vw
+    sdl["SDL3, downloaded and built as a static library"] --> vw
 ```
 
 | Program | Source | What it does |
 |---|---|---|
 | `RayTracing` | `main.cpp` | renders a scene on the CPU; the command-line options |
-| `RayTracingGPU` | `main_gpu.cpp` | builds a scene with the modules, translates it into plain numbers, with its instances moved into the world once, and renders it on the GPU |
+| `RayTracingGPU` | `main_gpu.cpp` | builds a scene with the modules, translates it into plain numbers (`gpu_scene.ixx`), with its instances moved into the world once, and renders it on the GPU |
+| `RayTracingViewer` | `main_viewer.cpp` | shows a scene in a window and refines it on the GPU while the camera stands still; the window's events, frames, keys, scripts and recordings |
 | `ImageCompare` | `image_compare.cpp` | are two renders the same picture up to noise? |
 | `MonteCarlo` | `monte_carlo.cpp` | the third book's numerical experiments, with the renderer's own random numbers, directions and densities, and a test of the light sampling |
 
@@ -95,14 +107,24 @@ flowchart LR
 | `scenes` | all scenes from the three books and the list for choosing one by name |
 | `cli` | helpers the programs share for their command lines: parsing numbers, checking output file names before rendering, paths as UTF-8 |
 
+The GPU programs' own modules:
+
+| Module | Contents |
+|---|---|
+| `gpu_scene` | a scene built with the CPU's modules and translated into the renderer's plain structures; the camera's frame for the GPU |
+| `view_options` | the camera's options (`--height`, `--lookfrom`, `--lookat`, `--vfov`, `--defocus-angle`, `--focus-dist`), the checks a view must pass, and the `View:` line that prints a view as options |
+| `viewer_camera` | the window's camera moves as pure functions of the camera's settings: orbit, look, pan, dolly, zoom, fly, the lens and the focus, shared by the mouse, the keys and the scripts |
+| `viewer_script` | the window's camera scripts, recordings and input files, as text: parsing them and writing them |
+
 ## The CUDA renderer's files
 
-The CUDA renderer in `src/gpu` is ordinary C++20 headers and one `.cu` file, compiled by `nvcc`, which can't import modules. Its files mirror the modules they port:
+The CUDA renderer in `src/gpu` is ordinary C++20 headers and two `.cu` files, compiled by `nvcc`, which can't import modules. Its files mirror the modules they port:
 
 | File | Contents | Ports |
 |---|---|---|
-| `renderer.h` | the interface between `main_gpu.cpp` and the renderer: the scene as plain numbers in (shapes, materials, textures, volumes, the lights list), the image out | |
-| `renderer.cu` | the two kernels and the host code around them: the scene checked and copied to the GPU, launches in passes, timing | `camera::render` |
+| `renderer.h` | the interface between the GPU programs (`gpu_scene.ixx`) and the renderer: the scene as plain numbers in (shapes, materials, textures, volumes, the lights list), the image out; a rendering session | |
+| `renderer.cu` | the two kernels and the host code around them: the scene checked and copied to the GPU, the session (views, rounds of strata, launches in passes, the image's bytes for the screen, waits that sleep), timing | `camera::render` |
+| `display.cu`, `display.cuh` | the image's bytes for the screen, computed on the GPU as `image::save_png` computes a PNG's (compiled without fused multiply-adds, and apart from the kernels, so it can't change how they compile) | `image` |
 | `scene.cuh` | the scene as each of the two kernels sees it | |
 | `camera.cuh` | camera rays, the sky, one step of a path, the four sampling strategies | `camera` |
 | `material.cuh` | the materials, as a `switch` on plain data | `material`, `onb` |
@@ -124,7 +146,7 @@ How these pieces render a scene, and why they are built this way: [the CUDA rend
 | Standard | Used for |
 |---|---|
 | C++23 | `import std;`; `std::expected` for errors; deducing this and a multidimensional `operator[]` (`img[x, y]`); `std::views::cartesian_product` and `std::views::zip`; `std::ranges::fold_left`, `contains`, `iota` and `to`; `std::unreachable`; `std::byteswap` and `std::print` for PFM files |
-| C++20 | modules; concepts (`direction_pdf`, `real_number`); ranges with projections; designated initializers; `std::jthread` and `std::atomic::wait`/`notify`; `std::bit_cast`; a defaulted `operator==`; a generic lambda with a constrained `auto` parameter |
+| C++20 | modules; concepts (`direction_pdf`, `real_number`); ranges with projections and `std::views::split`; designated initializers; `std::jthread` and `std::atomic::wait`/`notify`; `std::bit_cast`; a defaulted `operator==`; a generic lambda with a constrained `auto` parameter |
 | C++17 | `std::variant` with `std::visit` and `std::get_if`; `std::optional`; class template argument deduction; `if constexpr` |
 | CUDA, C++20 | device code written once as templates on the number type, constrained by a concept; RAII classes for GPU memory and CUDA events |
 
@@ -133,7 +155,7 @@ Where each one is used, and why:
 - **Modules and `import std;`** (C++20/23) instead of headers. The `std` module is built from `std.ixx`, which ships with MSVC (see `CMakeLists.txt`). The stb libraries are included in the global module fragment of the `image` module and are not visible outside it. An `import` isn't passed on (only `export import` is): `image` imports `vec3`, but a file that imports `image` still has to import `vec3` to use `color`, so every file imports what it uses.
 - **`constexpr` and `inline` in modules.** In a named module, unlike in a header, a function defined inside a class doesn't become `inline` by itself. So every function of the `vec3` module is declared `constexpr` (which implies `inline`) or `inline`; otherwise the compiler couldn't inline `vec3` calls into other modules' code, and a ray tracer makes billions of them (`vec3.ixx`).
 - **Static and dynamic polymorphism side by side.** Objects and materials are open families of long-lived objects, so they keep the books' virtual functions. Densities of directions, derived from an abstract base class in the book, are a closed set of short-lived values on the hottest path, so here they do without virtual functions: a **concept** (`direction_pdf`, C++20) instead of a base class, a class template `mixture_pdf` whose template arguments are deduced from the constructor's arguments (**CTAD**, C++17), a generic lambda with a constrained `auto` parameter (C++20), and **`std::variant` with `std::visit`** (C++17) for the density a material returns (`pdf.ixx`, `camera.ixx`).
-- **`std::variant` and `std::get_if`** for what a material does with a ray: a diffuse scatter (with a density) or a specular one (with a ready ray), wrapped in `std::optional` for absorption.
+- **`std::variant` and `std::get_if`** for what a material does with a ray: a diffuse scatter (with a density) or a specular one (with a ready ray), wrapped in `std::optional` for absorption. The viewer's camera scripts are lists of `std::variant`s too, one alternative per command, from lines cut with `std::views::split` (`viewer_script.ixx`).
 - **Ranges.** C++20 algorithms with projections: `std::ranges::sort` when building the BVH and in MonteCarlo, `std::ranges::find(scene_list, name, &scene_entry::name)` when choosing a scene. C++23: `std::views::cartesian_product` for the cells of a pixel, `std::views::zip` in MonteCarlo's convergence table, `std::ranges::fold_left` for the image's mean, `std::ranges::contains` in MonteCarlo's command line, `std::ranges::iota` in Perlin noise, `std::ranges::to` to collect a lowercase file extension into a string (`image.ixx`).
 - **`std::unreachable`** (C++23) after a `switch` that returns in every case.
 - **Multidimensional `operator[]` and deducing this** (C++23): `img[x, y]` with one function for const and non-const (`image.ixx`).
@@ -147,13 +169,13 @@ Where each one is used, and why:
 - **Ownership:** objects via `std::unique_ptr` (wrappers nest: `translate(rotate_y(box))`), shared materials and textures via `std::shared_ptr<const ...>`, and a non-owning `const material*` in the hot loop.
 - **C++ on the GPU** (CUDA, C++20): device code written once as templates on the number type, constrained by a concept (`real_number`: `float` or `double`), with `if constexpr` for what differs; RAII classes for GPU memory and CUDA events; designated initializers for the plain structures that cross from the CPU to the GPU (`src/gpu`).
 - **`std::bit_cast` and `std::byteswap`** (C++20, C++23) for the byte order of a PFM file, and **`std::print` into a stream** (C++23) for its header (`image.ixx`).
-- **`dynamic_cast`** asks the CPU's objects what they really are when `RayTracingGPU` translates them into plain numbers, walking lists, BVHs and instances (`main_gpu.cpp`). `std::conditional_t` gives each of the GPU's two kernels its own scene type, and a defaulted `operator==` (C++20) compares the lights list's shapes with the world's (`src/gpu`).
+- **`dynamic_cast`** asks the CPU's objects what they really are when the GPU programs translate them into plain numbers, walking lists, BVHs and instances (`gpu_scene.ixx`), and when the viewer's click-to-focus looks through smoke (`main_viewer.cpp`). `std::conditional_t` gives each of the GPU's two kernels its own scene type, and a defaulted `operator==` (C++20) compares the lights list's shapes with the world's (`src/gpu`).
 - **UTF-8 everywhere:** `/utf-8` for sources and strings, and the `src/utf8.manifest` manifest switches the process to UTF-8 (Windows 10 1903+), so paths with Cyrillic characters work in arguments too.
 
 ## Third-party code and credits
 
 The CPU renderer implements the algorithms and scenes of the book series by Peter Shirley, Trevor David Black and Steve Hollasch: ["Ray Tracing in One Weekend"](https://raytracing.github.io/books/RayTracingInOneWeekend.html), ["Ray Tracing: The Next Week"](https://raytracing.github.io/books/RayTracingTheNextWeek.html) and ["Ray Tracing: The Rest of Your Life"](https://raytracing.github.io/books/RayTracingTheRestOfYourLife.html). Its classes follow the books' C++ code; the project's own additions are listed above under [Beyond the books](#beyond-the-books).
 
-The only third-party libraries are [stb_image and stb_image_write](https://github.com/nothings/stb) in `external/stb`, which keep their own license (public domain or MIT, as their files say). The CUDA renderer's random number generator is PCG32 by Melissa O'Neill ([pcg-random.org](https://www.pcg-random.org)), ported from her minimal C implementation. The Earth map `assets/earthmap.jpg` comes from the [books' repository](https://github.com/RayTracing/raytracing.github.io) and is CC0, like that repository. The project's own code is under the [MIT license](../LICENSE).
+The third-party libraries are [stb_image and stb_image_write](https://github.com/nothings/stb) in `external/stb`, which keep their own license (public domain or MIT, as their files say), and [SDL3](https://libsdl.org) (zlib license), which CMake downloads and builds for the viewer's window. The README's GIF of the viewer is made with [gifski](https://gif.ski), run as a separate program by `scripts/make-gif.ps1`. The CUDA renderer's random number generator is PCG32 by Melissa O'Neill ([pcg-random.org](https://www.pcg-random.org)), ported from her minimal C implementation. The Earth map `assets/earthmap.jpg` comes from the [books' repository](https://github.com/RayTracing/raytracing.github.io) and is CC0, like that repository. The project's own code is under the [MIT license](../LICENSE).
 
 Published methods are credited in the comments where the code uses them. Among them, the CUDA renderer uses the SplitMix64 finalizer (Steele, Lea and Flood, 2014) to hash the seed, the pixel and the pass into each sample's generator, the ray-sphere discriminant of Haines et al. (*Ray Tracing Gems*, 2019, chapter 7), Aila and Laine's guard against zero direction components in the slab test, and the orthonormal basis of Duff et al. (JCGT, 2017); `ImageCompare` computes Student's t distribution through the incomplete beta function as in *Numerical Recipes* (section 6.4).

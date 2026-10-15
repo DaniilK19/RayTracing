@@ -57,7 +57,7 @@ struct options
     std::optional<std::filesystem::path> frames; // a folder for every frame shown, as PNG
     bool frames_hud = false;                     // the frames with the on-screen display and the help on them
     std::optional<std::filesystem::path> stats;  // a CSV file
-    std::optional<double> refresh_hz;            // pace as if the display ran at this rate
+    std::optional<double> refresh_hz;            // a moving frame's GPU time as at this display rate
     std::optional<std::filesystem::path> script; // play a camera script
     bool headless = false;                       // without a window
     std::optional<std::filesystem::path> record; // write the frames shown as a script
@@ -120,7 +120,7 @@ In the window:
   C                    copy that command
   Esc                  close the help, let the mouse go, or close the window
 
-Scripts and measurements:
+Scripts and measurements (see docs/viewer.md):
       --script FILE    play a camera script instead of taking input, then close
       --headless       no window: play the script, or render the samples; then save and exit
       --record FILE    write every frame shown with new samples as a script line, to render again
@@ -130,8 +130,8 @@ Scripts and measurements:
       --frames-hud     with --frames in a window: save the window as it is, the numbers and the help
                        on it
       --stats FILE     write a line of numbers per frame to a CSV file
-      --refresh-hz N   pace a moving view's frames as if the display ran at N Hz (for measurements;
-                       default: the display's own rate))",
+      --refresh-hz N   give a moving view's frames the GPU time of frames at N Hz (for measurements;
+                       default: the display's rate; the frames still come at the display's pace))",
                  default_viewer_scene, view_usage, max_strata, default_strata,
                  std::numeric_limits<std::uint32_t>::max());
 }
