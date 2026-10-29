@@ -1,5 +1,5 @@
-// The environment map on the GPU: from a direction to the map's texel, and the map's radiance along it. Device code;
-// the quality kernel's only, included by background.cuh (and the tests).
+// The environment map on the GPU: from a direction to the map's texel and back, and the map's radiance along it. Device
+// code; the quality kernel's only, included by background.cuh (and the tests).
 //
 // The map is equirectangular with +y up, seen from inside: a direction m of map space has the longitude
 // φ' = atan2(m_z, m_x) ∈ [−π, π] and the polar angle θ = atan2(√(m_x² + m_z²), m_y) ∈ [0, π], and the map's coordinates
@@ -64,6 +64,23 @@ __device__ inline int env_cell(const environment_view& e, const vec3<float>& wor
     const int i = clamp_index(static_cast<int>(u * static_cast<float>(e.width)), e.width);
     const int j = clamp_index(static_cast<int>(t * static_cast<float>(e.height)), e.height);
     return j * e.width + i;
+}
+
+// The way back, for the light sampler: the world direction at the fractions s_θ and s_φ ∈ [0, 1) of cell (i, j)'s
+// extent in cos θ and in φ', cos θ = cos θ_j − s_θ·(cos θ_j − cos θ_{j+1}) and φ' = 2π(i + s_φ)/W − π. The cell is a
+// rectangle in (φ', cos θ), and dω = dφ'·d(cos θ), so uniform fractions give directions uniform over its solid angle.
+// sin θ = √((1 − cos θ)(1 + cos θ)) keeps its digits near the poles, where 1 − cos²θ would cancel them, and sincospi
+// takes φ'/π = 2(i + s_φ)/W − 1, with no rounded π. A unit vector, to rounding.
+__device__ inline vec3<float> cell_direction(const environment_view& e, int i, int j, float s_theta, float s_phi)
+{
+    const float top = e.row_cos[j];
+    const float bottom = e.row_cos[j + 1];
+    const float cos_theta = top - s_theta * (top - bottom);
+    const float sin_theta = sqrt(fmax(0.0f, (1.0f - cos_theta) * (1.0f + cos_theta)));
+    float sin_phi;
+    float cos_phi;
+    sincospi(2.0f * (static_cast<float>(i) + s_phi) / static_cast<float>(e.width) - 1.0f, &sin_phi, &cos_phi);
+    return from_map(e, {sin_theta * cos_phi, cos_theta, sin_theta * sin_phi});
 }
 
 // The map's radiance along dir, as its nearest texel holds it (times the scale), and the density with which the light

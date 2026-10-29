@@ -89,13 +89,13 @@ __device__ bool trace_quality_ray(quality_path& q, const T& tracer, const qualit
     if (hit.index < 0)
     {
         // The sky or the environment, weighted against the light samples that could have drawn this direction (only
-        // after a vertex that took one: bsdf_pdf is 0 after the camera and under -p material). Both look up the very
-        // same vector, the ray's direction as it is (of any length): the map's cell of the radiance is then the cell of
-        // the density.
-        const float w = q.bsdf_pdf > 0.0f
-                            ? bsdf_weight(view.combination, q.bsdf_pdf, environment_hit_pdf(view, p.r.direction))
-                            : 1.0f;
-        sample = q.radiance + w * (p.throughput * background(view, cam, p.r.direction, q.specular));
+        // after a vertex that took one: bsdf_pdf is 0 after the camera and under -p material). The radiance and the
+        // map's density come from one lookup of the ray's direction as it is (of any length), the same texel.
+        float map_pdf;
+        const color<float> le = background(view, cam, p.r.direction, q.specular, map_pdf);
+        const float w =
+            q.bsdf_pdf > 0.0f ? bsdf_weight(view.combination, q.bsdf_pdf, environment_hit_pdf(view, map_pdf)) : 1.0f;
+        sample = q.radiance + w * (p.throughput * le);
         return true;
     }
     const surface<float> s = tracer.surface_of(p.r, hit);

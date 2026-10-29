@@ -71,9 +71,11 @@ consteval auto make_scene_list(std::index_sequence<I...>)
         gpu_scene_entry{"env-furnace", "the white sphere under a white environment map: every pixel exactly 1 again",
                         scene_role::test, &env_furnace},
         gpu_scene_entry{"studio", "gold, silver, copper and glossy spheres in a photo studio's light (an HDR map)",
-                        scene_role::showcase, &studio},
+                        scene_role::showcase, &studio, strategy::mis, studio_display},
         gpu_scene_entry{"sunlit", "matte, copper and aluminum spheres in the sunlight of an HDR sky",
-                        scene_role::showcase, &sunlit},
+                        scene_role::showcase, &sunlit, strategy::mis, sunlit_display},
+        gpu_scene_entry{"sun-test", "matte spheres in the sunlight of an HDR sky: -p nee against -p mis (a check of "
+                        "the light samples)", scene_role::test, &sun_test, strategy::mis},
     };
 }
 

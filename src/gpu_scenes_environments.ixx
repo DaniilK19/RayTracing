@@ -1,7 +1,8 @@
 // Partition gpu_scenes:environments: the GPU's own scenes lit by an environment map, an HDR photograph of the
 // surroundings in place of the camera's sky (environment_desc in gpu/renderer.h): a white furnace that checks the map's
-// lookups, and two scenes of rough metals and glossy coats, in a photographer's studio and in sunlight, which
-// gpu_scenes.ixx puts in its list. An interface partition that exports nothing: the scenes' functions have module
+// lookups and its sampling, two scenes of rough metals and glossy coats, in a photographer's studio and in sunlight,
+// and a matte one in the same sunlight that checks the light samples, which gpu_scenes.ixx puts in its list. An
+// interface partition that exports nothing: the scenes' functions and the showcase scenes' displays have module
 // linkage, seen by the module's other units and by no importer. (An internal partition, `module gpu_scenes:...;`
 // without `export`, would say so in its first line, but MSVC compiles a .ixx file only as an interface.)
 //
@@ -65,11 +66,12 @@ std::unique_ptr<quad> ground(double size, double y, std::shared_ptr<const materi
     return std::make_unique<quad>(point3{-size / 2, y, -size / 2}, vec3{0, 0, size}, vec3{size, 0, 0}, std::move(mat));
 }
 
-// The showcase scenes' camera: 16:9, 1920 pixels wide, 1024 samples, at most 10 rays a path
-camera_settings showcase_camera(const point3& lookfrom, const point3& lookat)
+// The scenes' camera: 16:9, 1024 samples, at most 10 rays a path, 1920 pixels wide for the showcase scenes. (The
+// strategy here is the books' part only: the registry gives the scenes -p mis.)
+camera_settings scene_camera(const point3& lookfrom, const point3& lookat, int width = 1920)
 {
     return {.aspect_ratio = 16.0 / 9.0,
-            .image_width = 1920,
+            .image_width = width,
             .samples_per_pixel = 1024,
             .max_depth = 10,
             .sampling = sampling_strategy::material,
@@ -77,13 +79,26 @@ camera_settings showcase_camera(const point3& lookfrom, const point3& lookat)
             .lookfrom = lookfrom,
             .lookat = lookat};
 }
+
+// The sky of sunlit and sun-test: the sun 48° above the horizon in a partly cloudy sky, the ground replaced by sky
+constexpr environment_choice sunlight{.source = env_source::asset,
+                                      .asset = "kloofendal_48d_partly_cloudy_puresky_1k.hdr",
+                                      .yaw_degrees = 0,
+                                      .scale = 1};
 }
+
+// The displays studio and sunlit open with (their entries in gpu_scenes.ixx): AgX at the scene's exposure, which
+// rolls a map's highlights off where the books' clamp would cut everything above 1. Here, not in the registry's unit,
+// because these are the renderer's types, which this partition's global module fragment brings.
+inline constexpr gpu::display_options studio_display{.op = gpu::tone_map::agx, .exposure = 0};
+inline constexpr gpu::display_options sunlit_display{.op = gpu::tone_map::agx, .exposure = -0.5};
 
 // furnace (gpu_scenes.ixx) again, its sphere and its camera, under a map of radiance 1 everywhere instead of a white
 // sky. Both of the map's lookups give exactly 1 there: the nearest texel is 1, and the bilinear filter's a + s·(b − a)
 // with a = b = 1 is 1 for every s. So under -p material every pixel is exactly 1.0, and the image must equal furnace's
 // in the quality kernel bit for bit: the same rays, the same random numbers, the same products. The camera's sky is
-// black, so a ray that missed the map would show.
+// black, so a ray that missed the map would show. Under -p mis the map is a light too, of density 1/(4π) in every
+// direction, and the sphere's pixels are 1 on average (the background stays exactly 1: camera rays see the map alone).
 gpu_scene_parts env_furnace()
 {
     hittable_list world;
@@ -126,7 +141,7 @@ gpu_scene_parts studio()
     add_gloss(parts, {0.71, 0.5, -0.8}, 0.5, color{0.7, 0.05, 0.05}, 0.2);
     add_gloss(parts, {2.13, 0.5, -0.8}, 0.5, color{0.05, 0.15, 0.6}, 0.5);
     parts.cpu.world.add(std::make_unique<sphere>(point3{0, 0.5, -2.2}, 0.5, std::make_shared<lambertian>(matte_white)));
-    parts.cpu.camera = showcase_camera({0, 2.65, 7.5}, {0, 0.4, 0});
+    parts.cpu.camera = scene_camera({0, 2.65, 7.5}, {0, 0.4, 0});
     parts.environment = {.source = env_source::asset, .asset = "studio_small_09_1k.hdr", .yaw_degrees = 0, .scale = 1};
     return parts;
 }
@@ -149,10 +164,29 @@ gpu_scene_parts sunlit()
     add_conductor(parts, {0, 1, 0}, 1, copper, 0.35);
     add_conductor(parts, {2.2, 1, 0}, 1, aluminum, 0.2);
     add_gloss(parts, {1.1, 0.4, 2}, 0.4, color{0.08, 0.45, 0.12}, 0.15);
-    parts.cpu.camera = showcase_camera({0, 2, 9}, {0, 0.9, 0});
-    parts.environment = {.source = env_source::asset,
-                         .asset = "kloofendal_48d_partly_cloudy_puresky_1k.hdr",
-                         .yaw_degrees = 0,
-                         .scale = 1};
+    parts.cpu.camera = scene_camera({0, 2, 9}, {0, 0.9, 0});
+    parts.environment = sunlight;
+    return parts;
+}
+
+// The light samples' check in sunlight: a grey floor and three matte spheres (albedo 0.8, 0.5 and 0.2) under sunlit's
+// sky and camera, nothing but lambertian surfaces. It makes the one fair comparison the sun allows (ImageCompare
+// wants two images whose noise has the same shape): -p nee against -p mis, which both draw the sun at every bounce.
+// -p material finds it once in some 40,000 bounces (a relative deviation of 127 per sample: 1.6·10⁸ samples for 1%),
+// and next-event estimation alone sparkles on a GGX surface of low roughness, where the light samples are the worse
+// technique by far, so neither meets this map in a comparison.
+gpu_scene_parts sun_test()
+{
+    gpu_scene_parts parts;
+    parts.cpu.world.add(ground(200, 0, std::make_shared<lambertian>(color{0.5, 0.5, 0.5})));
+    // Each sphere's x and albedo
+    constexpr std::array<std::pair<double, double>, 3> spheres{{{-2.2, 0.8}, {0, 0.5}, {2.2, 0.2}}};
+    for (const auto& [x, albedo] : spheres)
+    {
+        const auto matte = std::make_shared<lambertian>(color{albedo, albedo, albedo});
+        parts.cpu.world.add(std::make_unique<sphere>(point3{x, 1, 0}, 1.0, matte));
+    }
+    parts.cpu.camera = scene_camera({0, 2, 9}, {0, 0.9, 0}, 480);
+    parts.environment = sunlight;
     return parts;
 }

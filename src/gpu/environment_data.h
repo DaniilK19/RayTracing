@@ -32,8 +32,9 @@ struct alignas(16) env_texel
 };
 
 // A bin of the map's alias table (Vose 1991): a bin drawn uniformly keeps its own cell with the chance q, else gives
-// its alias. The table is padded to a power of two with bins of weight 0 (q = 0), so the bin's index can be the top
-// bits of one random number: exactly uniform whatever the map's size.
+// its alias, a cell with light. The table is padded to a power of two with bins of weight 0 (q = 0: they never give
+// themselves), so the bin's index can be the top bits of one random number: exactly uniform whatever the map's size.
+// q is a multiple of 2^-24, the step of the coin random_real<float> < q, so q is the coin's chance exactly.
 struct alignas(8) alias_bin
 {
     float q;
@@ -45,8 +46,8 @@ struct environment_tables
     int width = 0, height = 0, log2_bins = 0;
     double total = 0;              // S = Σ Y·Ω, in double: the map's luminance over the sphere, as the sampler sees it
     std::vector<env_texel> texels; // width·height, row 0 the image's top (+y); pdf = float(Y/S), 0 for a black map
-    std::vector<alias_bin> bins;   // 1 << log2_bins of them; empty until the map is sampled as a light, or for a black
-                                   // map (S = 0), which no light sample can come from
+    std::vector<alias_bin> bins;   // 1 << log2_bins ≥ 2 of them, the cells first, then the padding; empty for a black
+                                   // map (S = 0, log2_bins 0), which no light sample can come from
     std::vector<float> row_cos;    // height + 1: float(cos(π·j/height)), from double; 1 first, -1 last
 };
 

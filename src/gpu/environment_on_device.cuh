@@ -3,8 +3,9 @@
 // the environment fills it without touching the other parts. Made from scene_desc::quality.environment by
 // build_environment (environment_table.cu). Host code.
 //
-// Without a map, view() is the camera's sky (texels nullptr). The alias table comes with the map's importance
-// sampling: until then the map is seen, not sampled (bins nullptr, sampled() false), as a black map always is.
+// Without a map, view() is the camera's sky (texels nullptr). A map with light is a light of the set, with its alias
+// table (sampled()); a black map has none (bins nullptr): it is seen, never sampled. The table is uploaded whatever the
+// strategy: under -p material no light sample reads it, and its 4 MiB (a 1k map) cost no time per ray.
 #pragma once
 
 #include <cmath>
@@ -47,7 +48,8 @@ public:
     }
 
     environment_view view() const { return view_; }
-    // A map with light in it, and its alias table: a light of the set (environment_sampled on the device)
+    // A map with light in it, and so its alias table: a light of the set (environment_sampled on the device), which
+    // quality.cu counts in light_pmf
     bool sampled() const { return view_.bins != nullptr; }
 
 private:

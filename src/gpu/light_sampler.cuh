@@ -88,10 +88,16 @@ __device__ inline float lamp_hit_pdf(const quality_view& v, int global_id, const
     return k >= 0 ? v.light_pmf * lamp_pdf(v.lamps.lamps[k], x, unit_dir, distance) : 0.0f;
 }
 
-// The same for a ray that escaped toward the environment, along dir (of any length: the ray's own direction, which
-// background() looks the radiance up with); 0: the map isn't sampled
+// The same for a ray that escaped toward the environment, from the map's density of the texel its radiance came from
+// (background()'s, 0 when the map isn't sampled): the integrator's escapes take it so, from one lookup
+__device__ inline float environment_hit_pdf(const quality_view& v, float map_pdf)
+{
+    return v.light_pmf * map_pdf;
+}
+
+// The same for a direction alone (of any length), through env_cell: what an escape along dir gets
 __device__ inline float environment_hit_pdf(const quality_view& v, const vec3<float>& dir)
 {
-    return environment_sampled(v.environment) ? v.light_pmf * environment_pdf(v.environment, dir) : 0.0f;
+    return environment_hit_pdf(v, environment_sampled(v.environment) ? environment_pdf(v.environment, dir) : 0.0f);
 }
 }
