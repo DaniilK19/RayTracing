@@ -513,15 +513,19 @@ __device__ inline bool sound_true_return(const ggx_draw& d, const vec3<float>& l
 }
 
 // weight = eval/pdf per channel, eval and pdf from ggx_eval at the drawn l (G4): within 10⁻⁵ of the weight, plus what
-// F(v·h') may differ from the drawn F(v·h) (decision 12; D cancels in eval/pdf)
-__device__ inline bool weight_matches(const vec3<float>& vf, const vec3<float>& l, const vec3<float>& f0,
-                                      const vec3<float>& weight, const vec3<float>& eval, float pdf)
+// F(v·h') may differ from the drawn F(v·h) (decision 12; D cancels in eval/pdf), plus what c_l may: n·l of a direction
+// near the horizon is a difference of terms near 1, a few ulps of 1 apart in two copies that nvcc contracts
+// differently, and the weight is nearly proportional to it there
+__device__ inline bool weight_matches(const vec3<float>& n, const vec3<float>& vf, const vec3<float>& l,
+                                      const vec3<float>& f0, const vec3<float>& weight, const vec3<float>& eval,
+                                      float pdf)
 {
     const recomputed_half h = recompute_half(vf, l);
+    const double cl = ::fmax(gpu::dot(to_double(n), to_double(l)), 1e-30);
     for (int i = 0; i < 3; ++i)
     {
         const double w = channel(weight, i);
-        const double tolerance = 1e-5 + schlick_slope(channel(f0, i), h.vh) * h.error;
+        const double tolerance = 1e-5 + schlick_slope(channel(f0, i), h.vh) * h.error + 2.4e-7 / cl;
         if (!(::fabs(w - static_cast<double>(channel(eval, i)) / pdf) <= tolerance * w))
         {
             return false;
@@ -561,7 +565,7 @@ struct draw_has
             }
             float eval_pdf = 0;
             const vec3<float> eval = gpu::ggx_eval(draw.n, draw.v, l, draw.alpha, draw.f0, eval_pdf);
-            return !weight_matches(draw.v, l, draw.f0, w, eval, eval_pdf);
+            return !weight_matches(draw.n, draw.v, l, draw.f0, w, eval, eval_pdf);
         }
         case draw_property::pdf_off:
         {
@@ -2128,7 +2132,7 @@ struct compensated_lobe_off
             const double tolerance = pdf_tolerance(b.alpha, recompute_half(b.wo, s.wi).vh);
             return !(isfinite(pdf) && ::fabs(pdf - expected) <= tolerance * ::fabs(expected));
         }
-        return !weight_matches(b.wo, s.wi, b.albedo, s.weight, e, pdf);
+        return !weight_matches(b.n, b.wo, s.wi, b.albedo, s.weight, e, pdf);
     }
 };
 

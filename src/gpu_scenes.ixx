@@ -61,6 +61,8 @@ consteval auto make_scene_list(std::index_sequence<I...>)
                         scene_role::test, &furnace},
         gpu_scene_entry{"ggx-furnace", "white metals, a mirror and four GGX roughnesses, under a white sky: the light "
                         "each keeps", scene_role::test, &ggx_furnace},
+        gpu_scene_entry{"gloss-furnace", "white matte spheres under four glossy coats, under a white sky: the light "
+                        "each keeps", scene_role::test, &gloss_furnace},
     };
 }
 

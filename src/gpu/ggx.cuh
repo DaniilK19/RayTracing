@@ -1,6 +1,6 @@
-// The GGX microfacet model for the quality kernel's rough metals: pure functions of the unit normal n, the unit
-// direction toward the viewer v, the unit direction toward the light l, the width α and the color F0, callable without
-// a scene (bsdf.cuh puts them behind its lobes; GpuTests calls them directly).
+// The GGX microfacet model for the quality kernel's rough metals and glossy coats: pure functions of the unit normal n,
+// the unit direction toward the viewer v, the unit direction toward the light l, the width α and the color F0,
+// callable without a scene (bsdf.cuh puts them behind its lobes; GpuTests calls them directly).
 //
 // A rough surface is a field of tiny mirrors, microfacets, whose normals spread around n. Light from l leaves toward v
 // off the facets whose normal is the half vector h = (v + l)/|v + l|, so (Walter et al. 2007, eq. 20)
@@ -21,6 +21,8 @@
 // model describes; ggx_compensation gives back the light that leaves after several (Turquin 2019). The code is
 // re-derived from the papers' equations; no listing is copied.
 #pragma once
+
+#include <numbers>
 
 #include "ggx_energy.cuh"
 #include "material.cuh" // around
@@ -232,5 +234,92 @@ __device__ inline color<float> ggx_compensation(const color<float>& f0, float co
     const float e = fmin(ggx_energy(cos_v, roughness), 1.0f);
     const float lost = (1.0f - e) / e; // the light lost per unit kept (E is at least 0.3 in the table)
     return {fma(f0.x, lost, 1.0f), fma(f0.y, lost, 1.0f), fma(f0.z, lost, 1.0f)};
+}
+
+// --- The glossy coat: a clear varnish over a matte surface (glossy paint, plastic, a glazed tile) -------------------
+
+// The coat's F0: a dielectric of refractive index 1.5 reflects ((1.5 − 1)/(1.5 + 1))² = 4% head-on, in every channel
+inline constexpr float gloss_coat_f0 = 0.04f;
+
+// The coupled diffuse term's constant, 28/(23π)·(1 − 0.04) (see gloss_eval), rounded to float once
+inline constexpr float gloss_diffuse_scale = static_cast<float>(28.0 / (23.0 * std::numbers::pi) * (1.0 - 0.04));
+
+// 1 − (1 − c/2)⁵: the coupled diffuse term's factor for one direction, 0 at the horizon, 31/32 head-on
+__device__ inline float gloss_crossing(float c)
+{
+    const float x = 1.0f - 0.5f * c;
+    const float x2 = x * x;
+    return 1.0f - x2 * x2 * x;
+}
+
+// f·c_l of the coat over a matte base of color ρ, and in pdf the density gloss_sample draws l with. Both 0 when v or
+// l lies at or below the horizon.
+//   f = f_GGX(v, l; F0 = 0.04, α) + (28ρ/(23π))·(1 − 0.04)·(1 − (1 − c_l/2)⁵)·(1 − (1 − c_v/2)⁵)
+// The first term is the coat's own reflection, ggx_eval's lobe with single scattering alone (Turquin's factor is the
+// conductor's). The second is Ashikhmin & Shirley's coupled diffuse (2000): the light that crosses the coat into the
+// matte base and back out, less at grazing angles, where the coat reflects more, through a Schlick-shaped factor for
+// each crossing. It is symmetric in v and l (reciprocal) and deterministic, unlike a random walk between the layers
+// (pbrt-v4's coated diffuse), whose f and density are themselves random estimates, poor for MIS weights; and it needs
+// no table. It was derived for their Phong-like coat, so with GGX it is an approximation, which loses a few percent of
+// the light (GpuTests' gloss/energy checks it never adds any over its grid, α from 0.01; in the mirror limit a white
+// coat keeps 0.04 + 0.96·((1 − μ)⁵ + 1 − (1 − μ/2)⁵) ≤ 1). Its albedo is exactly E_d(μ) = 0.96ρ(1 − (1 − μ/2)⁵), as
+// ∫₀¹ c(1 − (1 − c/2)⁵) dc = 23/56: 0.93ρ head-on, where a white base under a smooth coat keeps about 97% of the light
+// together (94% under the roughest, α = 1).
+//   pdf = 0.5·p_GGX(l) + 0.5·c_l/π: the one-sample mixture of gloss_sample's two lobes, each picked half the time, so
+// a direction either lobe could draw has this density whichever drew it.
+__device__ inline color<float> gloss_eval(const vec3<float>& n, const vec3<float>& v, const vec3<float>& l, float alpha,
+                                          const color<float>& rho, float& pdf)
+{
+    pdf = 0.0f;
+    const float cv = dot(n, v);
+    const float cl = dot(n, l);
+    if (!(cv > 0.0f) || !(cl > 0.0f))
+    {
+        return {};
+    }
+    float coat_pdf;
+    const color<float> coat =
+        ggx_eval(n, v, l, alpha, color<float>{gloss_coat_f0, gloss_coat_f0, gloss_coat_f0}, coat_pdf);
+    pdf = 0.5f * (coat_pdf + cl * inverse_pi<float>);
+    // The two crossings' factors multiplied first: the same product for (v, l) and (l, v)
+    const float base = gloss_diffuse_scale * (gloss_crossing(cl) * gloss_crossing(cv)) * cl;
+    return coat + base * rho;
+}
+
+// Draws l for the coat over a matte base of color ρ: the coat's GGX lobe or the base's cosine lobe, half the time
+// each. Three random numbers: the choice first, then the lobe's two (ggx_sample's, or random_cosine_direction's).
+// false: absorbed, when the coat's l falls below the horizon (the coat's own single-scattering loss), when the base's
+// rounds below it, or when v lies at or below it (eval has nothing there). On true: l unit up to rounding, and the
+// one-sample mixture's weight f·c_l/p and density p, both from gloss_eval at l, whichever lobe drew it. The weight may
+// exceed 1: each lobe's light comes with half its own density (plus the other's), so the base's reaches 2.2ρ where the
+// coat's density is small.
+__device__ inline bool gloss_sample(const vec3<float>& n, const vec3<float>& v, float alpha, const color<float>& rho,
+                                    pcg32& rng, vec3<float>& l, color<float>& weight, float& pdf)
+{
+    if (random_real<float>(rng) < 0.5f) // exactly half of the numbers k/2²⁴
+    {
+        color<float> coat_weight;
+        float coat_pdf;
+        if (!ggx_sample(n, v, alpha, color<float>{gloss_coat_f0, gloss_coat_f0, gloss_coat_f0}, rng, l, coat_weight,
+                        coat_pdf))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        l = around(n, random_cosine_direction<float>(rng));
+        if (!(dot(n, l) > 0.0f))
+        {
+            return false;
+        }
+    }
+    const color<float> f = gloss_eval(n, v, l, alpha, rho, pdf);
+    if (!(pdf > 0.0f))
+    {
+        return false;
+    }
+    weight = (1.0f / pdf) * f;
+    return true;
 }
 }

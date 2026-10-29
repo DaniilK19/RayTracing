@@ -859,10 +859,9 @@ void validate(const scene_desc& scene)
                 // The coat has no mirror of its own below min_ggx_alpha (ggx.cuh), so it needs a width above it
                 if (!(side.roughness * side.roughness >= 1e-3))
                 {
-                    throw std::runtime_error("a glossy coat needs a roughness r with r² at least 0.001 (r about "
-                                             "0.0316 or more)");
+                    throw std::runtime_error("a glossy coat needs a roughness r with r² at least 0.001 (r of "
+                                             "0.0317 or more)");
                 }
-                throw std::runtime_error("glossy coats aren't implemented yet");
             }
             else if (side.kind != microfacet_kind::none)
             {

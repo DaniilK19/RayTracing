@@ -80,6 +80,7 @@ G cornell -p nee --all-books-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
 G ggx-furnace --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
 G ggx-furnace -p mixture -w 16 -s 1 -o out\m4\runs\cli-case.png
 G ggx-furnace --all-books-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
+G gloss-furnace --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --quality-kernel --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --quality-kernel -p mixture -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --quality-kernel --all-books-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png

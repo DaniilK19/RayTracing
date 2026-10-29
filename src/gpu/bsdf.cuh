@@ -10,8 +10,9 @@
 // the books' scatter() (material.cuh). So under -p material the quality kernel traces the books' paths.
 //
 // The GGX lobes (ggx.cuh) come from a material's side entry (quality_view::microfacets, by material index), which the
-// books' material underneath completes with its color: a rough metal is a metal of fuzz 0 whose albedo is F0. The
-// books' materials have none (the side array is nullptr), so their lobes and their arithmetic are those above.
+// books' material underneath completes with its color: a rough metal is a metal of fuzz 0 whose albedo is F0, a
+// glossy coat lies over a matte surface whose texture gives the color under it. The books' materials have none (the
+// side array is nullptr), so their lobes and their arithmetic are those above.
 #pragma once
 
 #include "ggx.cuh"
@@ -53,7 +54,7 @@ struct bsdf_sample
 };
 
 // The lobe from the material, its side entry (nullptr: none) and the color surface_color gave. validate() has checked
-// that a side entry's material is the one it completes: a conductor's is a metal of fuzz 0.
+// that a side entry's material is the one it completes: a conductor's is a metal of fuzz 0, a coat's a lambertian.
 __device__ inline bsdf make_bsdf(const material<float>& m, const microfacet* side, const color<float>& c,
                                  const hit_record<float>& rec, const vec3<float>& ray_direction)
 {
@@ -71,6 +72,14 @@ __device__ inline bsdf make_bsdf(const material<float>& m, const microfacet* sid
         b.albedo = m.albedo;
         b.alpha = side->alpha;
         b.roughness = side->roughness;
+        return b;
+    }
+    if (side && side->kind == microfacet_kind::gloss)
+    {
+        // The coat over the matte color c, its texture's at the hit
+        b.wo = -unit_vector(ray_direction);
+        b.kind = lobe::gloss;
+        b.alpha = side->alpha;
         return b;
     }
     switch (m.kind)
@@ -156,9 +165,12 @@ __device__ inline bool sample_bsdf(const bsdf& b, const ray<float>& in, const hi
         out.pdf = 0.0f;
         out.delta = true;
         return true;
-    default: // gloss: its sampling comes with it
-        return false;
+    case lobe::gloss:
+        // The coat or the matte base, half the time each (ggx.cuh): three numbers; false below the horizon
+        out.delta = false;
+        return gloss_sample(b.n, b.wo, b.alpha, b.albedo, rng, out.wi, out.weight, out.pdf);
     }
+    return false; // not reached: the cases cover every lobe
 }
 
 // f·|cos θi| (particles: albedo/(4π)) for a light sample's unit direction wi, and the density sample_bsdf draws it
@@ -180,7 +192,9 @@ __device__ inline color<float> eval_bsdf(const bsdf& b, const vec3<float>& wi, f
         const color<float> single = ggx_eval(b.n, b.wo, wi, b.alpha, b.albedo, pdf);
         return ggx_compensation(b.albedo, dot(b.n, b.wo), b.roughness) * single;
     }
-    default:
+    case lobe::gloss:
+        return gloss_eval(b.n, b.wo, wi, b.alpha, b.albedo, pdf);
+    default: // the delta lobes
         pdf = 0.0f;
         return {};
     }
