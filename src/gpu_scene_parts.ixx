@@ -58,4 +58,8 @@ export struct gpu_scene_entry
     scene_role role;
     gpu_scene_parts (*build)();
     std::optional<strategy> default_strategy = {};
+    // The display it opens with (tone_options.ixx): the books' bytes for the books' scenes and the test scenes, whose
+    // images stay what they were; a tone map at the scene's exposure for the scenes beyond the books, whose light the
+    // books' clamp would cut
+    gpu::display_options display = {};
 };

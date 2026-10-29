@@ -149,22 +149,28 @@ if(CMAKE_CUDA_COMPILER)
     # render of a second would take ten minutes. -lineinfo, in Debug and RelWithDebInfo, only maps the GPU's machine
     # code to source lines, for profilers such as Nsight Compute.
     # quality.cu, the third kernel's (light and materials beyond the books), is a translation unit of its own too, with
-    # renderer.cu's flags: nvcc compiles the books' kernels in renderer.cu as if it didn't exist.
-    add_library(gpu_renderer STATIC src/gpu/renderer.cu src/gpu/display.cu src/gpu/quality.cu)
+    # renderer.cu's flags: nvcc compiles the books' kernels in renderer.cu as if it didn't exist. So is tonemap.cu, the
+    # display's tone maps beyond the books, with display.cu's flags (below).
+    add_library(gpu_renderer STATIC src/gpu/renderer.cu src/gpu/display.cu src/gpu/quality.cu src/gpu/tonemap.cu)
     target_compile_options(gpu_renderer PRIVATE -Xcompiler=/W4 $<$<CONFIG:Debug,RelWithDebInfo>:-lineinfo>)
     # The window's conversion of the image to bytes (display.cu) must give the bytes of the PNG files, which the CPU
     # computes: -fmad=false keeps nvcc from fusing a multiplication and an addition into one operation with one
     # rounding, which the CPU doesn't do. (The kernels in renderer.cu keep nvcc's default, which they were measured
     # with.)
     set_source_files_properties(src/gpu/display.cu PROPERTIES COMPILE_OPTIONS -fmad=false)
+    # The tone maps' bytes (tonemap.cu) have no CPU twin, but they too should follow from the code as written, every
+    # product and sum rounded on its own: the same flag.
+    set_source_files_properties(src/gpu/tonemap.cu PROPERTIES COMPILE_OPTIONS -fmad=false)
 
     # The CPU's scenes as the renderer's data (gpu_scene.ixx): a module in a library of its own, which every GPU
     # program links. It includes the renderer's header and imports the ray tracer's modules, so it comes with both.
     # With it, the GPU programs' own lists of scenes (gpu_scenes.ixx and its partition gpu_scene_parts.ixx) and of
-    # sampling strategies (strategy_options.ixx), and their view options.
+    # sampling strategies (strategy_options.ixx), and their view and display options (view_options.ixx,
+    # tone_options.ixx).
     add_library(gpu_scene STATIC)
     target_sources(gpu_scene PUBLIC FILE_SET CXX_MODULES FILES
-        src/gpu_scene.ixx src/gpu_scene_parts.ixx src/gpu_scenes.ixx src/strategy_options.ixx src/view_options.ixx)
+        src/gpu_scene.ixx src/gpu_scene_parts.ixx src/gpu_scenes.ixx src/strategy_options.ixx src/tone_options.ixx
+        src/view_options.ixx)
     target_link_libraries(gpu_scene PUBLIC raytracer gpu_renderer)
     target_compile_options(gpu_scene PRIVATE /W4)
 

@@ -83,6 +83,9 @@ G --tonemap bogus -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --tonemap agx --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --exposure 1 -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --exposure abc -w 16 -s 1 -o out\m4\runs\cli-case.png
+G --tonemap agx --exposure nan -w 16 -s 1 -o out\m4\runs\cli-case.png
+G --tonemap agx --exposure 25 -w 16 -s 1 -o out\m4\runs\cli-case.png
+G --tonemap neutral --exposure -24.5 -w 16 -s 1 -o out\m4\runs\cli-case.png
 V -p mis --fp64 --headless -w 16 -s 1
 V --quality-kernel --fp64 --headless -w 16 -s 1
 V --quality-kernel -p mixture --headless -w 16 -s 1

@@ -717,3 +717,34 @@ export std::expected<image, std::string> to_image(std::span<const double> pixels
     }
     return img;
 }
+
+// The display's bytes (4 per pixel, red, green, blue and alpha, rows from the top) as the linear values that the CPU's
+// image::save_png turns back into exactly those bytes, so a tone map's PNG is written by the books' own writer: byte b
+// becomes ((b + 0.5)/256)². Everything is exact in double: (b + 0.5)/256 has 9 significant bits, its square 18;
+// save_png takes the square root, which is correctly rounded and so gives back (b + 0.5)/256 exactly, multiplies it by
+// 256 (b + 0.5) and truncates it to b. 255 gives 0.998046875, below the clamp at 0.999, and 0 gives 0.5/256, which
+// truncates to 0. Alpha is dropped (the PNG has three channels). Throws std::invalid_argument unless rgba holds
+// width × height pixels.
+export image bytes_to_image(std::span<const std::uint8_t> rgba, int width, int height)
+{
+    const std::size_t pixels = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    if (width < 1 || height < 1 || rgba.size() != 4 * pixels)
+    {
+        throw std::invalid_argument(std::format("{} bytes aren't the display of {}×{} pixels", rgba.size(), width,
+                                                height));
+    }
+    const auto linear = [](std::uint8_t byte) {
+        const double g = (byte + 0.5) / 256;
+        return g * g;
+    };
+    image img(width, height);
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            const std::size_t i = (static_cast<std::size_t>(y) * width + x) * 4; // rows from the top, then r, g, b, a
+            img[x, y] = color{linear(rgba[i]), linear(rgba[i + 1]), linear(rgba[i + 2])};
+        }
+    }
+    return img;
+}

@@ -15,6 +15,8 @@
 #include "statistics.h"
 
 import std;
+import gpu_scene;
+import gpu_scenes;
 import image;
 import vec3;
 
@@ -102,20 +104,18 @@ gpu::image_desc load_image(const std::filesystem::path& file)
     return desc;
 }
 
+// RayTracingGPU's own function (gpu_scene.ixx), the one its PNGs go through
 std::vector<double> bytes_to_linear(std::span<const std::uint8_t> rgba, int width, int height)
 {
-    if (rgba.size() != 4 * static_cast<std::size_t>(width) * static_cast<std::size_t>(height))
-    {
-        throw std::invalid_argument("bytes_to_linear: 4 bytes per pixel");
-    }
+    const image img = bytes_to_image(rgba, width, height);
     std::vector<double> values;
     values.reserve(3 * static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
-    for (std::size_t i = 0; i < rgba.size(); i += 4)
+    for (int y = 0; y < height; ++y)
     {
-        for (std::size_t k = 0; k < 3; ++k)
+        for (int x = 0; x < width; ++x)
         {
-            const double g = (rgba[i + k] + 0.5) / 256;
-            values.push_back(g * g);
+            const color& c = img[x, y];
+            values.insert(values.end(), {c.x, c.y, c.z});
         }
     }
     return values;
@@ -123,16 +123,7 @@ std::vector<double> bytes_to_linear(std::span<const std::uint8_t> rgba, int widt
 
 std::vector<std::uint8_t> png_round_trip(std::span<const std::uint8_t> rgba, int width, int height)
 {
-    const std::vector<double> values = bytes_to_linear(rgba, width, height);
-    image img(width, height);
-    for (int y = 0; y < height; ++y)
-    {
-        for (int x = 0; x < width; ++x)
-        {
-            const std::size_t i = 3 * (static_cast<std::size_t>(y) * width + x);
-            img[x, y] = color{values[i], values[i + 1], values[i + 2]};
-        }
-    }
+    const image img = bytes_to_image(rgba, width, height);
     const std::filesystem::path file = temp_folder() / "round-trip.png";
     if (const auto saved = img.save_png(file); !saved)
     {
@@ -165,6 +156,16 @@ std::vector<std::uint8_t> png_round_trip(std::span<const std::uint8_t> rgba, int
         }
     }
     return bytes;
+}
+
+std::vector<scene_display> scene_displays()
+{
+    std::vector<scene_display> scenes;
+    for (const gpu_scene_entry& entry : gpu_scene_list())
+    {
+        scenes.push_back({std::string(entry.name), entry.display});
+    }
+    return scenes;
 }
 }
 

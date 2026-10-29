@@ -17,6 +17,7 @@ import gpu_scene;
 import gpu_scenes;
 import image;
 import strategy_options;
+import tone_options;
 import view_options;
 
 // --- The command line ------------------------------------------------------------------------------------------
@@ -25,8 +26,8 @@ constexpr std::string_view default_gpu_scene = "weekend";
 constexpr int max_launch_ms = static_cast<int>(gpu::max_launch_seconds * 1000);
 
 // The options are RayTracing's, plus the GPU programs' own: --fp64, --all-books-kernel, --quality-kernel, --launch-ms,
-// --strata and the view options (view_options.ixx). std::optional tells "not given: take it from the scene" apart from
-// any given value.
+// --strata, the view options (view_options.ixx) and the display's (tone_options.ixx). std::optional tells "not given:
+// take it from the scene" apart from any given value.
 struct options
 {
     std::string_view scene = default_gpu_scene;
@@ -37,6 +38,7 @@ struct options
     view_options view;                // the camera, if not the scene's own
     std::uint32_t seed = 0;
     std::vector<std::filesystem::path> outputs; // one per -o; parse_options adds <scene name>-gpu.png if there is none
+    display_choice display;                     // --tonemap, --exposure: how a PNG shows the light
     bool fp64 = false;
     bool all_books_kernel = false;
     bool quality_kernel = false;
@@ -80,10 +82,11 @@ Options:
   -o, --output FILE    where to save the image (default <scene>-gpu.png): a .png, or a .pfm that
                        keeps the linear values as floats, before gamma correction and clamping;
                        give it several times to save several files: -o out.png -o out.pfm
+{}
   -h, --help           show this help
 
 Sampling (-p):)",
-                 view_usage, max_strata, max_launch_ms, std::numeric_limits<std::uint32_t>::max());
+                 view_usage, max_strata, max_launch_ms, std::numeric_limits<std::uint32_t>::max(), tone_usage());
     std::print("{}", strategy_usage());
 }
 
@@ -146,7 +149,10 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         const bool is_sampling = arg == "-p" || arg == "--sampling";
         const bool is_launch = arg == "--launch-ms";
         const bool is_strata = arg == "--strata";
-        if (!is_width && !is_samples && !is_output && !is_seed && !is_sampling && !is_launch && !is_strata)
+        const bool is_tonemap = arg == "--tonemap";
+        const bool is_exposure = arg == "--exposure";
+        if (!is_width && !is_samples && !is_output && !is_seed && !is_sampling && !is_launch && !is_strata &&
+            !is_tonemap && !is_exposure)
         {
             return std::unexpected(std::format("unknown option '{}'", arg));
         }
@@ -155,6 +161,28 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             return std::unexpected(std::format("{} needs a value", arg));
         }
         const std::string_view value = args[++i];
+
+        // The display: whether a tone map takes an exposure depends on the scene, checked once it is known
+        if (is_tonemap)
+        {
+            const auto op = tone_map_option(value);
+            if (!op)
+            {
+                return std::unexpected(op.error());
+            }
+            opts.display.op = *op;
+            continue;
+        }
+        if (is_exposure)
+        {
+            const auto ev = exposure_option(arg, value);
+            if (!ev)
+            {
+                return std::unexpected(ev.error());
+            }
+            opts.display.exposure = *ev;
+            continue;
+        }
 
         if (is_output)
         {
@@ -283,6 +311,14 @@ int main(int argc, char* argv[])
         std::println("Error: {}", checked.error());
         return 1;
     }
+    // The display: the options', else the scene's own (books for the books' scenes), and what it can't be
+    const gpu::display_options scene_display = find_gpu_scene(opts->scene)->display;
+    if (const auto checked = check_display(opts->display, scene_display, opts->fp64); !checked)
+    {
+        std::println("Error: {}", checked.error());
+        return 1;
+    }
+    const gpu::display_options display = effective_display(opts->display, scene_display);
     const camera_frame& frame = built->frame;
     // The strategy rendered with, and whether it isn't the one asked for (-p, or the scene's own)
     std::println("Scene: {}, sampling: {}{}", opts->scene, strategy_name(built->sampling),
@@ -290,6 +326,11 @@ int main(int argc, char* argv[])
     // The view as options: pasted into a command line, they give this camera again bit for bit (and with the same
     // other options the same image), and they are the place to start from to change it
     std::println("View: {}", format_view(built->cpu.camera, frame.image_height));
+    // A tone map is named; the books' bytes, as before, aren't
+    if (display.op != gpu::tone_map::books)
+    {
+        std::println("Display: {}, {}", tone_map_name(display.op), format_exposure(display.exposure));
+    }
 
     const int width = frame.image_width;
     const int height = frame.image_height;
@@ -326,7 +367,8 @@ int main(int argc, char* argv[])
             .all_books_kernel = opts->all_books_kernel,
             .quality_kernel = opts->quality_kernel,
             .launch_seconds = opts->launch_ms / 1000.0,
-            .passes = rays_per_pixel};
+            .passes = rays_per_pixel,
+            .display = display};
         result = gpu::render(built->desc, gpu_options);
     }
     catch (const std::exception& error)
@@ -365,11 +407,28 @@ int main(int argc, char* argv[])
     }
     std::println("Mean radiance (linear, before clamping): {:.6f}", img->mean_radiance());
 
+    // A PNG of a tone map other than books holds the bytes the GPU made of the image (render_result::rgba), the bytes
+    // the window shows: bytes_to_image gives the values image::save_png turns back into exactly those bytes. A PFM
+    // keeps the linear values whatever the display, and the books' PNG is made from them as before.
+    std::optional<image> toned;
+    if (display.op != gpu::tone_map::books)
+    {
+        try
+        {
+            toned = bytes_to_image(result.rgba, width, height);
+        }
+        catch (const std::invalid_argument& error)
+        {
+            std::println("Error: {}", error.what());
+            return 1;
+        }
+    }
     // An image that can't be saved doesn't stop the others: the render is done, and each file may still be useful
     bool all_saved = true;
     for (const std::filesystem::path& output : opts->outputs)
     {
-        if (const auto saved = img->save(output); !saved)
+        const image& source = toned && is_png(output) ? *toned : *img;
+        if (const auto saved = source.save(output); !saved)
         {
             std::println("Error: {} ({})", saved.error(), to_utf8(output));
             all_saved = false;

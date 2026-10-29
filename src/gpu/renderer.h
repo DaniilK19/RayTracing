@@ -274,6 +274,33 @@ struct quality_desc
     std::optional<environment_desc> environment; // the quality kernel's sky instead of camera.sky_bottom/sky_top
 };
 
+// --- Beyond the books: the display transform (tonemap.cu) --------------------------------------------------------
+//
+// How the image's light becomes the bytes of the screen and of a PNG. The books' way stays their scenes' default: the
+// square root of each channel, clamped below 1, so everything brighter than 1 is plain white, channel by channel, and a
+// highlight loses its shape and its hue. The tone maps beyond the books multiply the light by 2^exposure, compress it
+// into [0, 1] with a curve made for that (tone_curves.cuh), encode it for the display and round it to bytes with a
+// dither. The GPU computes those bytes for the window and for RayTracingGPU's PNG alike; a PFM always keeps the linear
+// values.
+enum class tone_map
+{
+    books,   // the books' bytes: √ gamma, clamp to 0.999, ×256 truncated (display.cu, image::save_png)
+    none,    // exposure, clip to [0, 1], the sRGB curve (IEC 61966-2-1): no tone curve
+    agx,     // Troy Sobotka's AgX base: 16.5 stops on a log2 curve, display-encoded
+    neutral, // Khronos PBR Neutral, then the sRGB curve
+};
+
+struct display_options
+{
+    tone_map op = tone_map::books;
+    double exposure = 0; // EV: the light is multiplied by 2^exposure first; 0 with books
+    bool operator==(const display_options&) const = default;
+};
+
+// The exposure's range in stops, either way: a factor of 16.8 million, far beyond what a scene needs, and float(2^EV)
+// stays a normal float with all of its precision
+inline constexpr double max_exposure = 24;
+
 // --- The scene, and how to render it --------------------------------------------------------------------------------
 
 struct scene_desc
@@ -332,6 +359,10 @@ struct render_options
     // of the books' camera; a positive number renders exactly that many, in rounds of sqrt_spp² (see session); a
     // negative one throws std::invalid_argument
     std::int64_t passes = 0;
+    // A tone map other than books fills render_result::rgba with the display's bytes after the last pass (see
+    // session::display), the bytes RayTracingGPU saves as its PNG; books leaves it empty. The render doesn't depend on
+    // it: the pixels and the rays are the same with any display.
+    display_options display;
 };
 
 // The kernel that rendered, as the CUDA runtime describes it: the numbers that decide how many of its threads a
@@ -386,7 +417,7 @@ device_info query_device(wait_mode wait = wait_mode::spin);
 
 // Renders the scene on the first CUDA device. Throws std::runtime_error with CUDA's message if something fails, or if
 // the scene is inconsistent (an index out of range, a checker before its textures...), and std::invalid_argument for
-// options out of range (launch_seconds, passes).
+// options out of range (launch_seconds, passes, a display session::display refuses), before rendering anything.
 render_result render(const scene_desc& scene, const render_options& options);
 
 // --- A render that goes on: the window's -------------------------------------------------------------------------
@@ -485,8 +516,14 @@ public:
     // the byte the PNG files hold (the CPU's image::save_png). Rows that the pass in progress has rendered hold one
     // sample more than the others, and are divided by their own number of samples, so the image never shows a band
     // brighter or darker than the rest. Computed on the GPU and copied into memory of this session's, valid until the
-    // next display() or set_camera. Throws std::logic_error unless the image has a complete pass.
+    // next display() of either kind or set_camera. Throws std::logic_error unless the image has a complete pass.
     std::span<const std::uint8_t> display();
+    // The image through a display transform. books gives display()'s bytes, by calling it; another tone map converts
+    // the same two bands of rows, each with its own number of samples, with tonemap.cu's kernel, into the same memory.
+    // Throws std::invalid_argument for an exposure that isn't a finite number within ±max_exposure, for books with an
+    // exposure other than 0, and for another tone map in a float64 session (what is new computes in float only);
+    // std::logic_error as display() does.
+    std::span<const std::uint8_t> display(const display_options& options);
 
     std::uint64_t rays() const;        // rays traced since the view was set
     std::uint64_t shadow_rays() const; // the quality kernel's rays toward a light since then (see render_result)

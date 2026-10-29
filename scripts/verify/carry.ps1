@@ -1,8 +1,9 @@
 # The carry check: configurations a step verified (statistically, against the references) still render the same bytes
 # in later steps, so their verification carries forward without rendering the comparisons again. Each configuration is
 # a RayTracingGPU command, rendered at -w 480 --height 270 -s 64 --seed 3 into a PFM, whose SHA-256 is kept with the
-# step that verified it in out\m4\carry\set.txt (lines name|step|sha256|arguments). A difference names the
-# configuration whose protocol the step must run again (or re-record, when the step changes it by design).
+# step that verified it in out\m4\carry\set.txt (lines name|step|sha256|arguments; with --tonemap, the PNG's too). A
+# difference names the configuration whose protocol the step must run again (or re-record, when the step changes it by
+# design).
 #   carry.ps1 -Step 74                                   check every configuration of the set (none: exit code 2)
 #   carry.ps1 -Step 73 -Record cornell-base -Arguments "cornell -p material --quality-kernel"
 #                                                        add a configuration (or record it again) as verified by Step 73
@@ -31,17 +32,24 @@ function Read-Set {
         })
 }
 
+# A configuration with --tonemap also saves its PNG, the display's bytes (Step 74): its hash is the PFM's and the PNG's,
+# joined by a colon
 function Get-CarryHash([string]$name, [string]$argumentText) {
     $path = Join-Path $work "$name.pfm"
-    $list = @($argumentText -split '\s+' | Where-Object { $_ }) +
-        @("-w", "480", "--height", "270", "-s", "64", "--seed", "3", "-o", $path)
+    $png = Join-Path $work "$name.png"
+    $words = @($argumentText -split '\s+' | Where-Object { $_ })
+    $toned = $words -contains "--tonemap"
+    $list = $words + @("-w", "480", "--height", "270", "-s", "64", "--seed", "3", "-o", $path)
+    if ($toned) { $list += @("-o", $png) }
     $all = @("-Step", "$Step", "-Label", "carry $name", "--", $gpu) + $list
     $lines = @(& $gpuScript @all)
     if ($LASTEXITCODE -ne 0) {
         $lines | ForEach-Object { Write-Host "  $_" }
         throw "carry.ps1: $name failed (exit code $LASTEXITCODE)"
     }
-    return (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    $sha = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+    if ($toned) { $sha += ":" + (Get-FileHash -LiteralPath $png -Algorithm SHA256).Hash }
+    return $sha
 }
 
 $set = Read-Set

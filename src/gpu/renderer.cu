@@ -49,6 +49,7 @@
 #include "scene.cuh"
 #include "sphere.cuh"
 #include "texture.cuh"
+#include "tonemap.cuh"
 #include "vec3.cuh"
 
 namespace gpu
@@ -1138,6 +1139,27 @@ bool uses_first_book_kernel(const scene_desc& scene, const session_options& opti
 {
     return !uses_quality_kernel(scene, options) && !options.all_books_kernel && first_book_scene(scene);
 }
+
+// What a display transform can't be (see session::display in renderer.h), checked by the session's display(options)
+// and by render() before it renders anything: an exposure that isn't a finite number of stops within the limit, an
+// exposure for the books' bytes, and a tone map beyond the books in float64 (what is new computes in float only)
+void check_display(const display_options& options, precision arithmetic)
+{
+    if (!(std::isfinite(options.exposure) && std::fabs(options.exposure) <= max_exposure))
+    {
+        throw std::invalid_argument(std::format("an exposure is a finite number of stops from {} to {}", -max_exposure,
+                                                max_exposure));
+    }
+    if (options.op == tone_map::books && options.exposure != 0)
+    {
+        throw std::invalid_argument("the books' bytes take no exposure: it needs another tone map");
+    }
+    if (options.op != tone_map::books && arithmetic == precision::float64)
+    {
+        throw std::invalid_argument("a tone map other than books is a new display transform, which works in float "
+                                    "only");
+    }
+}
 }
 
 // What a session holds, behind its pointer (see session in renderer.h). The precision is chosen at run time, so the
@@ -1155,6 +1177,7 @@ struct session::impl
     virtual render_report render_for(double seconds, std::int64_t pass_limit) = 0;
     virtual std::vector<double> pixels() const = 0;
     virtual std::span<const std::uint8_t> display() = 0;
+    virtual std::span<const std::uint8_t> display(const display_options& options) = 0;
     virtual std::uint64_t rays() const = 0;
     virtual std::uint64_t shadow_rays() const = 0;
     virtual bool has_view() const = 0;
@@ -1303,6 +1326,58 @@ public:
         // wait_mode::sleep (see query_device)
         check(cudaMemcpy(shown_.data(), rgba_.data(), bytes, cudaMemcpyDeviceToHost), "copying the image from the GPU");
         return {shown_.data(), bytes};
+    }
+
+    // display() through a tone map (see session::display in renderer.h): the options are checked first, whatever the
+    // image (the programs refuse them earlier, in their own words); books is display() itself
+    std::span<const std::uint8_t> display(const display_options& options) override
+    {
+        check_display(options, std::same_as<Real, float> ? precision::float32 : precision::float64);
+        if (options.op == tone_map::books)
+        {
+            return display();
+        }
+        // The tone maps are new, and what is new computes in float only: `if constexpr` keeps them out of the double
+        // session's code
+        if constexpr (std::same_as<Real, float>)
+        {
+            const accumulation now = planner().state();
+            if (now.passes == 0)
+            {
+                throw std::logic_error("the image has no complete pass to show");
+            }
+            const int width = camera_.image_width;
+            const int height = camera_.image_height;
+            const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4;
+            // The same buffers as display()'s, grown as it grows them
+            if (rgba_.size() < bytes)
+            {
+                rgba_ = device_array<std::uint8_t>(0);
+                rgba_ = device_array<std::uint8_t>(bytes);
+            }
+            if (shown_.size() < bytes)
+            {
+                shown_ = pinned_array<std::uint8_t>();
+                shown_ = pinned_array<std::uint8_t>(bytes);
+            }
+            // 2^EV in double, rounded once to float: 0 EV multiplies by exactly 1, a whole number of stops by an exact
+            // power of two
+            const auto exposure_scale = static_cast<float>(std::exp2(options.exposure));
+            // The two bands and their scales as display() computes them
+            const auto passes = static_cast<double>(now.passes);
+            detail::to_rgba8_toned(sums_.data(), width, 0, now.rows, 1.0 / (passes + 1), options.op, exposure_scale,
+                                   rgba_.data());
+            detail::to_rgba8_toned(sums_.data(), width, now.rows, height - now.rows, 1.0 / passes, options.op,
+                                   exposure_scale, rgba_.data());
+            check(cudaMemcpy(shown_.data(), rgba_.data(), bytes, cudaMemcpyDeviceToHost),
+                  "copying the image from the GPU");
+            return {shown_.data(), bytes};
+        }
+        else
+        {
+            throw std::invalid_argument("a tone map other than books is a new display transform, which works in float "
+                                        "only");
+        }
     }
 
     std::uint64_t rays() const override
@@ -1567,6 +1642,11 @@ std::span<const std::uint8_t> session::display()
     return impl_->display();
 }
 
+std::span<const std::uint8_t> session::display(const display_options& options)
+{
+    return impl_->display(options);
+}
+
 std::uint64_t session::rays() const
 {
     return impl_->rays();
@@ -1665,6 +1745,7 @@ device_info query_device(wait_mode wait)
 render_result render(const scene_desc& scene, const render_options& options)
 {
     const auto start_time = std::chrono::steady_clock::now();
+    check_display(options.display, options.arithmetic);
     session one(scene, {.seed = options.seed,
                          .arithmetic = options.arithmetic,
                          .all_books_kernel = options.all_books_kernel,
@@ -1689,7 +1770,14 @@ render_result render(const scene_desc& scene, const render_options& options)
     result.rays = one.rays();
     result.shadow_rays = one.shadow_rays();
     result.kernel = one.kernel();
-    // render_result::rgba stays empty: the books' bytes are the PNG's, which the programs make from the pixels
+    // The display's bytes after a tone map other than books, from the sums still in the GPU's memory: the bytes the
+    // window shows. With books rgba stays empty: the books' bytes are the PNG's, which the programs make from the
+    // pixels.
+    if (options.display != display_options{})
+    {
+        const std::span<const std::uint8_t> bytes = one.display(options.display);
+        result.rgba.assign(bytes.begin(), bytes.end());
+    }
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
     return result;
 }
