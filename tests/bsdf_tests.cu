@@ -102,9 +102,8 @@ struct make_mismatch
         const gpu::lobe expected = kind == 0   ? gpu::lobe::lambertian
                                    : kind == 1 ? gpu::lobe::isotropic
                                                : gpu::lobe::books_delta;
-        const vec3<float> wo = -gpu::unit_vector(h.in.direction);
-        bool ok = b.kind == expected && bits_equal(b.albedo, c) && bits_equal(b.n, h.rec.normal) &&
-                  fabsf(gpu::dot(b.wo, wo) - 1.0f) <= 1e-6f;
+        // (wo, the direction toward the viewer, is computed for the GGX lobes alone, which read it: the ggx suite)
+        bool ok = b.kind == expected && bits_equal(b.albedo, c) && bits_equal(b.n, h.rec.normal);
         if (expected == gpu::lobe::books_delta)
         {
             ok = ok && b.books.kind == m.kind && bits_equal(b.books.albedo, m.albedo) &&
@@ -140,8 +139,10 @@ struct weight_eval_mismatch
         const vec3<float> f = gpu::eval_bsdf(b, s.wi, pdf);
         const vec3<float> ratio = (1.0f / pdf) * f;
         const auto off = [](float w, float r) { return !(fabsf(w - r) <= 1e-5f * w); };
+        // The two densities within 10⁻⁵, or within 10⁻⁷ of the largest (1/π for a matte surface): just above the
+        // horizon cos θ is a few ulps of its two computations, which nvcc may contract differently
         return off(s.weight.x, ratio.x) || off(s.weight.y, ratio.y) || off(s.weight.z, ratio.z) ||
-               !(fabsf(s.pdf - pdf) <= 1e-5f * pdf);
+               !(fabsf(s.pdf - pdf) <= fmaxf(1e-5f * pdf, 1e-7f));
     }
 };
 

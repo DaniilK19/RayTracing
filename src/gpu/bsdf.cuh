@@ -8,8 +8,13 @@
 // The books' materials keep the books' sampling: a matte surface and a particle of smoke draw exactly the numbers the
 // kernel for all three books draws under -p material (diffuse_bounce in camera.cuh), and metal and glass go through
 // the books' scatter() (material.cuh). So under -p material the quality kernel traces the books' paths.
+//
+// The GGX lobes (ggx.cuh) come from a material's side entry (quality_view::microfacets, by material index), which the
+// books' material underneath completes with its color: a rough metal is a metal of fuzz 0 whose albedo is F0. The
+// books' materials have none (the side array is nullptr), so their lobes and their arithmetic are those above.
 #pragma once
 
+#include "ggx.cuh"
 #include "material.cuh"
 #include "pdf.cuh"
 #include "quality_view.cuh"
@@ -46,15 +51,26 @@ struct bsdf_sample
     bool delta;          // no density: no light sample here, the next light counts in full
 };
 
-// The lobe from the material, its side entry (nullptr: none) and the color surface_color gave. The GGX lobes come with
-// their side entries; until then validate() accepts no side entry but `none`.
-__device__ inline bsdf make_bsdf(const material<float>& m, const microfacet* /*side*/, const color<float>& c,
+// The lobe from the material, its side entry (nullptr: none) and the color surface_color gave. validate() has checked
+// that a side entry's material is the one it completes: a conductor's is a metal of fuzz 0.
+__device__ inline bsdf make_bsdf(const material<float>& m, const microfacet* side, const color<float>& c,
                                  const hit_record<float>& rec, const vec3<float>& ray_direction)
 {
     bsdf b{};
     b.n = rec.normal;
-    b.wo = -unit_vector(ray_direction); // read by the GGX lobes only: the compiler drops it where nothing reads it
     b.albedo = c;
+    if (side && side->kind == microfacet_kind::conductor)
+    {
+        // The GGX lobes are functions of the direction toward the viewer. Only they compute it: for the books' lobes
+        // nvcc would merge it with scatter()'s own unit vector of the ray, contracted otherwise, and the books' glass
+        // would no longer draw the books' directions bit for bit.
+        b.wo = -unit_vector(ray_direction);
+        // A metal's albedo is F0; below min_ggx_alpha the lobe is the mirror (r = 0 among them)
+        b.kind = side->alpha >= min_ggx_alpha ? lobe::conductor : lobe::smooth_conductor;
+        b.albedo = m.albedo;
+        b.alpha = side->alpha;
+        return b;
+    }
     switch (m.kind)
     {
     case material_kind::lambertian:
@@ -114,7 +130,25 @@ __device__ inline bool sample_bsdf(const bsdf& b, const ray<float>& in, const hi
         out.delta = true;
         return true;
     }
-    default: // the GGX lobes: their sampling comes with them
+    case lobe::conductor:
+        // The visible normals (ggx.cuh): two numbers; false below the horizon
+        out.delta = false;
+        return ggx_sample(b.n, b.wo, b.alpha, b.albedo, rng, out.wi, out.weight, out.pdf);
+    case lobe::smooth_conductor:
+        // The conductor's limit α → 0: one facet, the surface itself, so the mirror direction and Schlick's F at the
+        // incidence (the light single scattering keeps tends to F). No random number. Unlike the books' metal, whose
+        // weight is its albedo at every angle, it turns white toward grazing angles. A view at or below the surface (a
+        // grazing hit's rounding) reflects below it too: absorbed, as the rough lobe and the books' metal do.
+        if (!(dot(b.n, b.wo) > 0.0f))
+        {
+            return false;
+        }
+        out.wi = unit_vector(reflect(-b.wo, b.n));
+        out.weight = schlick(b.albedo, dot(b.n, b.wo));
+        out.pdf = 0.0f;
+        out.delta = true;
+        return true;
+    default: // gloss: its sampling comes with it
         return false;
     }
 }
@@ -133,6 +167,8 @@ __device__ inline color<float> eval_bsdf(const bsdf& b, const vec3<float>& wi, f
     case lobe::isotropic:
         pdf = uniform_sphere_density<float>;
         return uniform_sphere_density<float> * b.albedo;
+    case lobe::conductor:
+        return ggx_eval(b.n, b.wo, wi, b.alpha, b.albedo, pdf);
     default:
         pdf = 0.0f;
         return {};

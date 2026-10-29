@@ -822,17 +822,52 @@ void validate(const scene_desc& scene)
     {
         throw std::runtime_error("unknown light combination");
     }
-    // --- microfacets (track B): one side entry per material, or none
+    // --- microfacets (track B): one side entry per material, or none. A side entry turns its material into a GGX lobe
+    // that takes its color from the material (make_bsdf in bsdf.cuh): a rough metal is a metal whose albedo is F0, its
+    // fuzz 0 (GGX's roughness replaces the books' blur); a glossy coat lies over a matte surface, whose texture is the
+    // color under it.
     if (!quality.microfacets.empty())
     {
         if (quality.microfacets.size() != scene.materials.size())
         {
             throw std::runtime_error("the materials' GGX side entries must be one per material");
         }
-        if (std::ranges::any_of(quality.microfacets,
-                                [](const microfacet_desc& m) { return m.kind != microfacet_kind::none; }))
+        for (std::size_t k = 0; k < quality.microfacets.size(); ++k)
         {
-            throw std::runtime_error("rough metals and glossy coats aren't implemented yet");
+            const microfacet_desc& side = quality.microfacets[k];
+            const material_desc& m = scene.materials[k];
+            // The parametrization's range (α = r², OpenPBR's); NaN and the infinities fail the comparisons too
+            if (!(side.roughness >= 0 && side.roughness <= 1))
+            {
+                throw std::runtime_error("a GGX roughness must be a number from 0 to 1");
+            }
+            if (side.kind == microfacet_kind::conductor)
+            {
+                if (m.kind != material_kind::metal || m.fuzz != 0)
+                {
+                    throw std::runtime_error("a rough metal (a GGX conductor) must complete a metal material with fuzz "
+                                             "0, whose albedo is its color F0");
+                }
+            }
+            else if (side.kind == microfacet_kind::gloss)
+            {
+                if (m.kind != material_kind::lambertian)
+                {
+                    throw std::runtime_error("a glossy coat (GGX) must complete a lambertian material, whose texture "
+                                             "is the color under the coat");
+                }
+                // The coat has no mirror of its own below min_ggx_alpha (ggx.cuh), so it needs a width above it
+                if (!(side.roughness * side.roughness >= 1e-3))
+                {
+                    throw std::runtime_error("a glossy coat needs a roughness r with r² at least 0.001 (r about "
+                                             "0.0316 or more)");
+                }
+                throw std::runtime_error("glossy coats aren't implemented yet");
+            }
+            else if (side.kind != microfacet_kind::none)
+            {
+                throw std::runtime_error("unknown kind of GGX side entry");
+            }
         }
     }
     // --- environment (track C)

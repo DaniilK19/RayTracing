@@ -56,4 +56,19 @@ GPU_TEST(services, host)
     ctx.count("png-round-trip", differ, 0, 768);
     ctx.exact("find-repo-file", gpu_test::host::find_repo_file("src/gpu/renderer.h").filename() == "renderer.h", 1, 0);
 }
+
+// The translator's GGX side entries (gpu_scene.ixx): one per material in a scene that has any, each at its
+// material's index whatever the order they are listed in, and the two mistakes a scene's code could make refused
+GPU_TEST(services, ggx_translation)
+{
+    const gpu_test::host::translation_check t = gpu_test::host::check_ggx_translation();
+    ctx.count("ggx-translation-aligned", t.aligned.empty() ? 0 : 1, 0, 1);
+    if (!t.aligned.empty())
+    {
+        ctx.info("ggx-translation-aligned", t.aligned);
+    }
+    ctx.exact("ggx-translation-same-entry-twice", t.same_entry_twice ? 1 : 0, 1, 0);
+    ctx.exact("ggx-translation-two-entries-refused", t.two_entries_refused ? 1 : 0, 1, 0);
+    ctx.exact("ggx-translation-unused-refused", t.unused_refused ? 1 : 0, 1, 0);
+}
 }

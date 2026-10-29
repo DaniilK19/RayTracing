@@ -170,7 +170,23 @@ std::expected<void, std::string> for_each_shape(const hittable& object, const pl
 class scene_translator
 {
 public:
-    scene_translator(const camera_frame& frame, sampling_strategy sampling) { desc_.camera = to_gpu(frame, sampling); }
+    // microfacets: the GGX side entries of the scene's CPU materials, by address (gpu_scene_parts::microfacets)
+    scene_translator(const camera_frame& frame, sampling_strategy sampling,
+                     std::span<const std::pair<const material*, gpu::microfacet_desc>> microfacets)
+    {
+        desc_.camera = to_gpu(frame, sampling);
+        // Materials are stored once per address (material_index), so an address can carry one side entry only: a scene
+        // that gave one placeholder two different GGX materials would render one of them in both places, with no
+        // error. That is a mistake in the scene's code, not the user's, so it is no message but an exception.
+        for (const auto& [mat, side] : microfacets)
+        {
+            const auto [found, added] = microfacets_.emplace(mat, side);
+            if (!added && (found->second.kind != side.kind || found->second.roughness != side.roughness))
+            {
+                throw std::logic_error("two GGX materials share one placeholder material");
+            }
+        }
+    }
 
     // Every shape (sphere, quad) and every volume of smoke of the world, wherever it is in the world's lists, BVHs and
     // instances
@@ -181,7 +197,17 @@ public:
         });
     }
 
-    gpu::scene_desc finish() && { return std::move(desc_); }
+    // The tables. Every GGX side entry must have met its placeholder in the world: one that didn't would leave its
+    // material rendered as the placeholder (a mirror, a matte surface), with no error, as two entries on one address
+    // would above
+    gpu::scene_desc finish() &&
+    {
+        if (microfacets_used_ != microfacets_.size())
+        {
+            throw std::logic_error("a GGX side entry's placeholder material isn't in the scene's world");
+        }
+        return std::move(desc_);
+    }
 
 private:
     gpu::scene_desc desc_;
@@ -191,6 +217,9 @@ private:
     // run: the order of first use, except that a checker comes after the two textures it refers to.
     std::unordered_map<const material*, int> material_indices_;
     std::unordered_map<const texture*, int> texture_indices_;
+    // The GGX side entries by the address of the CPU material they complete; empty for the books' scenes
+    std::unordered_map<const material*, gpu::microfacet_desc> microfacets_;
+    std::size_t microfacets_used_ = 0; // how many of them a material of the world has taken
 
     std::expected<void, std::string> add_shape(const hittable& shape, const placement& where);
     std::expected<void, std::string> add_medium(const constant_medium& volume, const placement& where);
@@ -348,6 +377,14 @@ std::expected<int, std::string> scene_translator::material_index(const material*
     const auto index = static_cast<int>(desc_.materials.size());
     desc_.materials.push_back(desc);
     material_indices_.emplace(mat, index);
+    // Its GGX side entry, in a scene that has any: then every material has one (`none` but for the GGX materials'
+    // placeholders), in the order of the materials
+    if (!microfacets_.empty())
+    {
+        const auto side = microfacets_.find(mat);
+        microfacets_used_ += side != microfacets_.end() ? 1 : 0; // once per material: this runs at its first use only
+        desc_.quality.microfacets.push_back(side != microfacets_.end() ? side->second : gpu::microfacet_desc{});
+    }
     return index;
 }
 
@@ -506,16 +543,24 @@ std::expected<std::vector<gpu::light_desc>, std::string> lights_to_gpu(const hit
 // The whole scene, or why the GPU can't render it. The GPU renders spheres, standing still or moving, and quads, also
 // in lists, BVHs, translate and rotate_y, with matte surfaces of solid, checker, image or marble textures, metal, glass
 // and lamps, and volumes of smoke or fog: every scene of the books. sampling is the strategy the CPU would render with
-// (effective_sampling).
-std::expected<gpu::scene_desc, std::string> to_gpu(const scene& s, const camera_frame& frame,
-                                                   sampling_strategy sampling)
+// (effective_sampling). microfacets: the GGX side entries of its materials (gpu_scene_parts::microfacets).
+std::expected<gpu::scene_desc, std::string> to_gpu(
+    const scene& s, const camera_frame& frame, sampling_strategy sampling,
+    std::span<const std::pair<const material*, gpu::microfacet_desc>> microfacets)
 {
-    scene_translator translator(frame, sampling);
+    scene_translator translator(frame, sampling, microfacets);
     if (const auto added = translator.add_world(s.world); !added)
     {
         return std::unexpected(added.error());
     }
     return std::move(translator).finish();
+}
+
+// A scene's parts as the renderer's tables, at their camera's own frame, without the programs' options, a lights list or
+// an environment: the translation of the world and of its GGX side entries alone, which GpuTests checks
+export std::expected<gpu::scene_desc, std::string> translate_parts(const gpu_scene_parts& parts)
+{
+    return to_gpu(parts.cpu, camera(parts.cpu.camera).frame(), sampling_strategy::material, parts.microfacets);
 }
 
 // --- A scene ready for the GPU ---------------------------------------------------------------------------------
@@ -601,7 +646,7 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
     // without lamps
     const sampling_strategy sampling = effective_sampling(s.camera.sampling, s.lights);
 
-    auto desc = to_gpu(s, frame, sampling);
+    auto desc = to_gpu(s, frame, sampling, parts.microfacets);
     if (!desc)
     {
         return std::unexpected(std::format("the GPU can't render '{}': {}.", name, desc.error()));

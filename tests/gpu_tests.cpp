@@ -15,9 +15,16 @@
 #include "statistics.h"
 
 import std;
+import camera;
+import constant_medium;
 import gpu_scene;
 import gpu_scenes;
+import hittable;
 import image;
+import material;
+import quad;
+import scenes;
+import sphere;
 import vec3;
 
 namespace gpu_test
@@ -156,6 +163,76 @@ std::vector<std::uint8_t> png_round_trip(std::span<const std::uint8_t> rgba, int
         }
     }
     return bytes;
+}
+
+translation_check check_ggx_translation()
+{
+    const auto matte = std::make_shared<const lambertian>(color{0.5, 0.5, 0.5});
+    const auto lamp = std::make_shared<const diffuse_light>(color{4, 4, 4});
+    const auto coat = std::make_shared<const lambertian>(color{0.7, 0.2, 0.2});
+    const auto rough = std::make_shared<const metal>(color{0.9, 0.9, 0.9}, 0.0);
+    const auto stray = std::make_shared<const metal>(color{0.5, 0.5, 0.5}, 0.0); // in no object of the world
+    const gpu::microfacet_desc rough_entry{.kind = gpu::microfacet_kind::conductor, .roughness = 0.5};
+    const gpu::microfacet_desc coat_entry{.kind = gpu::microfacet_kind::gloss, .roughness = 0.3};
+    const auto parts_with = [&](std::vector<std::pair<const material*, gpu::microfacet_desc>> extra) {
+        gpu_scene_parts parts;
+        parts.cpu.camera = {.aspect_ratio = 1, .image_width = 8, .samples_per_pixel = 1};
+        hittable_list& world = parts.cpu.world;
+        world.add(std::make_unique<sphere>(point3{0, -100, 0}, 99, matte));
+        world.add(std::make_unique<quad>(point3{-1, 3, -1}, vec3{2, 0, 0}, vec3{0, 0, 2}, lamp));
+        world.add(std::make_unique<constant_medium>(std::make_unique<sphere>(point3{0, 0, -5}, 1, matte), 0.1,
+                                                    color{0.9, 0.9, 0.9}));
+        world.add(std::make_unique<sphere>(point3{-1, 0.5, 0}, 0.5, coat));
+        world.add(std::make_unique<sphere>(point3{1, 0.5, 0}, 0.5, rough));
+        parts.microfacets = {{rough.get(), rough_entry}, {coat.get(), coat_entry}};
+        parts.microfacets.insert(parts.microfacets.end(), extra.begin(), extra.end());
+        return parts;
+    };
+    const auto refused = [&](std::vector<std::pair<const material*, gpu::microfacet_desc>> extra) {
+        try
+        {
+            (void)translate_parts(parts_with(std::move(extra)));
+        }
+        catch (const std::logic_error&)
+        {
+            return true;
+        }
+        return false;
+    };
+
+    translation_check out;
+    const auto desc = translate_parts(parts_with({}));
+    if (!desc)
+    {
+        out.aligned = "not translated: " + desc.error();
+    }
+    else
+    {
+        // The materials in the order of first use: the matte floor, the lamp, the smoke's phase function, the gloss's
+        // placeholder, the conductor's
+        const std::vector<gpu::microfacet_desc>& side = desc->quality.microfacets;
+        const std::array<gpu::microfacet_kind, 5> kinds{gpu::microfacet_kind::none, gpu::microfacet_kind::none,
+                                                        gpu::microfacet_kind::none, gpu::microfacet_kind::gloss,
+                                                        gpu::microfacet_kind::conductor};
+        if (desc->materials.size() != kinds.size() || side.size() != kinds.size())
+        {
+            out.aligned = std::format("{} materials and {} side entries, expected 5 and 5", desc->materials.size(),
+                                      side.size());
+        }
+        for (std::size_t i = 0; out.aligned.empty() && i < kinds.size(); ++i)
+        {
+            const double expected = i == 3 ? 0.3 : i == 4 ? 0.5 : 0.0;
+            if (side[i].kind != kinds[i] || side[i].roughness != expected)
+            {
+                out.aligned = std::format("side entry {} isn't its material's", i);
+            }
+        }
+    }
+    out.same_entry_twice = !refused({{rough.get(), rough_entry}});
+    out.two_entries_refused =
+        refused({{rough.get(), gpu::microfacet_desc{.kind = gpu::microfacet_kind::conductor, .roughness = 0.6}}});
+    out.unused_refused = refused({{stray.get(), rough_entry}});
+    return out;
 }
 
 std::vector<scene_display> scene_displays()

@@ -40,4 +40,15 @@ struct scene_display
     gpu::display_options display;
 };
 std::vector<scene_display> scene_displays();
+
+// The translation of a scene's GGX side entries (gpu_scene.ixx, translate_parts), on a world of its own: a matte floor,
+// a lamp, smoke, then a gloss's placeholder and a conductor's, their side entries listed in the other order
+struct translation_check
+{
+    std::string aligned;              // empty when there is one side entry per material, each at its material's index
+    bool same_entry_twice = false;    // a placeholder listed twice with the same entry: accepted
+    bool two_entries_refused = false; // a placeholder with two different entries: std::logic_error
+    bool unused_refused = false;      // an entry whose placeholder isn't in the world: std::logic_error
+};
+translation_check check_ggx_translation();
 }

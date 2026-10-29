@@ -6,6 +6,9 @@
 export module gpu_scenes;
 
 export import :parts;
+// The scenes of materials beyond the books. An interface partition must be exported by the primary interface
+// ([module.unit]/3); it exports nothing of its own, and its scenes' functions are the module's.
+export import :materials;
 
 import std;
 import camera;
@@ -56,6 +59,8 @@ consteval auto make_scene_list(std::index_sequence<I...>)
         gpu_scene_entry{scene_list[I].name, scene_list[I].description, scene_role::book, &book_scene<I>}...,
         gpu_scene_entry{"furnace", "a white sphere under a white sky: every pixel exactly 1 (a check of the renderers)",
                         scene_role::test, &furnace},
+        gpu_scene_entry{"ggx-furnace", "white metals, a mirror and four GGX roughnesses, under a white sky: the light "
+                        "each keeps", scene_role::test, &ggx_furnace},
     };
 }
 
@@ -77,13 +82,19 @@ export const gpu_scene_entry* find_gpu_scene(std::string_view name)
 // each other group that has scenes under its heading. A scene added to the list appears in both programs' help.
 export std::string scenes_usage(std::string_view default_scene)
 {
+    // Each group's names in a column as wide as its longest, at least the books' 10 (RayTracing's own list)
     const auto group = [](scene_role role) {
+        std::size_t width = 10;
+        for (const gpu_scene_entry& entry : gpu_scenes)
+        {
+            width = entry.role == role ? std::max(width, entry.name.size()) : width;
+        }
         std::string text;
         for (const gpu_scene_entry& entry : gpu_scenes)
         {
             if (entry.role == role)
             {
-                text += std::format("  {:10} {}\n", entry.name, entry.description);
+                text += std::format("  {:{}} {}\n", entry.name, width, entry.description);
             }
         }
         return text;
