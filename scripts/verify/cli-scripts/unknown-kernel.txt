@@ -1,0 +1,4 @@
+# A script naming a kernel the window doesn't know (Step 73 adds kernel quality, never this one)
+size 16 9
+kernel bogus
+hold 1 +1

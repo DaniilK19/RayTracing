@@ -1,0 +1,60 @@
+# The window's regression script for scripts/verify/hostgate.ps1: tiny frames of every scene and of the settings the
+# window can switch, rendered with
+#   RayTracingViewer --headless --script tests\regress-viewer.txt --frames <folder>
+# Their bytes are the display kernel's (the window's), so the frames must stay the same, byte for byte, from build to
+# build: the 13 scenes in float, two in double, the Cornell box under three more strategies, the first book's scenes
+# in the kernel for all three books, and rounds of 2×2. Every frame has 16 passes at 96×54: one round of 4×4 samples,
+# the last four rounds of 2×2. (The kernel for all three books gives the first book's images bit for bit, so its
+# frames equal the others: these show that it still does, not which kernel ran; RayTracingGPU's Kernel line does.)
+size 96 54
+strata 4
+seed 0
+scene materials
+hold 1 +16
+scene weekend
+hold 1 +16
+scene bouncing
+hold 1 +16
+scene checker
+hold 1 +16
+scene earth
+hold 1 +16
+scene perlin
+hold 1 +16
+scene quads
+hold 1 +16
+scene light
+hold 1 +16
+scene cornell
+hold 1 +16
+scene smoke
+hold 1 +16
+scene final
+hold 1 +16
+scene aluminum
+hold 1 +16
+scene glass
+hold 1 +16
+precision double
+scene weekend
+hold 1 +16
+scene final
+hold 1 +16
+precision float
+scene cornell
+sampling uniform
+hold 1 +16
+sampling material
+hold 1 +16
+sampling lights
+hold 1 +16
+sampling scene
+kernel all-books
+scene weekend
+hold 1 +16
+scene materials
+hold 1 +16
+kernel auto
+scene final
+strata 2
+hold 1 +16

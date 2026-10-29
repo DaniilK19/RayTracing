@@ -1,0 +1,4 @@
+# A script with an unknown scene: the window refuses it before it renders (cli-cases.txt)
+size 16 9
+scene bogus
+hold 1 +1

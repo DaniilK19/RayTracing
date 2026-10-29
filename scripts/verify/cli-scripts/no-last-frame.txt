@@ -1,0 +1,4 @@
+# A script that ends without a frame: lines after the last hold render nothing, an error
+size 16 9
+hold 1 +1
+seed 2

@@ -1,0 +1,5 @@
+# A script with the kernel of a later step: unknown until Step 73, then a tiny headless render of 16×9
+size 16 9
+scene cornell
+kernel quality
+hold 1 +1

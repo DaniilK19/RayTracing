@@ -1,0 +1,96 @@
+# The command lines of hostgate.ps1's text gate: each ends before anything is rendered (help, or an error found in the
+# options or in building the scene), so they cost no GPU time. Their output and exit code must stay the same as the
+# previous step's, apart from the step's allowed differences. One case per line: G for RayTracingGPU, V for
+# RayTracingViewer, then the arguments ("double quotes" keep spaces). The programs run from the project's folder.
+# None of them may open the viewer's window: every V case must fail before it, or be --help.
+
+# Help
+G --help
+G -h
+V --help
+
+# The scene and the options' names
+G bogus
+G --bogus
+G cornell extra
+V bogus
+V --bogus
+
+# Values missing or out of range
+G -w
+G -w 0
+G -w abc
+G -w -5
+G -s 0
+G --samples 1.5
+G --strata 0
+G --strata 100000
+G --seed -1
+G --seed abc
+G --seed 4294967296
+G --launch-ms 0
+G --launch-ms 100000
+G cornell -p
+G -p bogus
+G -p Material
+V -w 0
+V -s 0
+V --strata 0
+V --seed -1
+V --refresh-hz 0
+V --refresh-hz abc
+V -p bogus
+V --frames
+
+# Outputs
+G -o out.bmp
+G -o no-such-folder\image.png
+G -o image.png -o image.jpg
+V -o out.bmp
+V -o no-such-folder\image.pfm
+
+# The view options, and views the scene can't be rendered from (found when the scene is built)
+G --height 0
+G --height abc
+G --lookfrom 1,2
+G --lookat x,y,z
+G --vfov 0
+G --vfov 180
+G --defocus-angle -1
+G --focus-dist 0
+G cornell --lookfrom 0,0,0 --lookat 0,0,0
+G cornell --lookfrom 0,0,0 --lookat 0,5,0
+G cornell --height 9999999
+V --height 0
+V --lookfrom 1,2,3,4
+
+# Combinations the window refuses
+V --headless --input input.txt
+V --script script.txt --input input.txt
+
+# Options of the later steps: unknown so far, then each step's own errors. They are tiny renders (-w 16 -s 1, the
+# window --headless, RayTracingGPU writing into out\m4\runs), so that a step that failed to refuse one would cost
+# nothing, open no window and write nothing into the project.
+G -p nee -w 16 -s 1 -o out\m4\runs\cli-case.png
+G -p mis -w 16 -s 1 -o out\m4\runs\cli-case.png
+G cornell -p mis --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
+G --quality-kernel --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
+G --quality-kernel -p mixture -w 16 -s 1 -o out\m4\runs\cli-case.png
+G --quality-kernel --all-books-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
+G --tonemap bogus -w 16 -s 1 -o out\m4\runs\cli-case.png
+G --tonemap agx --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
+G --exposure 1 -w 16 -s 1 -o out\m4\runs\cli-case.png
+G --exposure abc -w 16 -s 1 -o out\m4\runs\cli-case.png
+V -p mis --fp64 --headless -w 16 -s 1
+V --quality-kernel --fp64 --headless -w 16 -s 1
+V --tonemap bogus --headless -w 16 -s 1
+V --exposure 1 --headless -w 16 -s 1
+
+# The window's scripts (scripts/verify/cli-scripts): errors found when the script is read or started, before a frame
+V --headless --script scripts\verify\cli-scripts\unknown-scene.txt
+V --headless --script scripts\verify\cli-scripts\unknown-sampling.txt
+V --headless --script scripts\verify\cli-scripts\unknown-kernel.txt
+V --headless --script scripts\verify\cli-scripts\no-last-frame.txt
+V --headless --script scripts\verify\cli-scripts\later-sampling.txt
+V --headless --script scripts\verify\cli-scripts\later-kernel.txt
+V --headless --script scripts\verify\cli-scripts\no-such-file.txt

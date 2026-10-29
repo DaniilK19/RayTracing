@@ -1,0 +1,4 @@
+# A script with an unknown sampling strategy (later steps add nee and mis, never this one)
+size 16 9
+sampling bogus
+hold 1 +1

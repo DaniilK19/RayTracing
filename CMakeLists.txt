@@ -103,6 +103,12 @@ add_executable(ImageCompare src/image_compare.cpp src/utf8.manifest)
 target_link_libraries(ImageCompare PRIVATE raytracer)
 target_compile_options(ImageCompare PRIVATE /W4)
 
+# PfmStats: numbers about renders that ImageCompare doesn't give (noise, exact values, identical bytes) for the checks
+# of the GPU's kernels (tests/pfm_stats.cpp). It reads the files with the image module.
+add_executable(PfmStats tests/pfm_stats.cpp src/utf8.manifest)
+target_link_libraries(PfmStats PRIVATE raytracer)
+target_compile_options(PfmStats PRIVATE /W4)
+
 # --- GPU programs (optional) -------------------------------------------------
 # RayTracingGPU renders RayTracing's scenes on an NVIDIA graphics card (see main_gpu.cpp), and RayTracingViewer shows
 # them in a window as they render (main_viewer.cpp). They need the CUDA Toolkit (nvcc and the CUDA libraries); without
@@ -160,8 +166,19 @@ if(CMAKE_CUDA_COMPILER)
     add_executable(RayTracingGPU src/main_gpu.cpp src/utf8.manifest)
     target_link_libraries(RayTracingGPU PRIVATE gpu_scene)
     target_compile_options(RayTracingGPU PRIVATE /W4)
+
+    # GpuTests: numeric tests of the renderer's device functions, run on the GPU (tests/gpu_tests.cpp and the suites,
+    # tests/*_tests.cu). A suite is a file of its own: the glob finds new ones, and CONFIGURE_DEPENDS has the build
+    # look for them again each time it runs.
+    file(GLOB gpu_test_suites CONFIGURE_DEPENDS tests/*_tests.cu)
+    add_executable(GpuTests tests/gpu_tests.cpp ${gpu_test_suites} src/utf8.manifest)
+    # gpu_tests.cpp, compiled by cl.exe, asks the CUDA runtime whether there is a GPU at all: the toolkit's headers
+    target_include_directories(GpuTests PRIVATE src/gpu tests ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(GpuTests PRIVATE gpu_scene)
+    target_compile_options(GpuTests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:/W4> $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/W4>)
 else()
-    message(STATUS "No working CUDA compiler found: the GPU programs, RayTracingGPU and RayTracingViewer, are skipped")
+    message(STATUS "No working CUDA compiler found: the GPU programs, RayTracingGPU, RayTracingViewer and GpuTests, "
+                   "are skipped")
     message(STATUS "After installing the CUDA Toolkit, restart Visual Studio (or the terminal) and delete the CMake "
                    "cache: Project > Delete Cache and Reconfigure (or cmake --fresh)")
 endif()
@@ -169,3 +186,14 @@ endif()
 # RayTracingViewer, the window, with SDL3 for the window and for drawing the image in it (cmake/sdl3.cmake). Without
 # CUDA the file only declares its options, so that giving them is no mistake.
 include(cmake/sdl3.cmake)
+
+# --- Tests ---------------------------------------------------------------------
+# ctest (in the build folder) runs PfmStats' check of its own arithmetic and GpuTests' quick run: every test kernel on
+# a few samples, the statistical verdicts skipped. GpuTests exits with 77 on a computer without an NVIDIA GPU, which
+# ctest reports as skipped. The full statistical runs, the renders and the gates of scripts/verify are run by hand.
+enable_testing()
+add_test(NAME pfm_stats_self_test COMMAND PfmStats self-test)
+if(TARGET GpuTests)
+    add_test(NAME gpu_tests_quick COMMAND GpuTests all --quick)
+    set_tests_properties(gpu_tests_quick PROPERTIES SKIP_RETURN_CODE 77)
+endif()
