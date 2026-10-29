@@ -63,6 +63,10 @@ consteval auto make_scene_list(std::index_sequence<I...>)
                         "each keeps", scene_role::test, &ggx_furnace},
         gpu_scene_entry{"gloss-furnace", "white matte spheres under four glossy coats, under a white sky: the light "
                         "each keeps", scene_role::test, &gloss_furnace},
+        gpu_scene_entry{"cornell-ggx", "the Cornell box with a block of rough aluminum and a glossy white one",
+                        scene_role::showcase, &cornell_ggx, strategy::mis, cornell_ggx_display},
+        gpu_scene_entry{"veach", "Veach's four plates (1997): a metal from sharp to rough under four lamps of one power "
+                        "and four sizes", scene_role::showcase, &veach_plates, strategy::mis, veach_display},
     };
 }
 

@@ -1,5 +1,6 @@
 // Suites ggx and ggx-energy: the GGX rough conductor of ggx.cuh and its two lobes in bsdf.cuh, conductor and
-// smooth_conductor (Step 78), and its energy compensation (Step 79). A rough metal reflects off microfacets whose
+// smooth_conductor (Step 78), its energy compensation (Step 79), and the GGX lobes' weights in multiple importance
+// sampling under the lamps (Step 81). A rough metal reflects off microfacets whose
 // normals h follow the GGX distribution D (Walter et al. 2007), masked by the height-correlated Smith term G2 (Heitz
 // 2014); ggx_sample draws the visible normals (Heitz 2018) by spherical caps (Dupuy & Benyoub 2023). The quality
 // kernel's multiple importance sampling weighs ggx_sample's density against ggx_eval's for the same direction, so the
@@ -23,6 +24,12 @@
 //   - The formulas of B.md §2.3 at random arguments against double (the formula-* checks, not numbered in the spec):
 //     they pin the α / α² conventions of ggx_d, ggx_g1, ggx_g2 and smith_a, which the integrals can't see (a D of
 //     width α² instead of α still integrates to 1).
+//   - Under the lamps (G18, Step 81): Veach's conditions on the weights of a light sample and of the lobe's own sample,
+//     the conductor and the gloss at a vertex lit by cornell's lamp or light's two: w_L + w_B = 1 wherever both
+//     techniques can draw the direction (W1), and a technique that can't draw it has density 0 (W2), under nee and
+//     mis. The conductor's two densities of one direction, ggx_sample's and ggx_pdf's, meet in the weights there; a
+//     density 5% too wide must be rejected. (The gloss's sample takes its density from gloss_eval itself, so W1 can't
+//     see an error in it: the gloss suite's χ², masses and pdf checks do.)
 //   - ggx-energy: single scattering loses energy to the light that bounces between microfacets, up to 70% at α = 1.
 //     Turquin et al. 2019 scale f by 1 + F0 (1 - E)/E, E = E_ss(μ, r) with F = 1, read from a 32 × 32 table that this
 //     suite generates (--write FILE, the file ggx_energy.cuh) by the same quadrature and checks (--check FILE, or the
@@ -51,7 +58,7 @@
 //      as ∫ pdf's, stops at the horizon, where the midpoint error is O(1/N) (measured 9.5·10⁻⁵); α = 10⁻³ is INFO.
 //  10. G17's patch averages: E_ss(μ) over the patch's area, μ from the camera's own rays (B.md §6.2), E_ss
 //      interpolated linearly between quadratures at μ = 0.96, 0.965, ..., 1.
-//  11. G18 (Step 81's T3 case) needs track D's lamps and comes with Step 81.
+//  11. G18 (Step 81's T3 case, written once the lamps existed): decisions 18-23.
 //  12. G4's tolerances and G10's F follow the half vector h' = unit(v + l) that ggx_eval and ggx_pdf recompute from the
 //      drawn l. B.md §8.4 estimated its rounding at v·h ≈ 1; v + l has the length 2 v·h and carries l's rounding, so
 //      h' is off the drawn h by about 10⁻⁷/(v·h): 60 times more at θv = 89°, where a narrow lobe has v·h ≈ 0.017 (a
@@ -75,6 +82,37 @@
 //  17. E4 adds a check not in B.md's list: ggx_compensation equals B.md §3.8's bilinear lookup of the compiled-in
 //      table, 1 + F0 (1 - E)/E, to 10⁻⁵ (the review's "the table's axes and bilinear lookup"), at 65 × 65 points and
 //      the 32 × 32 nodes. E5 draws 10⁵ samples in each case of the §5.1 grid (B.md gives no count).
+//  18. G18's cases go beyond B.md's two (cornell's lamp; the conductor at α = 0.09 over aluminium's F0, the gloss at
+//      α = 0.04 over ρ = 0.73; mis): both setups of the lamps suite's T3, cornell's lamp (pmf 1) and light's quad and
+//      sphere (pmf ½), × the conductor (aluminium) at the ggx grid's α and 0.09 × the gloss (ρ = 0.73) at the gloss
+//      suite's α and 0.04 × nee and mis, from 10⁶ light-drawn and 10⁶ lobe-drawn directions per case (one draw for both
+//      combinations: only the weights differ). B.md's ggx/t3-cornell-conductor and ggx/t3-cornell-gloss are the checks
+//      t3-cornell-conductor-0.09-mis and t3-cornell-gloss-0.04-mis. An α below min_ggx_alpha (should G13's remedy
+//      raise it) makes the delta mirror, with nothing to weigh: INFO. t3-<setup>-lamps checks build_lamps' count.
+//  19. The points: B.md's box [100, 450] × [50, 400] × [100, 450] under cornell's lamp, D.md §6's P_light under light's
+//      (behind its quad too, where a lobe's ray finds the quad's back). The normal faces the centre of a lamp picked
+//      uniformly; wo is uniform above n at half the points, and at the other half aimed: the mirror image about n of
+//      the direction to a uniform point of that lamp (when above n), so that the lobe's peak meets the lamp. With wo
+//      uniform alone a narrow lobe would be tested almost only where p_L ≫ p_B or p_B ≫ p_L, where the sum of the
+//      weights can't see a density's error (its slope 2r²/(1 + r²)² in ln r, r = p_L/p_B, vanishes there).
+//  20. Under mis |Σw − 1| ≤ 10⁻⁵ + τ with decision 12's τ = max(10⁻⁵, 10⁻⁶/(α v·h')), h' = unit(wo + wi), for both
+//      techniques and both lobes: B.md's τ(α) at v·h' = 1. The sum moves by at most ½|ln(p/p')| (plus rounding) when
+//      one technique's density enters it as p and p', so G4's bound on ggx_sample's against ggx_pdf's implies it.
+//      Under nee Σw = 1 exactly. A technique's weight counts only where its density is positive (W2): for a
+//      light-drawn direction Σw = w_L + [p_B > 0]·w_B, so one the lobe can't draw (p_B = 0 with f > 0, counted INFO)
+//      needs w_L = 1 alone. A lobe-drawn ray at a lamp's front must find p_L′ > 0, finite (the light sampler draws
+//      every point of a front in view; without its density the light would count twice): a violation in both modes.
+//  21. W2's checks, t3-<setup>-<lobe>-w2 over every α and both techniques: a drawn direction has a positive, finite
+//      density in its technique (the light sample's pdf; the lobe's, which isn't delta); a light-drawn direction more
+//      than 10⁻⁶ below the lobe's horizon gets f = 0 and density 0 from eval_bsdf (the lobe's draws there are
+//      absorbed); a lobe-drawn ray at the back of light's quad gets lamp_hit_pdf 0, light_weight 0 under mis and
+//      bsdf_weight 1 under both. Non-finite f or densities count here too.
+//  22. A case whose light-drawn or lobe-drawn directions tested nothing counts one violation: a check of nothing
+//      mustn't pass. Rays that find another lamp first or slip past the sampled lamp's edge are left out (the lamps
+//      suite's T1 tests them).
+//  23. The must-fail t3-planted-wider-pdf: cornell's conductor at α = 0.3, lobe-drawn, mis, w_L from ggx_pdf at 1.05α
+//      instead of eval_bsdf's density; rejected iff some direction has |Σw − 1| > 10⁻³ (50 times the tolerance), a
+//      count as the lamps suite's X1.
 //
 // Step 78's criteria (B.md §7; Claude runs them; $S = -w 480 --height 270):
 //   $GT ggx: exit 0; it prints E_ss(1, α) and the patch averages (ggx.furnace-values-*).
@@ -95,12 +133,22 @@
 //   rectangles byte-identical to Step 78's render: $PS same W\78\gf.pfm W\79\gf.pfm --rect 66 133 70 137
 //   --rect 0 0 479 109 --rect 0 161 479 269. CARRY: the lamp scenes identical; ggx-furnace re-recorded.
 //   Sanitizer: ggx-furnace and $GT ggx-energy --quick.
+// Step 81's (B.md §7):
+//   $GT ggx gloss: exit 0 (G18: Σw = 1 to 10⁻⁵ + τ with these lobes under cornell's and light's lamps; its counts keep
+//   their verdicts under --quick).
+//   compare.ps1 -Scene cornell-ggx -A material:1,2 -B mis:3,4 -Spp 1024: tests, controls and the RMS rule pass;
+//   σ_mis < σ_material ($PS noise, trimmed).
+//   veach $S -s 256 -p mis, seeds 3 and 4: the control exits 0, $PS stats --finite; no cross-strategy test on veach.
+//   Help: "Scenes beyond the books:" lists cornell-ggx and veach (allowed diff); Tab unchanged until Step 84.
+//   Sanitizer: cornell-ggx, veach (and $GT ggx --quick, G18 included). CARRY recorded: cornell-ggx and veach -p mis $S
+//   -s 64 --seed 3.
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <format>
@@ -114,16 +162,22 @@
 #include <vector>
 
 #include "bsdf.cuh"
+#include "bvh.cuh"
 #include "ggx.cuh"
 #include "ggx_energy.cuh"
 #include "gpu_test.cuh"
 #include "gpu_test.h"
 #include "host_services.h"
+#include "lamps.cuh"
+#include "light_sampler.cuh"
 #include "material.cuh"
+#include "mis.cuh"
 #include "quality_view.cuh"
 #include "random.cuh"
 #include "renderer.h"
 #include "statistics.h"
+#include "test_scene.h"
+#include "tracer.cuh"
 #include "vec3.cuh"
 
 namespace
@@ -1587,6 +1641,469 @@ GPU_TEST(ggx, validate)
     ctx.exact("validate-accepts-smooth-conductor", refused(one_sphere(mirror, {conductor(0)})), 0, 0);
     ctx.exact("validate-accepts-roughness-1", refused(one_sphere(mirror, {conductor(1)})), 0, 0);
     ctx.exact("validate-accepts-none", refused(one_sphere(matte, {gpu::microfacet_desc{}})), 0, 0);
+}
+
+// --- G18 (Step 81): Veach's conditions on the weights, with the GGX lobes under the lamps ----------------------------
+//
+// At a vertex of a rough metal or a glossy coat the path takes a light sample and a sample of the lobe, the next ray
+// (D.md §2.1), and mis.cuh weighs each against the other technique's density of the same direction. Veach's
+// multi-sample estimator (1997, eq. 9.4, p. 260) is unbiased iff (W1) w_L + w_B = 1 wherever f·Le ≠ 0 and both
+// techniques can draw the direction, and (W2) a technique that can't draw it has weight 0, so there the other's weight
+// is 1 alone. The lamps suite's T3 checks this with the books' lobes, whose two densities are one formula; the
+// conductor computes its density twice, ggx_sample's from the drawn half vector and ggx_pdf's from unit(v + l), and
+// enters the weights of one direction with both: W1 holds only as far as they agree. (The gloss's sample takes its
+// density from gloss_eval at the drawn direction, as eval_bsdf does: its W1 holds by construction, and an error in
+// that density is the gloss suite's to find, by its χ² and masses.) As D.md §6's T3 (and §10.7's pairing):
+//   (a) a direction the light sampler draws: w_L(p_L, p_B) + w_B(p_B, p_L′), p_B eval_bsdf's density, p_L′ the
+//       lamp_hit_pdf of the traced hit;
+//   (b) a direction the lobe draws that reaches a lamp's front: w_B(p_B,sample, p_L′) + w_L(p_L′, p_B,eval), as the
+//       integrator pairs them (the sample's own density at the lamp hit, eval_bsdf's at the light sample).
+// Under the power heuristic |Σw − 1| ≤ 10⁻⁵ + τ (B.md G18), under lights_only Σw = 1 exactly.
+
+constexpr std::int64_t t3_samples = 1'000'000; // per case and technique: light-drawn, lobe-drawn
+constexpr std::uint64_t t3_seed = 8100;        // + 2·case + technique: 28 cases (2 setups × 14 lobes), 8100 to 8155
+constexpr std::uint64_t t3_planted_seed = 8160;
+
+// The conductor at the ggx grid's α and B.md's 0.09 (aluminium); the gloss at the gloss suite's α and B.md's 0.04
+// (ρ = 0.73)
+constexpr std::array<double, 8> t3_conductor_alphas{1e-3, 0.01, 0.05, 0.09, 0.1, 0.3, 0.6, 1.0};
+constexpr std::array<double, 6> t3_gloss_alphas{0.01, 0.04, 0.1, 0.3, 0.6, 1.0};
+
+// The books' lamps (D.md §5.5), alone in the BVH, so that nothing else stands between a point and a lamp: cornell's
+// quad of L = 15 (one lamp, pmf 1), or light's quad and sphere of L = 4 (pmf ½)
+gpu::scene_desc t3_lamps(bool cornell)
+{
+    gpu::scene_desc s;
+    const double radiance = cornell ? 15 : 4;
+    s.textures.push_back({.kind = gpu::texture_kind::solid, .rgb = {radiance, radiance, radiance}});
+    s.materials.push_back({.kind = gpu::material_kind::diffuse_light, .texture = 0});
+    if (cornell)
+    {
+        s.quads.push_back({.q = {343, 554, 332}, .u = {-130, 0, 0}, .v = {0, 0, -105}, .material = 0});
+    }
+    else
+    {
+        s.quads.push_back({.q = {3, 1, -2}, .u = {2, 0, 0}, .v = {0, 2, 0}, .material = 0});
+        s.spheres.push_back({.center = {0, 7, 0}, .radius = 2, .material = 0});
+    }
+    return s;
+}
+
+// The lamps on the GPU as the quality kernel's view holds them (shared.md 3.11): the BVH of device_scene, the light set
+// of build_lamps, light_pmf = float(1/N) divided in double (D.md §3.3)
+class t3_scene
+{
+public:
+    explicit t3_scene(bool cornell)
+        : scene_(t3_lamps(cornell)),
+          device_(scene_),
+          table_(gpu::build_lamps(scene_, device_.sphere_ids(), device_.quad_ids())),
+          lamps_(table_.lamps),
+          lamp_of_(table_.lamp_of)
+    {
+    }
+
+    int count() const { return static_cast<int>(table_.lamps.size()); }
+
+    gpu::quality_view view() const
+    {
+        gpu::quality_view v{};
+        v.base = device_.view();
+        v.microfacets = nullptr; // the test makes the lobe itself, passing its side entry to make_bsdf
+        v.lamps = {.lamps = lamps_.get(), .lamp_of = lamp_of_.get(), .count = count()};
+        v.environment = {};
+        v.light_pmf = count() > 0 ? static_cast<float>(1.0 / count()) : 0.0f;
+        v.combination = gpu::light_combination::power_heuristic; // unread: each weight takes its combination
+        return v;
+    }
+
+private:
+    gpu::scene_desc scene_;
+    gpu_test::device_scene device_;
+    gpu::lamp_table table_;
+    gpu_test::device_buffer<gpu::emitter> lamps_;
+    gpu_test::device_buffer<int> lamp_of_;
+};
+
+// The vertex's material, as make_bsdf gets it
+struct t3_lobe
+{
+    gpu::material<float> m; // a metal of fuzz 0 (conductor) or a matte surface (gloss)
+    gpu::microfacet side;   // its side entry: kind, α = float(r²), r = float(r), from r in double (B.md §2.1)
+    vec3<float> c;          // the color surface_color gave: the gloss's ρ
+    gpu::lobe expected;     // what make_bsdf must make of them
+};
+
+t3_lobe make_t3_lobe(bool gloss, double alpha)
+{
+    const double r = std::sqrt(alpha);
+    t3_lobe l{};
+    l.side = {gloss ? gpu::microfacet_kind::gloss : gpu::microfacet_kind::conductor, static_cast<float>(r * r),
+              static_cast<float>(r)};
+    if (gloss)
+    {
+        l.m.kind = gpu::material_kind::lambertian;
+        l.m.albedo = {0.73f, 0.73f, 0.73f};
+        l.expected = gpu::lobe::gloss;
+    }
+    else
+    {
+        l.m.kind = gpu::material_kind::metal;
+        l.m.albedo = aluminium();
+        l.m.fuzz = 0;
+        l.expected = gpu::lobe::conductor;
+    }
+    l.c = l.m.albedo;
+    return l;
+}
+
+enum t3_tally : int
+{
+    t3_tested,      // f·Le ≠ 0 and both techniques have a density: W1
+    t3_one_density, // f·Le ≠ 0, but the lobe's density is 0 (a light-drawn direction): w_L alone must be 1 (W2)
+    t3_nee_wrong,   // lights_only: Σw not exactly 1, a weight outside [0, 1], a lamp's front without p_L′
+    t3_mis_wrong,   // power heuristic: |Σw − 1| > 10⁻⁵ + τ, a weight outside [0, 1], a lamp's front without p_L′
+    t3_w2_wrong,    // a density where its technique can't draw the direction, or none where it does (W2)
+    t3_far,         // power heuristic: |Σw − 1| > 10⁻³ (the planted fault's verdict)
+    t3_tallies,
+};
+
+__device__ inline bool positive(const vec3<float>& c) { return c.x > 0.0f || c.y > 0.0f || c.z > 0.0f; }
+__device__ inline bool unit_interval(float w) { return w >= 0.0f && w <= 1.0f; } // a NaN fails
+__device__ inline gpu::light_combination t3_mode(int c) // 0: nee, 1: mis
+{
+    return c == 0 ? gpu::light_combination::lights_only : gpu::light_combination::power_heuristic;
+}
+
+// One number per statement: their order is the statements'
+__device__ inline float uniform_in(gpu::pcg32& rng, float lo, float hi)
+{
+    return lo + (hi - lo) * gpu::random_real<float>(rng);
+}
+
+// B.md G18's points under cornell's lamp, [100, 450] × [50, 400] × [100, 450]; D.md §6's P_light under light's,
+// [−10, 10] × [0, 10] × [−10, 10] outside D² ≤ 4.04 of the sphere lamp (the points behind the quad included)
+__device__ inline vec3<float> t3_point(bool cornell, gpu::pcg32& rng)
+{
+    const vec3<float> lo = cornell ? vec3<float>{100.0f, 50.0f, 100.0f} : vec3<float>{-10.0f, 0.0f, -10.0f};
+    const vec3<float> hi = cornell ? vec3<float>{450.0f, 400.0f, 450.0f} : vec3<float>{10.0f, 10.0f, 10.0f};
+    for (;;) // rejects less than 1% of light's box, none of cornell's
+    {
+        const float x = uniform_in(rng, lo.x, hi.x);
+        const float y = uniform_in(rng, lo.y, hi.y);
+        const float z = uniform_in(rng, lo.z, hi.z);
+        const vec3<float> p{x, y, z};
+        if (cornell || (p - vec3<float>{0.0f, 7.0f, 0.0f}).length_squared() > 4.04f)
+        {
+            return p;
+        }
+    }
+}
+
+__device__ inline vec3<float> lamp_centre(const gpu::emitter& e)
+{
+    return e.kind == static_cast<int>(gpu::light_shape::quad) ? e.corner + 0.5f * e.u + 0.5f * e.v : e.corner;
+}
+
+// A point of lamp e for two numbers: q + a·u + b·v on a quad, the point at z = 1 − 2a, φ = 2πb on a sphere
+__device__ inline vec3<float> lamp_point(const gpu::emitter& e, float a, float b)
+{
+    if (e.kind == static_cast<int>(gpu::light_shape::quad))
+    {
+        return e.corner + a * e.u + b * e.v;
+    }
+    const float z = 1.0f - 2.0f * a;
+    const float s = sqrtf(fmaxf(0.0f, 1.0f - z * z));
+    float sin_phi;
+    float cos_phi;
+    sincospif(2.0f * b, &sin_phi, &cos_phi);
+    return e.corner + e.size * vec3<float>{s * cos_phi, s * sin_phi, z};
+}
+
+struct t3_sample
+{
+    gpu::quality_view v; // the lamps alone; the combination is each weight's argument, so one draw serves both
+    t3_lobe lobe;
+    bool cornell;     // the point set and lamps: cornell's, else light's
+    bool light_drawn; // (a) the light sampler's direction, (b) the lobe's
+    bool planted;     // (b), mis: w_L from the density of a conductor 5% wider than the lobe (the must-fail)
+
+    __device__ void operator()(gpu::pcg32& rng, unsigned long long* tally, float& largest) const
+    {
+        // The point; the normal toward the centre of a lamp picked uniformly (B.md G18); the view direction uniform
+        // above n, or for half the points aimed: the mirror image about n of the direction to a point of that lamp,
+        // so that the lobe's peak meets it (decision 19)
+        const vec3<float> x = t3_point(cornell, rng);
+        const int count = v.lamps.count;
+        const int k = ::min(static_cast<int>(gpu::random_real<float>(rng) * static_cast<float>(count)), count - 1);
+        const gpu::emitter& e = v.lamps.lamps[k];
+        vec3<float> n = gpu::random_unit_vector<float>(rng);
+        n = gpu::dot(n, lamp_centre(e) - x) < 0.0f ? -n : n;
+        vec3<float> wo = gpu::random_unit_vector<float>(rng);
+        wo = gpu::dot(wo, n) < 0.0f ? -wo : wo;
+        const bool aimed = gpu::random_real<float>(rng) < 0.5f;
+        const float a = gpu::random_real<float>(rng);
+        const float b = gpu::random_real<float>(rng);
+        if (aimed)
+        {
+            const vec3<float> l = gpu::unit_vector(lamp_point(e, a, b) - x);
+            const float c = gpu::dot(n, l);
+            wo = c > 0.0f ? (2.0f * c) * n - l : wo;
+        }
+        gpu::hit_record<float> rec{};
+        rec.p = x;
+        rec.normal = n;
+        rec.front_face = true;
+        const gpu::ray<float> in{x + wo, -wo};
+        const gpu::bsdf vertex = gpu::make_bsdf(lobe.m, &lobe.side, lobe.c, rec, in.direction);
+        if (vertex.kind != lobe.expected)
+        {
+            ++tally[t3_nee_wrong]; // no density to weigh: G12, L9 say why
+            ++tally[t3_mis_wrong];
+            return;
+        }
+        const gpu::bvh_tracer tracer{v};
+        float w_light[2] = {};
+        float w_bsdf[2] = {};
+        vec3<float> wi{};
+        bool one_density = false;
+        if (light_drawn)
+        {
+            gpu::light_sample ls;
+            if (!gpu::sample_light(v, x, rng, ls))
+            {
+                return; // the back of light's quad: no sample
+            }
+            if (!finite(ls.wi) || !(ls.pdf > 0.0f) || !isfinite(ls.pdf))
+            {
+                ++tally[t3_w2_wrong]; // W2: a technique draws only where its density is positive
+                return;
+            }
+            float p_bsdf = quiet_nan();
+            const vec3<float> f = gpu::eval_bsdf(vertex, ls.wi, p_bsdf);
+            if (!finite(f) || !(f.x >= 0.0f && f.y >= 0.0f && f.z >= 0.0f) || !(p_bsdf >= 0.0f) ||
+                !isfinite(p_bsdf))
+            {
+                ++tally[t3_w2_wrong];
+                return;
+            }
+            if (gpu::dot(to_double(vertex.n), to_double(ls.wi)) < -1e-6)
+            {
+                // Below the lobe's horizon its draws are absorbed: the material can't draw the direction, so its
+                // density is 0 (W2), and its f too: f·Le = 0, W1 doesn't apply
+                tally[t3_w2_wrong] += is_zero(f) && p_bsdf == 0.0f ? 0 : 1;
+                return;
+            }
+            if (!positive(f))
+            {
+                return; // at the horizon: no light to weigh
+            }
+            const gpu::bvh_hit<float> hit = tracer.closest({x, ls.wi}, gpu::spawn{-1, false}, rng);
+            if (hit.index != ls.skip || !hit.entering)
+            {
+                return; // the other lamp in front, or a ray past the lamp's edge: the lamps suite's T1
+            }
+            // As the integrator asks at a lamp hit (D.md §2.3, 2.): the ray's origin, unit direction and distance. A
+            // p_L′ of 0 there gives w_B = 1 beside w_L: Σw > 1
+            const float p_light = gpu::lamp_hit_pdf(v, hit.index, x, gpu::unit_vector(ls.wi),
+                                                    hit.t * sqrtf(ls.wi.length_squared()));
+            one_density = !(p_bsdf > 0.0f);
+            for (int c = 0; c < 2; ++c)
+            {
+                w_light[c] = gpu::light_weight(t3_mode(c), ls.pdf, p_bsdf);
+                // W2: no weight for the material where it can't draw the direction; then w_L alone must be 1
+                w_bsdf[c] = one_density ? 0.0f : gpu::bsdf_weight(t3_mode(c), p_bsdf, p_light);
+            }
+            wi = ls.wi;
+        }
+        else
+        {
+            gpu::bsdf_sample s{nan_vector(), nan_vector(), quiet_nan(), true};
+            if (!gpu::sample_bsdf(vertex, in, rec, rng, s))
+            {
+                return; // absorbed: below the horizon
+            }
+            if (s.delta || !finite(s.wi) || !finite(s.weight) || !(s.pdf > 0.0f) || !isfinite(s.pdf))
+            {
+                ++tally[t3_w2_wrong]; // W2: a GGX lobe has a density, positive where it draws
+                return;
+            }
+            if (!positive(s.weight))
+            {
+                return; // f = 0: no light to weigh
+            }
+            float p_eval = quiet_nan();
+            gpu::eval_bsdf(vertex, s.wi, p_eval);
+            if (planted)
+            {
+                p_eval = gpu::ggx_pdf(vertex.n, vertex.wo, s.wi, 1.05f * vertex.alpha);
+            }
+            const gpu::bvh_hit<float> hit = tracer.closest({x, s.wi}, gpu::spawn{-1, false}, rng);
+            if (hit.index < 0)
+            {
+                return; // no lamp: no light (the BVH holds the lamps alone)
+            }
+            const float p_light = gpu::lamp_hit_pdf(v, hit.index, x, gpu::unit_vector(s.wi),
+                                                    hit.t * sqrtf(s.wi.length_squared()));
+            if (!hit.entering)
+            {
+                // The back of light's quad, which glows on its front only: no light sample reaches it (sample_lamp
+                // gives none from behind), so its density is 0, the light's weight 0, and the material's ray counts in
+                // full (W2; Le = 0 there, so no image depends on it)
+                const bool sound = p_light == 0.0f && gpu::light_weight(t3_mode(1), p_light, p_eval) == 0.0f &&
+                                   gpu::bsdf_weight(t3_mode(0), s.pdf, p_light) == 1.0f &&
+                                   gpu::bsdf_weight(t3_mode(1), s.pdf, p_light) == 1.0f;
+                tally[t3_w2_wrong] += sound ? 0 : 1;
+                return;
+            }
+            if (!(p_light > 0.0f) || !isfinite(p_light))
+            {
+                // A lamp's front in view, which the light sampler draws too: without its density the material's ray
+                // would count in full beside the light sample's share, the light twice, in both modes
+                ++tally[t3_tested];
+                ++tally[t3_nee_wrong];
+                ++tally[t3_mis_wrong];
+                return;
+            }
+            for (int c = 0; c < 2; ++c)
+            {
+                w_bsdf[c] = gpu::bsdf_weight(t3_mode(c), s.pdf, p_light);
+                w_light[c] = gpu::light_weight(t3_mode(c), p_light, p_eval);
+            }
+            wi = s.wi;
+        }
+        ++tally[one_density ? t3_one_density : t3_tested];
+        // lights_only: 1 + 0, exactly
+        const float nee_sum = w_light[0] + w_bsdf[0];
+        tally[t3_nee_wrong] += unit_interval(w_light[0]) && unit_interval(w_bsdf[0]) && nee_sum == 1.0f ? 0 : 1;
+        // The power heuristic: P(a, b) + P(b, a′) = 1 up to rounding and ½|ln(a/a′)|, a and a′ the one technique's two
+        // densities (decision 20)
+        const float off = fabsf(w_light[1] + w_bsdf[1] - 1.0f);
+        bool close_to_one = off <= 2e-5f; // the smallest tolerance, 10⁻⁵ + 10⁻⁵: no h' to compute
+        if (!close_to_one && off == off)
+        {
+            close_to_one = off <= 1e-5 + pdf_tolerance(vertex.alpha, recompute_half(vertex.wo, wi).vh);
+        }
+        tally[t3_mis_wrong] += unit_interval(w_light[1]) && unit_interval(w_bsdf[1]) && close_to_one ? 0 : 1;
+        tally[t3_far] += off <= 1e-3f ? 0 : 1;
+        largest = fmaxf(largest, off); // fmaxf passes over a NaN, which the tallies count
+    }
+};
+
+template <class F>
+__global__ void t3_kernel(F f, std::uint64_t seed, int count, unsigned long long* tallies, unsigned int* largest)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    gpu::pcg32 rng = gpu::sample_generator(seed, static_cast<std::uint64_t>(t), 0);
+    unsigned long long local[t3_tallies] = {};
+    float most = 0;
+    for (int i = 0; i < count; ++i)
+    {
+        f(rng, local, most);
+    }
+    for (int k = 0; k < t3_tallies; ++k)
+    {
+        atomicAdd(&tallies[k], local[k]);
+    }
+    atomicMax(largest, __float_as_uint(most)); // a float ≥ 0 orders as its bits
+}
+
+struct t3_outcome
+{
+    std::array<std::int64_t, t3_tallies> tally{};
+    float largest = 0; // the power heuristic's largest |Σw − 1| over the directions tested
+    std::int64_t tested() const { return tally[t3_tested] + tally[t3_one_density]; }
+};
+
+// The harness's layout (gpu_test.cuh): 4096 threads, thread t drawing from sample_generator(seed, t, 0)
+template <class F>
+t3_outcome run_t3(const F& f, std::uint64_t seed, std::int64_t n)
+{
+    const gpu_test::device_buffer<unsigned long long> tallies(static_cast<std::size_t>(t3_tallies));
+    const gpu_test::device_buffer<unsigned int> largest(1);
+    t3_kernel<<<gpu_test::test_blocks, gpu_test::test_block_size>>>(f, seed, gpu_test::per_thread(n), tallies.get(),
+                                                                     largest.get());
+    gpu_test::finish_launch("a T3 kernel");
+    t3_outcome out;
+    const std::vector<unsigned long long> t = tallies.download();
+    for (std::size_t k = 0; k < out.tally.size(); ++k)
+    {
+        out.tally[k] = static_cast<std::int64_t>(t[k]);
+    }
+    const unsigned int bits = largest.download()[0];
+    std::memcpy(&out.largest, &bits, sizeof bits);
+    return out;
+}
+
+GPU_TEST(ggx, t3)
+{
+    const std::int64_t n = ctx.samples(t3_samples);
+    struct lobe_case
+    {
+        bool gloss;
+        double alpha;
+    };
+    std::vector<lobe_case> lobes;
+    for (const double alpha : t3_conductor_alphas)
+    {
+        lobes.push_back({false, alpha});
+    }
+    for (const double alpha : t3_gloss_alphas)
+    {
+        lobes.push_back({true, alpha});
+    }
+    std::uint64_t seed = t3_seed;
+    for (const bool cornell : {true, false})
+    {
+        const std::string setup = cornell ? "cornell" : "light";
+        const t3_scene lamps(cornell);
+        ctx.exact("t3-" + setup + "-lamps", lamps.count(), cornell ? 1 : 2, 0);
+        if (lamps.count() == 0)
+        {
+            seed += 2 * lobes.size(); // nothing to aim at: the check above fails
+            continue;
+        }
+        std::int64_t w2_wrong[2] = {}; // conductor, gloss
+        std::int64_t w2_drawn[2] = {};
+        for (const lobe_case& lc : lobes)
+        {
+            const std::string name = "t3-" + setup + (lc.gloss ? "-gloss-" : "-conductor-") + number(lc.alpha);
+            const t3_lobe lobe = make_t3_lobe(lc.gloss, lc.alpha);
+            const std::uint64_t case_seed = seed;
+            seed += 2;
+            if (!lc.gloss && lobe.side.alpha < gpu::min_ggx_alpha)
+            {
+                ctx.info(name, "below min_ggx_alpha: the smooth mirror, a delta lobe with nothing to weigh");
+                continue;
+            }
+            const t3_outcome a = run_t3(t3_sample{lamps.view(), lobe, cornell, true, false}, case_seed, n);
+            const t3_outcome b = run_t3(t3_sample{lamps.view(), lobe, cornell, false, false}, case_seed + 1, n);
+            // A technique that tested no direction would pass by testing nothing: one violation (decision 22)
+            const std::int64_t empty = (a.tested() == 0 ? 1 : 0) + (b.tested() == 0 ? 1 : 0);
+            ctx.count(name + "-nee", a.tally[t3_nee_wrong] + b.tally[t3_nee_wrong] + empty, 0,
+                      a.tested() + b.tested());
+            ctx.count(name + "-mis", a.tally[t3_mis_wrong] + b.tally[t3_mis_wrong] + empty, 0,
+                      a.tested() + b.tested());
+            ctx.info(name + "-tested",
+                     std::format("{} light-drawn directions ({} of them the lobe can't draw), {} lobe-drawn ones at a "
+                                 "lamp's front; mis: largest |w_L + w_B - 1| = {:.3g} (light-drawn) and {:.3g} "
+                                 "(lobe-drawn)",
+                                 a.tested(), a.tally[t3_one_density], b.tested(), a.largest, b.largest));
+            const std::size_t kind = lc.gloss ? 1 : 0;
+            w2_wrong[kind] += a.tally[t3_w2_wrong] + b.tally[t3_w2_wrong];
+            w2_drawn[kind] += 2 * gpu_test::drawn(n);
+        }
+        ctx.count("t3-" + setup + "-conductor-w2", w2_wrong[0], 0, w2_drawn[0]);
+        ctx.count("t3-" + setup + "-gloss-w2", w2_wrong[1], 0, w2_drawn[1]);
+    }
+
+    // The planted fault (decision 23): cornell's conductor at α = 0.3, lobe-drawn, w_L from a lobe 5% wider
+    const t3_scene cornell(true);
+    const t3_outcome planted =
+        run_t3(t3_sample{cornell.view(), make_t3_lobe(false, 0.3), true, false, true}, t3_planted_seed, n);
+    ctx.count("t3-planted-wider-pdf", planted.tally[t3_far] > 0 ? 0 : 1, 0, 1);
+    ctx.info("t3-planted-wider-pdf-far", std::format("{} of {} directions with |w_L + w_B - 1| > 1e-3",
+                                                     planted.tally[t3_far], planted.tested()));
 }
 
 // === Suite ggx-energy (Step 79): Turquin's energy compensation and its table =========================================
