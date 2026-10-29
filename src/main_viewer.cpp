@@ -114,6 +114,7 @@ In the window:
   Shift+wheel          focus nearer or farther
   double-click         focus on what is under the cursor
   Tab, Shift+Tab       the next or the previous scene
+  M, Shift+M           the next or the previous sampling strategy, skipping those the scene can't take
   F2                   float32 or float64
   T, Shift+T           the next or the previous tone map: books, none, agx, neutral
   , and .              exposure down or up by 0.5 EV (not with books)
@@ -460,6 +461,9 @@ private:
     std::int64_t target_ = 0;       // passes to refine to
     int pending_width_ = 0;         // a new size from the window, applied at the next iterate
     int pending_height_ = 0;
+    // The strategy the command line or M named (empty: each scene's own), which Tab takes to every scene that can take
+    // it, as it takes a display chosen; settings_.sampling is the one the scene shown was asked for
+    std::optional<strategy> named_sampling_{opts_.sampling};
 
     // The display (tone_options.ixx): what the command line, a script or the keys chose, for every scene; what they
     // leave open is each scene's own. A change shows the image again through the new display, without restarting it:
@@ -550,6 +554,9 @@ private:
     bool headless() const { return opts_.headless; }
     SDL_AppResult fail(const std::string& message);
     std::expected<void, std::string> use_settings(const render_settings& settings);
+    std::expected<void, std::string> check_display_for(const render_settings& settings) const;
+    std::expected<gpu_build, std::string> build_for(const render_settings& settings) const;
+    std::expected<void, std::string> use_build(const render_settings& settings, gpu_build built);
     camera_settings settings_for(const camera_settings& view, int width, int height) const;
     std::expected<void, std::string> show_view(const camera_settings& view, int width, int height, bool restart);
     std::expected<void, std::string> size_window(int width, int height);
@@ -576,6 +583,7 @@ private:
     void save_view();
     SDL_AppResult switch_scene(int step);
     SDL_AppResult switch_precision();
+    SDL_AppResult switch_strategy(int step);
     SDL_AppResult switched(const std::expected<void, std::string>& used, const std::string& what);
     void change_target(bool more);
     gpu::display_options scene_display() const;
@@ -624,19 +632,40 @@ SDL_AppResult viewer::fail(const std::string& message)
 // session of its own, its image started over; if even that fails, there is no session, and the caller ends.
 std::expected<void, std::string> viewer::use_settings(const render_settings& settings)
 {
-    // The display these settings would show: a tone map beyond the books computes in float32 only (as T and F2 keep
-    // it), checked also when the settings stay, for a script's tonemap line before its next frame
+    // The display is checked also when the settings stay, for a script's tonemap line before its next frame
+    if (session_ && settings == settings_)
+    {
+        return check_display_for(settings);
+    }
+    auto built = build_for(settings);
+    if (!built)
+    {
+        return std::unexpected(built.error());
+    }
+    return use_build(settings, std::move(*built));
+}
+
+// The display these settings would show: a tone map beyond the books computes in float32 only (as T and F2 keep it)
+std::expected<void, std::string> viewer::check_display_for(const render_settings& settings) const
+{
     const gpu_scene_entry* entry = find_gpu_scene(settings.scene);
     if (const gpu::display_options shown = effective_display(display_, entry ? entry->display : gpu::display_options{});
         settings.fp64 && shown.op != gpu::tone_map::books)
     {
         return std::unexpected(std::format("{} works in float32 only", tone_map_name(shown.op)));
     }
-    if (session_ && settings == settings_)
+    return {};
+}
+
+// The scene these settings build, as a new session would render it, or why the window can't show it, while nothing
+// changes yet (M and Tab ask it of the settings they could go to): the display (check_display_for), the scene's own
+// errors, and what the quality kernel can't render (the float-only rule, the books' strategies but the material's)
+std::expected<gpu_build, std::string> viewer::build_for(const render_settings& settings) const
+{
+    if (const auto shown = check_display_for(settings); !shown)
     {
-        return {};
+        return std::unexpected(shown.error());
     }
-    const bool same_scene = session_ && settings.scene == settings_.scene;
     const bool own = settings.scene == opts_.scene;
     std::expected<gpu_build, std::string> built = std::unexpected(std::string());
     try
@@ -645,20 +674,26 @@ std::expected<void, std::string> viewer::use_settings(const render_settings& set
                                                  .view = own ? opts_.view : view_options{},
                                                  .strata = settings.strata});
     }
-    catch (const std::exception& error) // out of memory: nothing has changed yet
+    catch (const std::exception& error) // out of memory
     {
         return std::unexpected(error.what());
     }
     if (!built)
     {
-        return std::unexpected(built.error());
+        return built;
     }
-    // What the quality kernel can't render (the float-only rule, the books' strategies but the material's)
     if (const auto checked = check_kernel(*built, settings.scene, settings.kernel, settings.fp64); !checked)
     {
         return std::unexpected(checked.error());
     }
-    camera_settings view = built->cpu.camera; // the scene's sampling and samples, with its view
+    return built;
+}
+
+// use_settings with the scene its settings built (build_for): the new session, or the old scene back
+std::expected<void, std::string> viewer::use_build(const render_settings& settings, gpu_build built)
+{
+    const bool same_scene = session_ && settings.scene == settings_.scene;
+    camera_settings view = built.cpu.camera; // the scene's sampling and samples, with its view
     if (same_scene)
     {
         view.lookfrom = view_.lookfrom;
@@ -687,7 +722,7 @@ std::expected<void, std::string> viewer::use_settings(const render_settings& set
     session_.reset();
     try
     {
-        session_for(*built, view, settings);
+        session_for(built, view, settings);
     }
     catch (const std::exception& error)
     {
@@ -709,7 +744,7 @@ std::expected<void, std::string> viewer::use_settings(const render_settings& set
         pending_view_.reset(); // a move of the old scene's camera still waiting
     }
     const bool keep_target = same_scene && settings.strata == settings_.strata;
-    build_ = std::move(*built);
+    build_ = std::move(built);
     settings_ = settings;
     start_view_ = build_->cpu.camera;
     view_ = view;
@@ -1058,10 +1093,17 @@ void viewer::print_settings() const
 }
 
 // Tab, Shift+Tab: the next or the previous scene (see use_settings), at the window's size. It goes through the books'
-// scenes; from a test scene, Tab goes to the first of them and Shift+Tab to the last.
+// scenes, then the scenes beyond the books; from a test scene, Tab goes to the first of them and Shift+Tab to the
+// last. The strategy named (-p, M) goes along, as a display chosen does: a scene that refuses it (a books' strategy
+// but the material's, beyond the books) renders with its own instead and says so, and the next scene is asked for the
+// named one again. A scene the window can't show here is skipped, the console saying why: the scenes beyond the books
+// in float64 and under --all-books-kernel (only the quality kernel renders them, in float32), and, under
+// --quality-kernel with no strategy named, a scene whose own strategy is a books' one but the material's.
 SDL_AppResult viewer::switch_scene(int step)
 {
-    const auto in_cycle = [](const gpu_scene_entry& e) { return e.role == scene_role::book; };
+    const auto in_cycle = [](const gpu_scene_entry& e) {
+        return e.role == scene_role::book || e.role == scene_role::showcase;
+    };
     const std::vector<const gpu_scene_entry*> cycle = gpu_scene_list() | std::views::filter(in_cycle) |
                                                       std::views::transform([](const auto& e) { return &e; }) |
                                                       std::ranges::to<std::vector>();
@@ -1071,15 +1113,96 @@ SDL_AppResult viewer::switch_scene(int step)
     {
         at = step > 0 ? -1 : count;
     }
-    render_settings next = settings_;
-    next.scene = std::string(cycle[static_cast<std::size_t>((at + step + count) % count)]->name);
-    return switched(use_settings(next), std::format("can't show {}", next.scene));
+    std::string skipped;
+    std::string why; // the first skipped scene's reason, on screen
+    const auto skip = [&](const std::string& scene, const std::string& reason, std::string_view shown) {
+        std::println("Note: {} skipped: {}", scene, reason);
+        skipped += std::format("{}{}", skipped.empty() ? "" : ", ", scene);
+        if (why.empty())
+        {
+            why = shown;
+        }
+    };
+    for (std::ptrdiff_t k = 1; k <= count; ++k)
+    {
+        const gpu_scene_entry& entry = *cycle[static_cast<std::size_t>(((at + step * k) % count + count) % count)];
+        render_settings next = settings_;
+        next.scene = std::string(entry.name);
+        next.sampling = named_sampling_;
+        if (next.scene == settings_.scene)
+        {
+            break; // around the cycle
+        }
+        // The scenes beyond the books, which the quality kernel renders, in float32 only: refused without a build
+        if (entry.role == scene_role::showcase && next.kernel == kernel_choice::all_books)
+        {
+            skip(next.scene, "the quality kernel renders it, and --all-books-kernel picks the books' kernel",
+                 "the quality kernel's, not --all-books-kernel's");
+            continue;
+        }
+        if (entry.role == scene_role::showcase && next.fp64)
+        {
+            skip(next.scene, "the quality kernel renders it, in float32 only", "float32 only: F2 first");
+            continue;
+        }
+        auto built = build_for(next);
+        std::string own_note;
+        if (!built && next.sampling)
+        {
+            render_settings own = next;
+            own.sampling.reset();
+            auto own_built = build_for(own);
+            if (!own_built)
+            {
+                skip(next.scene, own_built.error(), own_built.error());
+                continue;
+            }
+            std::println("Note: {}: {}; its own strategy instead", next.scene, built.error());
+            own_note = std::format("{} can't take {}", next.scene, strategy_name(*next.sampling));
+            next = std::move(own);
+            built = std::move(own_built);
+        }
+        if (!built)
+        {
+            skip(next.scene, built.error(), built.error());
+            continue;
+        }
+        const SDL_AppResult result =
+            switched(use_build(next, std::move(*built)), std::format("can't show {}", next.scene));
+        if (result == SDL_APP_CONTINUE && session_ && settings_ == next && (!own_note.empty() || !skipped.empty()))
+        {
+            const std::string skip_note = skipped.empty() ? "" : std::format("skipped {}: {}", skipped, why);
+            say(own_note.empty() ? skip_note
+                : skipped.empty()
+                    ? std::format("sampling: {}, the scene's own ({})", strategy_name(build_->sampling), own_note)
+                    : std::format("{}; sampling: {}, the scene's own ({})", skip_note,
+                                  strategy_name(build_->sampling), own_note));
+        }
+        return result;
+    }
+    const std::string note = std::format("no other scene renders here (skipped {}: {})", skipped, why);
+    std::println("Note: {}", note);
+    say(note);
+    return SDL_APP_CONTINUE;
 }
 
-// F2: the other precision, in a new session at the same view (the moves still waiting are shown first). Under a tone
-// map other than books it stays in float32, where the tone maps compute, and says so.
+// F2: the other precision, in a new session at the same view (the moves still waiting are shown first). The quality
+// kernel, and a tone map other than books, compute in float32 only: there F2 stays and says so, with the way out.
 SDL_AppResult viewer::switch_precision()
 {
+    if (!settings_.fp64 && session_ && session_->kernel().name == "quality")
+    {
+        // A book scene renders with the quality kernel under nee and mis (or --quality-kernel); the others always do
+        const gpu_scene_entry* entry = find_gpu_scene(settings_.scene);
+        const std::string note =
+            settings_.kernel == kernel_choice::quality ? "--quality-kernel works in float32 only"
+            : entry && entry->role == scene_role::book
+                ? "the quality kernel works in float32 only: M to a books' strategy first"
+                : std::format("{} renders with the quality kernel, in float32 only", settings_.scene);
+        std::println("Note: {}", note);
+        say(note);
+        return SDL_APP_CONTINUE;
+    }
     if (const gpu::display_options shown = shown_display(); !settings_.fp64 && shown.op != gpu::tone_map::books)
     {
         const std::string note = std::format("{} works in float32 only: T to books first", tone_map_name(shown.op));
@@ -1094,6 +1217,61 @@ SDL_AppResult viewer::switch_precision()
     render_settings next = settings_;
     next.fp64 = !next.fp64;
     return switched(use_settings(next), std::format("can't render in {}", next.fp64 ? "float64" : "float32"));
+}
+
+// M, Shift+M: the next or the previous sampling strategy, in a new session at the same view: the scene's own, then the
+// GPU programs' list (uniform, material, lights, mixture, nee, mis). The scene's own and the same strategy named
+// differ across Tab, which takes a strategy named along. One the scene can't take as asked is skipped, named in the
+// note and, with the reason, on the console: refused (a books' strategy but the material's beyond the books or under
+// --quality-kernel; nee and mis in float64 or under --all-books-kernel), or one the scene would fall back from (lights
+// and mixture without a lights list, nee and mis without a lamp or a map).
+SDL_AppResult viewer::switch_strategy(int step)
+{
+    std::vector<std::optional<strategy>> cycle{std::nullopt};
+    for (const strategy_entry& entry : strategy_list)
+    {
+        cycle.emplace_back(entry.value);
+    }
+    const auto count = static_cast<std::ptrdiff_t>(cycle.size());
+    const std::ptrdiff_t at = std::ranges::find(cycle, settings_.sampling) - cycle.begin();
+    std::string skipped;
+    bool float_only = false; // nee or mis refused in float64, which F2 would allow
+    for (std::ptrdiff_t k = 1; k < count; ++k)
+    {
+        render_settings next = settings_;
+        next.sampling = cycle[static_cast<std::size_t>(((at + step * k) % count + count) % count)];
+        auto built = build_for(next);
+        if (!built || (next.sampling && built->sampling != *next.sampling))
+        {
+            const std::string_view name =
+                next.sampling ? strategy_name(*next.sampling) : std::string_view("the scene's own");
+            std::println("Note: {} skipped: {}", name,
+                         built ? std::format("{} renders it as {}", next.scene, strategy_name(built->sampling))
+                               : built.error());
+            skipped += std::format("{}{}", skipped.empty() ? "" : ", ", name);
+            float_only = float_only || (!built && next.fp64 && next.kernel != kernel_choice::all_books &&
+                                        next.sampling && !entry_of(*next.sampling).books);
+            continue;
+        }
+        if (const auto applied = apply_pending_view(); !applied)
+        {
+            return fail(applied.error());
+        }
+        const SDL_AppResult result = switched(use_build(next, std::move(*built)), "can't change the strategy");
+        if (result == SDL_APP_CONTINUE && session_ && settings_ == next)
+        {
+            named_sampling_ = next.sampling;
+            const std::string_view hint = float_only ? "; nee and mis in float32 only: F2 first" : "";
+            say(std::format("sampling: {}{}{}", strategy_name(build_->sampling),
+                            next.sampling ? "" : ", the scene's own",
+                            skipped.empty() ? "" : std::format(" (skipped: {}{})", skipped, hint)));
+        }
+        return result;
+    }
+    const std::string note = std::format("no other strategy renders this scene here (skipped: {})", skipped);
+    std::println("Note: {}", note);
+    say(note);
+    return SDL_APP_CONTINUE;
 }
 
 // After a switch: the new scene's line on the console; or the error, on the console and on screen, over the scene that
@@ -1214,6 +1392,7 @@ void viewer::draw_overlay()
         "W A S D Q E         fly (Shift faster, Ctrl slower)",
         "R                   back to the start view",
         "Tab, Shift+Tab      the next or previous scene",
+        "M, Shift+M          the next or previous strategy",
         "F2                  float32 or float64",
         "T, Shift+T          the next or previous tone map",
         ", .                 exposure -/+ 0.5 EV",
@@ -1229,7 +1408,11 @@ void viewer::draw_overlay()
     constexpr float note_height = line + 6;
     const auto w = static_cast<float>(width_);
     const auto h = static_cast<float>(height_);
-    // A tone map is named on the third line ("  agx +0.5 EV"); the books' bytes, the default, aren't
+    // The quality kernel's strategy is named on the first line ("  mis"), as a tone map is on the third
+    // ("  agx +0.5 EV"): the books' scenes, under their own kernels and bytes, show the numbers they showed
+    const std::string strategy = session_ && session_->kernel().name == "quality"
+                                     ? std::format("  {}", strategy_name(build_->sampling))
+                                     : std::string();
     const gpu::display_options shown = shown_display();
     const std::string tone = shown.op == gpu::tone_map::books
                                  ? std::string()
@@ -1287,8 +1470,8 @@ void viewer::draw_overlay()
             progress += std::format("   {:.1f} M samples/s   frame {:.1f} ms", samples_per_second_ / 1e6, frame_ms_);
         }
         const std::string lines[] = {
-            std::format("{}  {}x{}  {}  strata {}x{}", settings_.scene, width_, height_,
-                        settings_.fp64 ? "float64" : "float32", settings_.strata, settings_.strata),
+            std::format("{}  {}x{}  {}  strata {}x{}{}", settings_.scene, width_, height_,
+                        settings_.fp64 ? "float64" : "float32", settings_.strata, settings_.strata, strategy),
             progress,
             std::format("vfov {:.4g}  aperture {:.4g}  focus {:.4g}{}{}", view_.vfov, view_.defocus_angle,
                         view_.focus_dist, tone, live ? "   H: help" : ""),
@@ -2353,6 +2536,15 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         else if (e.key.key == SDLK_T)
         {
             step_display((mods_ & SDL_KMOD_SHIFT) ? -1 : 1);
+        }
+        else if (e.key.key == SDLK_M)
+        {
+            // A switch that fails shows the strategy it came from; one that leaves no session ends the program
+            if (const SDL_AppResult result = switch_strategy((mods_ & SDL_KMOD_SHIFT) ? -1 : 1);
+                result != SDL_APP_CONTINUE)
+            {
+                return result;
+            }
         }
         else if (is(SDLK_COMMA, SDL_SCANCODE_COMMA) || is(SDLK_PERIOD, SDL_SCANCODE_PERIOD))
         {

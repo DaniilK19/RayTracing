@@ -17,7 +17,7 @@ import strategy_options;
 export enum class scene_role
 {
     book,     // the books' 13, as RayTracing renders them
-    showcase, // the GPU's own scenes of light and materials beyond the books
+    showcase, // the GPU's own scenes of light and materials beyond the books, which only the quality kernel renders
     test,     // checks of the renderers, such as a white furnace
 };
 

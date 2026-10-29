@@ -1,0 +1,59 @@
+# The window's strategies and the scenes beyond the books, driven by scripted input (see docs/viewer.md, "Scripted
+# input"), recorded and replayed. It quits by itself, so it runs without --exit-when-done:
+#   RayTracingViewer cornell -w 320 --height 180 -s 32 --input tests\window-strategies.input --record r.txt --frames A
+#   RayTracingViewer --headless --script r.txt --frames B
+# Every frame in A equals the one in B of the same number (decoded), and each P's printed command, run, renders P's
+# PNG and PFM. 32 samples at 320x180 take a few frames: every key below waits 20 frames for the image to be done.
+#
+# M through the Cornell box's cycle, from its own strategy (mixture): uniform, material (saved), lights, mixture, nee
+# (saved), mis (saved), its own again, then uniform, named, which Tab takes along
+at 20 key M
+at 40 key M
+at 60 key P
+at 80 key M
+at 100 key M
+at 120 key M
+at 140 key P
+at 160 key M
+at 180 key P
+at 200 key M
+at 220 key M
+# Tab through the rest of the books' scenes under uniform, smoke, final, aluminum and glass, to the first beyond them,
+# cornell-ggx, which can't take it: its own (mis) instead, with a note
+at 240 key Tab
+at 260 key Tab
+at 280 key Tab
+at 300 key Tab
+at 320 key Tab
+# M from its own: the books' uniform skipped for material
+at 340 key M
+# veach and studio under material; on studio, T from its own display (agx) to neutral, and F2 refused: the quality
+# kernel computes in float32 only
+at 360 key Tab
+at 380 key Tab
+at 400 key T
+at 420 key F2
+# T to the books' bytes; Tab to sunlit, then around to the first of the books' scenes; F2 to float64 there
+at 440 key T
+at 460 key Tab
+at 480 key Tab
+at 500 key F2
+# A notch of the wheel and Shift+M in one batch: the move still waiting is shown first, under uniform. Shift+M twice
+# more: the scene's own (material), then past mis, nee, mixture and lights, which a scene without lamps would render
+# as material, to material, named
+at 520 wheel 1
+at 520 key-down Left Shift
+at 520 key M
+at 540 key M
+at 560 key M
+at 560 key-up Left Shift
+# Shift+Tab in float64: the four scenes beyond the books skipped (float32 only), to glass under material
+at 580 key-down Left Shift
+at 580 key Tab
+at 580 key-up Left Shift
+# M: lights, mixture, then past nee and mis (float32 only) to the scene's own; F2 back to float32
+at 600 key M
+at 620 key M
+at 640 key M
+at 660 key F2
+at 680 quit
