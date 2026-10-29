@@ -6,8 +6,9 @@
 export module gpu_scenes;
 
 export import :parts;
-// The scenes of materials beyond the books. An interface partition must be exported by the primary interface
-// ([module.unit]/3); it exports nothing of its own, and its scenes' functions are the module's.
+// The scenes beyond the books, a partition per kind. An interface partition must be exported by the primary
+// interface ([module.unit]/3); they export nothing of their own, and their scenes' functions are the module's.
+export import :environments;
 export import :materials;
 
 import std;
@@ -67,6 +68,12 @@ consteval auto make_scene_list(std::index_sequence<I...>)
                         scene_role::showcase, &cornell_ggx, strategy::mis, cornell_ggx_display},
         gpu_scene_entry{"veach", "Veach's four plates (1997): a metal from sharp to rough under four lamps of one power "
                         "and four sizes", scene_role::showcase, &veach_plates, strategy::mis, veach_display},
+        gpu_scene_entry{"env-furnace", "the white sphere under a white environment map: every pixel exactly 1 again",
+                        scene_role::test, &env_furnace},
+        gpu_scene_entry{"studio", "gold, silver, copper and glossy spheres in a photo studio's light (an HDR map)",
+                        scene_role::showcase, &studio},
+        gpu_scene_entry{"sunlit", "matte, copper and aluminum spheres in the sunlight of an HDR sky",
+                        scene_role::showcase, &sunlit},
     };
 }
 

@@ -151,9 +151,9 @@ if(CMAKE_CUDA_COMPILER)
     # quality.cu, the third kernel's (light and materials beyond the books), is a translation unit of its own too, with
     # renderer.cu's flags: nvcc compiles the books' kernels in renderer.cu as if it didn't exist. So is tonemap.cu, the
     # display's tone maps beyond the books, with display.cu's flags (below). lamp_table.cu builds the quality kernel's
-    # light set on the host: no device code.
+    # light set on the host, environment_table.cu its environment map's tables: no device code.
     add_library(gpu_renderer STATIC src/gpu/renderer.cu src/gpu/display.cu src/gpu/quality.cu src/gpu/tonemap.cu
-        src/gpu/lamp_table.cu)
+        src/gpu/lamp_table.cu src/gpu/environment_table.cu)
     target_compile_options(gpu_renderer PRIVATE -Xcompiler=/W4 $<$<CONFIG:Debug,RelWithDebInfo>:-lineinfo>)
     # The window's conversion of the image to bytes (display.cu) must give the bytes of the PNG files, which the CPU
     # computes: -fmad=false keeps nvcc from fusing a multiplication and an addition into one operation with one
@@ -171,8 +171,8 @@ if(CMAKE_CUDA_COMPILER)
     # options (view_options.ixx, tone_options.ixx).
     add_library(gpu_scene STATIC)
     target_sources(gpu_scene PUBLIC FILE_SET CXX_MODULES FILES
-        src/gpu_scene.ixx src/gpu_scene_parts.ixx src/gpu_scenes.ixx src/gpu_scenes_materials.ixx
-        src/strategy_options.ixx src/tone_options.ixx src/view_options.ixx)
+        src/gpu_scene.ixx src/gpu_scene_parts.ixx src/gpu_scenes.ixx src/gpu_scenes_environments.ixx
+        src/gpu_scenes_materials.ixx src/strategy_options.ixx src/tone_options.ixx src/view_options.ixx)
     target_link_libraries(gpu_scene PUBLIC raytracer gpu_renderer)
     target_compile_options(gpu_scene PRIVATE /W4)
 

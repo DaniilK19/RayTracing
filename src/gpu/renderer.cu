@@ -869,10 +869,31 @@ void validate(const scene_desc& scene)
             }
         }
     }
-    // --- environment (track C)
+    // --- environment (track C): an equirectangular image of at most 2048×1024 texels (environment_data.h's limits,
+    // a header this file doesn't include: it holds the quality kernel's device types), its linear radiance finite and
+    // ≥ 0 everywhere, a finite yaw, and a finite scale ≥ 0 (it multiplies the radiance)
     if (quality.environment)
     {
-        throw std::runtime_error("environment maps aren't implemented yet");
+        const environment_desc& environment = *quality.environment;
+        const image_desc& map = environment.image;
+        if (map.width < 1 || map.height < 1 || map.width > 2048 || map.height > 1024)
+        {
+            // (The sizes as arguments: nvcc writes the × as octal escapes, which a digit after it would extend)
+            throw std::runtime_error(std::format("an environment map must have from {}×{} to {}×{} texels, not {}×{}",
+                                                 1, 1, 2048, 1024, map.width, map.height));
+        }
+        if (map.rgb.size() != 3 * static_cast<std::size_t>(map.width) * static_cast<std::size_t>(map.height))
+        {
+            throw std::runtime_error("an environment map's pixels don't match its size");
+        }
+        if (std::ranges::any_of(map.rgb, [](float value) { return !(std::isfinite(value) && value >= 0); }))
+        {
+            throw std::runtime_error("an environment map's radiance must be a finite number ≥ 0 in every texel");
+        }
+        if (!std::isfinite(environment.yaw_degrees) || !(std::isfinite(environment.scale) && environment.scale >= 0))
+        {
+            throw std::runtime_error("an environment map's yaw and scale must be finite numbers, the scale ≥ 0");
+        }
     }
 }
 

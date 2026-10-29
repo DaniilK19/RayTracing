@@ -563,6 +563,92 @@ export std::expected<gpu::scene_desc, std::string> translate_parts(const gpu_sce
     return to_gpu(parts.cpu, camera(parts.cpu.camera).frame(), sampling_strategy::material, parts.microfacets);
 }
 
+// --- The environment map ---------------------------------------------------------------------------------------
+
+// A file of the project's assets folder, found as the CPU's scenes find theirs (find_asset in scenes.ixx, which that
+// module keeps to itself): in the current folder or the nearest one above it that has it, as the programs run from the
+// project's root and from Visual Studio, whose current folder is out\build\x64-release. Without one, the plain relative
+// path, which then doesn't open.
+std::filesystem::path find_asset(std::string_view name)
+{
+    for (std::filesystem::path dir = std::filesystem::current_path();; dir = dir.parent_path())
+    {
+        const std::filesystem::path candidate = dir / "assets" / name;
+        if (std::filesystem::exists(candidate))
+        {
+            return candidate;
+        }
+        if (dir == dir.parent_path())
+        {
+            return std::filesystem::path("assets") / name;
+        }
+    }
+}
+
+// The renderer's largest map, per side (gpu::max_environment_width and _height in gpu/environment_data.h, a header of
+// the renderer's own)
+constexpr int max_environment_width = 2048;
+constexpr int max_environment_height = 1024;
+
+// The side of the constant map made in code: small, as every texel is the same (and so is every density, 1/(4π))
+constexpr int white_map_width = 64;
+constexpr int white_map_height = 32;
+
+// The environment map a scene names (gpu_scene_parts::environment) as the renderer's data: none (the camera's sky), an
+// equirectangular .hdr image from the assets folder, or a constant map of radiance 1 made in code (a furnace). The
+// error is the whole message, as the programs print it after "Error: ".
+std::expected<std::optional<gpu::environment_desc>, std::string> load_environment(const environment_choice& choice)
+{
+    if (choice.source == env_source::none)
+    {
+        return std::optional<gpu::environment_desc>{};
+    }
+    gpu::environment_desc environment{.yaw_degrees = choice.yaw_degrees, .scale = choice.scale};
+    gpu::image_desc& map = environment.image;
+    if (choice.source == env_source::white)
+    {
+        map = {.width = white_map_width,
+               .height = white_map_height,
+               .rgb = std::vector<float>(3 * std::size_t{white_map_width} * white_map_height, 1.0f)};
+        return std::optional{std::move(environment)};
+    }
+    // stb_image reads a Radiance .hdr (RGBE) as linear floats, with no gamma: the 2.2 that image::load's comment speaks
+    // of is for 8-bit files only. It reads only the usual orientation, rows from the top (-Y H +X W), which is the
+    // map's: row 0 is straight up.
+    const auto loaded = image::load(find_asset(choice.asset));
+    if (!loaded)
+    {
+        return std::unexpected(std::format("the environment map '{}' doesn't load: {}", choice.asset, loaded.error()));
+    }
+    const image& img = *loaded;
+    if (img.width() > max_environment_width || img.height() > max_environment_height)
+    {
+        return std::unexpected(std::format("the environment map '{}' is {}×{}: at most {}×{}", choice.asset,
+                                           img.width(), img.height(), max_environment_width, max_environment_height));
+    }
+    map = {.width = img.width(), .height = img.height()};
+    map.rgb.reserve(3 * static_cast<std::size_t>(img.width()) * static_cast<std::size_t>(img.height()));
+    for (int y = 0; y < img.height(); ++y)
+    {
+        for (int x = 0; x < img.width(); ++x)
+        {
+            // Exact: image::load made these doubles from stb_image's floats
+            const color& c = img[x, y];
+            for (const double value : {c.x, c.y, c.z})
+            {
+                if (!(std::isfinite(value) && value >= 0))
+                {
+                    return std::unexpected(std::format(
+                        "the environment map '{}' has a texel that isn't a finite radiance ≥ 0, at ({}, {})",
+                        choice.asset, x, y));
+                }
+                map.rgb.push_back(static_cast<float>(value));
+            }
+        }
+    }
+    return std::optional{std::move(environment)};
+}
+
 // --- A scene ready for the GPU ---------------------------------------------------------------------------------
 
 // The largest side of a pixel's grid of samples, the renderer's (see gpu::max_sqrt_spp)
@@ -663,6 +749,13 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
         }
         desc->lights = std::move(*lights);
     }
+    // The environment map the scene names, if any: the quality kernel's sky in place of the camera's
+    auto environment = load_environment(parts.environment);
+    if (!environment)
+    {
+        return std::unexpected(environment.error());
+    }
+    desc->quality.environment = std::move(*environment);
     // The quality kernel's light samples (-p nee, -p mis): a combination of its own, while its camera samples bounces
     // as the material scatters (the books' part of the strategy, above). A scene with no lamp of the light set
     // (gpu/lamps.cuh) and no environment map has nothing to sample: it renders as -p material, with RayTracing's note,
