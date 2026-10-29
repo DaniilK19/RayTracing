@@ -1,9 +1,10 @@
-// Suite ggx: the GGX rough conductor of ggx.cuh and its two lobes in bsdf.cuh, conductor and smooth_conductor (Step
-// 78). A rough metal reflects off microfacets whose normals h follow the GGX distribution D (Walter et al. 2007),
-// masked by the height-correlated Smith term G2 (Heitz 2014); ggx_sample draws the visible normals (Heitz 2018) by
-// spherical caps (Dupuy & Benyoub 2023). The quality kernel's multiple importance sampling weighs ggx_sample's density against
-// ggx_eval's for the same direction, so the two must agree to the digits float allows, and both must be the GGX model,
-// not merely each other's match. The spec is out/m4/spec/B.md, section 5.1, whose numbers (G1-G17) the checks cite.
+// Suites ggx and ggx-energy: the GGX rough conductor of ggx.cuh and its two lobes in bsdf.cuh, conductor and
+// smooth_conductor (Step 78), and its energy compensation (Step 79). A rough metal reflects off microfacets whose
+// normals h follow the GGX distribution D (Walter et al. 2007), masked by the height-correlated Smith term G2 (Heitz
+// 2014); ggx_sample draws the visible normals (Heitz 2018) by spherical caps (Dupuy & Benyoub 2023). The quality
+// kernel's multiple importance sampling weighs ggx_sample's density against ggx_eval's for the same direction, so the
+// two must agree to the digits float allows, and both must be the GGX model, not merely each other's match. The spec
+// is out/m4/spec/B.md, sections 5.1 and 5.2, whose numbers (G1-G17, E1-E7) the checks cite.
 //
 //   - Integrals by deterministic quadrature on the GPU, summed in double, over the half vector with
 //     θh = atan(α·tan(πt/2)), t and φ at 2048 × 512 midpoints: with it D(h) cos θh dωh is exactly ¼ sin(πt) dt dφ for
@@ -22,6 +23,11 @@
 //   - The formulas of B.md §2.3 at random arguments against double (the formula-* checks, not numbered in the spec):
 //     they pin the α / α² conventions of ggx_d, ggx_g1, ggx_g2 and smith_a, which the integrals can't see (a D of
 //     width α² instead of α still integrates to 1).
+//   - ggx-energy: single scattering loses energy to the light that bounces between microfacets, up to 70% at α = 1.
+//     Turquin et al. 2019 scale f by 1 + F0 (1 - E)/E, E = E_ss(μ, r) with F = 1, read from a 32 × 32 table that this
+//     suite generates (--write FILE, the file ggx_energy.cuh) by the same quadrature and checks (--check FILE, or the
+//     compiled-in table: E1, E2, E6). With F0 = 1 the compensated conductor reflects everything: E_ms = 1 (E3), which
+//     a table shifted by one node must fail (E7); the factor itself (E4) and the lobe's weight and pdf (E5).
 //
 // Decisions where the spec leaves room (B.md §8 has the spec writer's; these are this file's):
 //   1. --quick: the quadrature verdicts B.md skips (G1, G2, G8, G9, G13, the resolution check) become INFO lines; the
@@ -51,7 +57,24 @@
 //      h' is off the drawn h by about 10⁻⁷/(v·h): 60 times more at θv = 89°, where a narrow lobe has v·h ≈ 0.017 (a
 //      correct sampler failed B.md's flat tolerances there, by estimate). So the pdf's τ(α) = max(10⁻⁵, 10⁻⁶/α)
 //      becomes max(10⁻⁵, 10⁻⁶/(α v·h')), the same at v·h = 1, and the weight's 10⁻⁵ gains what F(v·h') may differ
-//      from F(v·h): Schlick's d ln F/dμ times 5·10⁻⁷/(v·h') (D cancels in eval/pdf).
+//      from F(v·h): Schlick's d ln F/dμ times 5·10⁻⁷/(v·h') (D cancels in eval/pdf). E5's weight check too.
+//  13. The table file (B.md §5.2.1) writes each value as {:.9g} with ".0" added to a number without a point or an
+//      exponent: "{:.9g}f" turns row 0's 1 into "1f", which is no C++ literal. A row's comment has a line of its own
+//      and its 32 values come 8 per line (120 columns).
+//  14. --check reads the literals between ggx_energy_table's "= {" and its "}", with the comments left out: B.md's
+//      "after the first {" would start at namespace gpu's brace, and the comments hold numbers (0.001, 0/31). Not 1024
+//      of them, or anything else in the list, is an error (exit 2). A relative FILE that isn't there is looked for from
+//      the current folder up (find_repo_file), so src\gpu\ggx_energy.cuh works from the build folder; --write's folder
+//      likewise.
+//  15. --write writes the regenerated table and runs E2-E7 (E1 has nothing to compare with yet): E3 and E5 still test
+//      the compiled-in table, so the first --write over a placeholder reports E3's failures until the rebuild. Its INFO
+//      line gives the largest difference from the compiled-in table (0: no rebuild needed). --check also prints that
+//      difference between the compiled-in table and FILE, and E6 checks both.
+//  16. E7 shifts the compiled-in table (the one E3 used) and computes E_ss/E' from the quadrature of the
+//      uncompensated conductor; "rejected" is a count of the fault accepted (max |E_ms - 1| ≤ 10⁻² over θv ≤ 80°).
+//  17. E4 adds a check not in B.md's list: ggx_compensation equals B.md §3.8's bilinear lookup of the compiled-in
+//      table, 1 + F0 (1 - E)/E, to 10⁻⁵ (the review's "the table's axes and bilinear lookup"), at 65 × 65 points and
+//      the 32 × 32 nodes. E5 draws 10⁵ samples in each case of the §5.1 grid (B.md gives no count).
 //
 // Step 78's criteria (B.md §7; Claude runs them; $S = -w 480 --height 270):
 //   $GT ggx: exit 0; it prints E_ss(1, α) and the patch averages (ggx.furnace-values-*).
@@ -65,23 +88,37 @@
 //     -p mis: the same bytes (no lamps, no map: the fallback to material).
 //   HOST: ggx-furnace under "Test scenes:"; errors for ggx-furnace --fp64, -p mixture, --all-books-kernel (exit 1, one
 //   Error: line). Sanitizer: ggx-furnace and $GT ggx --quick. CARRY recorded: ggx-furnace $S -s 64 --seed 3.
+// Step 79's (B.md §7):
+//   $GT ggx-energy --write src\gpu\ggx_energy.cuh once (over the placeholder), rebuild, then
+//   $GT ggx-energy --check src\gpu\ggx_energy.cuh: exit 0 (and $GT ggx: G14 now with the factor).
+//   ggx-furnace $S -s 256 --seed 3: every GGX patch mean = 1 ± (4 SE + 0.005); the mirror patch and both background
+//   rectangles byte-identical to Step 78's render: $PS same W\78\gf.pfm W\79\gf.pfm --rect 66 133 70 137
+//   --rect 0 0 479 109 --rect 0 161 479 269. CARRY: the lamp scenes identical; ggx-furnace re-recorded.
+//   Sanitizer: ggx-furnace and $GT ggx-energy --quick.
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <format>
+#include <fstream>
 #include <limits>
 #include <numbers>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "bsdf.cuh"
 #include "ggx.cuh"
+#include "ggx_energy.cuh"
 #include "gpu_test.cuh"
 #include "gpu_test.h"
+#include "host_services.h"
 #include "material.cuh"
 #include "quality_view.cuh"
 #include "random.cuh"
@@ -1038,7 +1075,7 @@ GPU_TEST(ggx, conductor)
             for (const std::size_t i : {std::size_t{0}, std::size_t{1}})
             {
                 const double d = std::abs(half[k][i] - q[k][i]);
-                worst = d <= worst ? worst : d; // a NaN stays
+                worst = std::isnan(d) || d > worst ? d : worst; // a NaN stays
             }
             const double d = std::abs(half[k][3] - q[k][3]);
             worst_energy = d <= worst_energy ? worst_energy : d;
@@ -1071,8 +1108,8 @@ GPU_TEST(ggx, conductor)
         }
         const auto [average, smallest] = patch_average(patch, e);
         ctx.info("furnace-values-" + number(patch.alpha),
-                 std::format("E_ss(1, α) = {:.6f}; ggx-furnace's patch [{}..{}] × [133..137] averages {:.6f} "
-                             "(μ ≥ {:.4f})",
+                 std::format("E_ss(1, α) = {:.6f}; ggx-furnace's patch [{}..{}] × [133..137], single scattering "
+                             "alone (before Step 79's compensation), averages {:.6f} (μ ≥ {:.4f})",
                              e.back(), patch.first, patch.last, average, smallest));
     }
 }
@@ -1256,8 +1293,9 @@ struct make_off
     }
 };
 
-// G14: the conductor lobe from make_bsdf is ggx.cuh's functions with the lobe's own n, wo, α and F0, bit for bit, on
-// equal copies of the generator (Step 78: no compensation yet)
+// G14: the conductor lobe from make_bsdf is ggx.cuh's functions with the lobe's own n, wo, α and F0 on equal copies of
+// the generator: the same direction and pdf bit for bit, the weight and f·cos θ times Turquin's factor (Step 79) to
+// 10⁻⁶
 struct lobe_off
 {
     float alpha;
@@ -1279,9 +1317,11 @@ struct lobe_off
         float pdf = quiet_nan();
         const bool sampled = gpu::ggx_sample(b.n, b.wo, b.alpha, b.albedo, c, l, w, pdf);
         bool same = drawn == sampled && generators_equal(a, c);
+        const vec3<float> factor = gpu::ggx_compensation(b.albedo, gpu::dot(b.n, b.wo), side.roughness);
         if (drawn && sampled)
         {
-            same = same && bits_equal(s.wi, l) && bits_equal(s.weight, w) && bits_equal(s.pdf, pdf) && !s.delta;
+            same = same && bits_equal(s.wi, l) && close(s.weight, w * factor, 1e-6) && bits_equal(s.pdf, pdf) &&
+                   !s.delta;
         }
         // eval at the drawn direction (true or false) and at a random one, above or below the horizon
         const vec3<float> directions[] = {l, gpu::random_unit_vector<float>(rng)};
@@ -1295,7 +1335,7 @@ struct lobe_off
             float ggx_pdf = quiet_nan();
             const vec3<float> e = gpu::eval_bsdf(b, d, lobe_pdf);
             const vec3<float> g = gpu::ggx_eval(b.n, b.wo, d, b.alpha, b.albedo, ggx_pdf);
-            same = same && bits_equal(e, g) && bits_equal(lobe_pdf, ggx_pdf);
+            same = same && close(e, g * factor, 1e-6) && bits_equal(lobe_pdf, ggx_pdf);
         }
         rng = a;
         return !same;
@@ -1543,5 +1583,577 @@ GPU_TEST(ggx, validate)
     ctx.exact("validate-accepts-smooth-conductor", refused(one_sphere(mirror, {conductor(0)})), 0, 0);
     ctx.exact("validate-accepts-roughness-1", refused(one_sphere(mirror, {conductor(1)})), 0, 0);
     ctx.exact("validate-accepts-none", refused(one_sphere(matte, {gpu::microfacet_desc{}})), 0, 0);
+}
+
+// === Suite ggx-energy (Step 79): Turquin's energy compensation and its table =========================================
+
+static_assert(gpu::ggx_energy_size == 32, "the table of B.md 3.8 is 32 by 32");
+constexpr int table_side = 32;
+constexpr std::size_t table_entries = 32 * 32;
+constexpr std::uint64_t compensated_lobe_seed = 7900; // + case index, 0 to 34
+
+// The node (i, j) of the table (B.md §3.8, §5.2.1, with columns even in √μ since Step 79's integration): r = j/31,
+// α = r², cos θv = (i/31)², §5.1's frame. Column 0 (μ = 0) isn't integrated: see table_values.
+quad_case table_node(int i, int j)
+{
+    const double r = j / 31.0;
+    const double root = i / 31.0;
+    quad_case k = make_case(r * r, root * root);
+    k.roughness = static_cast<float>(r);
+    return k;
+}
+
+using table_nodes = std::vector<std::array<int, 2>>; // (i, j)
+
+table_nodes all_nodes() // in the table's order, [j·32 + i]
+{
+    table_nodes nodes;
+    for (int j = 0; j < table_side; ++j)
+    {
+        for (int i = 0; i < table_side; ++i)
+        {
+            nodes.push_back({i, j});
+        }
+    }
+    return nodes;
+}
+
+table_nodes every_fourth_node() // E2's 64: i and j in 0, 4, ..., 28
+{
+    table_nodes nodes;
+    for (int j = 0; j < table_side; j += 4)
+    {
+        for (int i = 0; i < table_side; i += 4)
+        {
+            nodes.push_back({i, j});
+        }
+    }
+    return nodes;
+}
+
+// E_ss with F = 1, the table's value: ∫ ggx_eval(F0 = (1, 1, 1)) dωl, the green channel
+struct single_scattering
+{
+    __device__ void operator()(const quad_case& k, const h_node& node, double (&sum)[quad_values]) const
+    {
+        if (node.d_omega_l > 0)
+        {
+            float pdf = 0;
+            sum[0] += static_cast<double>(gpu::ggx_eval(k.nf, k.vf, node.l, k.alpha, white(), pdf).y) * node.d_omega_l;
+        }
+    }
+};
+
+// The table at the nodes listed: row j = 0, the mirror, is exactly 1 (ggx_eval has no α = 0)
+std::vector<double> table_values(const table_nodes& nodes, resolution r)
+{
+    std::vector<quad_case> cases;
+    std::vector<std::size_t> where;
+    // Row 0 (the mirror) and column 0 (a view grazing the surface) are 1 exactly. At μ → 0 the view's masking Λ(v)
+    // grows without bound, so G2/G1(v) → 1, and every facet the view sees reflects upward (n·l = 2(v·h)(n·h) > 0): the
+    // lobe keeps all of its light, as the table's nearest nodes approach (0.994 to 0.9998 at μ = 10⁻⁴). The quadrature
+    // there, in float with v·h near 10⁻⁴, would be the table's least accurate node.
+    for (std::size_t n = 0; n < nodes.size(); ++n)
+    {
+        if (nodes[n][0] > 0 && nodes[n][1] > 0)
+        {
+            cases.push_back(table_node(nodes[n][0], nodes[n][1]));
+            where.push_back(n);
+        }
+    }
+    const std::vector<integrals> q = h_quadrature(single_scattering{}, cases, r);
+    std::vector<double> values(nodes.size(), 1.0);
+    for (std::size_t c = 0; c < cases.size(); ++c)
+    {
+        values[where[c]] = q[c][0];
+    }
+    return values;
+}
+
+// f(k) for k from 0 to count - 1, a thread each: the suite's small kernels. A template, as every kernel of the tests:
+// nvcc's host stub of a kernel that isn't one, in an unnamed namespace, draws MSVC's warning C4211.
+template <class F>
+__global__ void for_each_index_kernel(F f, int count)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k < count)
+    {
+        f(k);
+    }
+}
+
+template <class F>
+void for_each_index(const F& f, int count, const char* what)
+{
+    for_each_index_kernel<<<(count + 127) / 128, 128>>>(f, count);
+    gpu_test::finish_launch(what);
+}
+
+// The table this program was compiled with (ggx_energy.cuh), which the conductor reads: a __device__ array, copied out
+// by a kernel (whatever its qualifiers: __device__ or __constant__)
+struct copy_energy_table
+{
+    float* out;
+    __device__ void operator()(int k) const { out[k] = gpu::ggx_energy_table[k]; }
+};
+
+std::vector<float> compiled_table()
+{
+    const gpu_test::device_buffer<float> table(table_entries);
+    for_each_index(copy_energy_table{table.get()}, static_cast<int>(table_entries), "copying the energy table");
+    return table.download();
+}
+
+// A float as a literal that round-trips (9 significant digits, B.md §5.2.1) and compiles: "{:.9g}" writes 1 as "1",
+// and "1f" is no C++ literal, so a number without a point or an exponent gets ".0" (decision 13)
+std::string float_literal(float value)
+{
+    std::string text = std::format("{:.9g}", value);
+    if (text.find_first_of(".eEni") == std::string::npos) // "n", "i": nan, inf (never in a valid table)
+    {
+        text += ".0";
+    }
+    return text + "f";
+}
+
+// ggx_energy.cuh's text: B.md §5.2.1's header lines and array, 32 values per row j, rows in order; a row's comment on a
+// line of its own and its values 8 per line, to keep the file within 120 columns
+std::string table_text(const std::vector<float>& table)
+{
+    std::string text = "// src/gpu/ggx_energy.cuh: generated by GpuTests ggx-energy --write; do not edit.\n"
+                       "// E_ss(μ, r) of the GGX conductor with F = 1 (single scattering), for Turquin's compensation "
+                       "(ggx.cuh)\n"
+                       "#pragma once\n"
+                       "namespace gpu\n"
+                       "{\n"
+                       "inline constexpr int ggx_energy_size = 32;\n"
+                       "// [j * 32 + i]: roughness r = j / 31 (α = r²), √(cos θv) = i / 31; row 0 "
+                       "(the mirror)\n// and column 0 (a grazing view) are 1\n"
+                       "static __device__ const float ggx_energy_table[ggx_energy_size * ggx_energy_size] = {\n";
+    for (int j = 0; j < table_side; ++j)
+    {
+        text += std::format("    /* r = {}/31 */\n", j);
+        for (int i = 0; i < table_side; ++i)
+        {
+            const float value = table[static_cast<std::size_t>(j * table_side + i)];
+            text += (i % 8 == 0 ? "    " : " ") + float_literal(value) + ",";
+            text += i % 8 == 7 ? "\n" : "";
+        }
+    }
+    text += "};\n}\n";
+    return text;
+}
+
+// The 1024 numbers of a table file: the literals between ggx_energy_table's "= {" and its "}", comments left out
+// (decision 14: B.md's "after the first {" would start at namespace gpu's brace, and the comments hold numbers too).
+// Anything else is an error, exit 2.
+std::vector<float> read_table(const std::filesystem::path& file)
+{
+    std::ifstream in(file, std::ios::binary);
+    if (!in)
+    {
+        throw std::runtime_error(std::format("can't read {}", file.string()));
+    }
+    std::ostringstream whole;
+    whole << in.rdbuf();
+    const std::string text = whole.str();
+    std::string code; // the text without its comments
+    for (std::size_t i = 0; i < text.size();)
+    {
+        if (text.compare(i, 2, "/*") == 0)
+        {
+            const std::size_t end = text.find("*/", i + 2);
+            i = end == std::string::npos ? text.size() : end + 2;
+            code += ' ';
+        }
+        else if (text.compare(i, 2, "//") == 0)
+        {
+            i = text.find('\n', i);
+            i = i == std::string::npos ? text.size() : i;
+        }
+        else
+        {
+            code += text[i++];
+        }
+    }
+    const std::size_t name = code.find("ggx_energy_table");
+    const std::size_t equals = name == std::string::npos ? name : code.find('=', name);
+    const std::size_t open = equals == std::string::npos ? equals : code.find('{', equals);
+    const std::size_t close = open == std::string::npos ? open : code.find('}', open);
+    if (close == std::string::npos)
+    {
+        throw std::runtime_error(std::format("{}: no ggx_energy_table = {{ ... }}", file.string()));
+    }
+    std::vector<float> values;
+    std::istringstream items(code.substr(open + 1, close - open - 1));
+    for (std::string item; std::getline(items, item, ',');)
+    {
+        const std::size_t first = item.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos)
+        {
+            continue; // the empty item after the last comma
+        }
+        item = item.substr(first, item.find_last_not_of(" \t\r\n") - first + 1);
+        char* end = nullptr;
+        const double value = std::strtod(item.c_str(), &end);
+        const std::string rest(end);
+        if (end == item.c_str() || !(rest.empty() || rest == "f" || rest == "F"))
+        {
+            throw std::runtime_error(std::format("{}: '{}' is no float literal", file.string(), item));
+        }
+        values.push_back(static_cast<float>(value));
+    }
+    if (values.size() != table_entries)
+    {
+        throw std::runtime_error(
+            std::format("{}: {} numbers in ggx_energy_table, not {}", file.string(), values.size(), table_entries));
+    }
+    return values;
+}
+
+// --check's file: as given, or found from the current folder up (find_repo_file), so that src\gpu\ggx_energy.cuh works
+// from the build folder too
+std::filesystem::path check_path(const std::string& name)
+{
+    const std::filesystem::path path(name);
+    return path.is_relative() && !std::filesystem::exists(path) ? gpu_test::host::find_repo_file(name) : path;
+}
+
+// --write's file: as given, or in the repository's folder of that name when the current folder has none
+std::filesystem::path write_path(const std::string& name)
+{
+    const std::filesystem::path path(name);
+    const std::filesystem::path folder = path.parent_path();
+    if (!path.is_relative() || folder.empty() || std::filesystem::is_directory(folder))
+    {
+        return path;
+    }
+    return gpu_test::host::find_repo_file(folder.generic_string()) / path.filename();
+}
+
+// B.md §3.8's lookup in double: bilinear in (√μ, r), clamped; shift = 1 reads every μ node one node up,
+// T(min(i + 1, 31), j) (E7)
+double table_lookup(const std::vector<float>& t, double mu, double r, int shift = 0)
+{
+    const double x = std::sqrt(std::clamp(mu, 0.0, 1.0)) * 31;
+    const double y = std::clamp(r, 0.0, 1.0) * 31;
+    const int i0 = std::min(static_cast<int>(std::floor(x)), 30);
+    const int j0 = std::min(static_cast<int>(std::floor(y)), 30);
+    const double fx = x - i0;
+    const double fy = y - j0;
+    const auto at = [&](int i, int j) {
+        return static_cast<double>(t[static_cast<std::size_t>(j * table_side + std::min(i + shift, 31))]);
+    };
+    return (1 - fy) * ((1 - fx) * at(i0, j0) + fx * at(i0 + 1, j0)) +
+           fy * ((1 - fx) * at(i0, j0 + 1) + fx * at(i0 + 1, j0 + 1));
+}
+
+// The largest |a - b| (a NaN stays)
+double largest_difference(const std::vector<float>& a, const std::vector<float>& b)
+{
+    double worst = 0;
+    for (std::size_t k = 0; k < a.size(); ++k)
+    {
+        const double d = std::abs(static_cast<double>(a[k]) - b[k]);
+        worst = std::isnan(worst) || !(std::isnan(d) || d > worst) ? worst : d; // a NaN stays
+    }
+    return worst;
+}
+
+// E6: row 0 exactly 1, every value in (0, 1 + 10⁻⁶]
+std::int64_t table_faults(const std::vector<float>& t)
+{
+    std::int64_t faults = 0;
+    for (std::size_t k = 0; k < t.size(); ++k)
+    {
+        const bool limit = k < static_cast<std::size_t>(table_side) || k % table_side == 0; // row 0, column 0
+        faults += (limit && t[k] != 1.0f) || !(t[k] > 0 && t[k] <= 1 + 1e-6) ? 1 : 0;
+    }
+    return faults;
+}
+
+// E1, E2, E6, and --write / --check
+GPU_TEST(ggx_energy, table)
+{
+    const std::string* write = ctx.argument("--write");
+    const std::string* check = ctx.argument("--check");
+    if (write && ctx.quick())
+    {
+        throw std::runtime_error("ggx-energy --write needs the full quadrature: drop --quick");
+    }
+    if (write && check)
+    {
+        throw std::runtime_error("ggx-energy takes --write or --check, not both");
+    }
+    const std::vector<float> compiled = compiled_table();
+    std::vector<float> file_table;
+    if (check)
+    {
+        file_table = read_table(check_path(*check));
+        ctx.info("table-compiled-in",
+                 std::format("largest |compiled-in - {}| = {:.3g}", *check, largest_difference(compiled, file_table)));
+    }
+
+    if (ctx.quick())
+    {
+        // Every kernel at 64 nodes and 256 × 64 points, no verdict (B.md §5.2: E1-E3 and E7 skip)
+        const table_nodes nodes = every_fourth_node();
+        const std::vector<double> values = table_values(nodes, quick_resolution);
+        double worst = 0;
+        for (std::size_t n = 0; n < nodes.size(); ++n)
+        {
+            const double d = std::abs(values[n] - compiled[static_cast<std::size_t>(nodes[n][1] * 32 + nodes[n][0])]);
+            worst = std::isnan(worst) || !(std::isnan(d) || d > worst) ? worst : d; // a NaN stays
+        }
+        ctx.info("table", std::format("quick: 64 nodes at 256 × 64, largest |Δ| from the compiled-in table {:.3g}, "
+                                      "no verdict",
+                                      worst));
+    }
+    else
+    {
+        const std::vector<double> full = table_values(all_nodes(), full_resolution);
+        std::vector<float> regenerated;
+        for (const double v : full)
+        {
+            regenerated.push_back(static_cast<float>(v));
+        }
+        if (write)
+        {
+            const std::filesystem::path path = write_path(*write);
+            std::ofstream out(path, std::ios::binary);
+            out << table_text(regenerated);
+            out.close();
+            if (!out)
+            {
+                throw std::runtime_error(std::format("can't write {}", path.string()));
+            }
+            ctx.info("table-written", std::format("{}; largest |regenerated - compiled-in| = {:.3g} (rebuild if > 0)",
+                                                  path.string(), largest_difference(regenerated, compiled)));
+        }
+        else
+        {
+            // E1: the regenerated table against the file's (--check) or the compiled-in one
+            ctx.exact("table", largest_difference(regenerated, check ? file_table : compiled), 0, 1e-6);
+        }
+
+        // E2: half the resolution on every fourth node, within 2·10⁻⁴ (B.md said 2·10⁻⁵; the ggx suite's
+        // quadrature-resolution-energy takes 2·10⁻⁴ too): E_ss's integrand stops at the horizon, where the midpoint
+        // rule's error is O(1/N); measured 7.2·10⁻⁵ with the columns even in √μ
+        const table_nodes nodes = every_fourth_node();
+        const std::vector<double> half = table_values(nodes, half_resolution);
+        double worst = 0;
+        for (std::size_t n = 0; n < nodes.size(); ++n)
+        {
+            const double d = std::abs(half[n] - full[static_cast<std::size_t>(nodes[n][1] * 32 + nodes[n][0])]);
+            worst = std::isnan(worst) || !(std::isnan(d) || d > worst) ? worst : d; // a NaN stays
+        }
+        ctx.exact("table-accuracy", worst, 0, 2e-4);
+    }
+
+    // E6, on the compiled-in table (and the file's)
+    ctx.count("mirror-row", table_faults(compiled), 0, static_cast<std::int64_t>(table_entries));
+    if (check)
+    {
+        ctx.count("mirror-row-file", table_faults(file_table), 0, static_cast<std::int64_t>(table_entries));
+    }
+}
+
+// [0] E_ms = ∫ eval_bsdf of the conductor from make_bsdf (metal (1, 1, 1), side entry {conductor, r², r}),
+// [1] E_ss = ∫ ggx_eval with F0 = (1, 1, 1)
+struct compensated_integrands
+{
+    __device__ void operator()(const quad_case& k, const h_node& node, double (&sum)[quad_values]) const
+    {
+        if (!(node.d_omega_l > 0))
+        {
+            return;
+        }
+        gpu::hit_record<float> rec{};
+        rec.normal = k.nf;
+        rec.front_face = true;
+        const gpu::microfacet side{gpu::microfacet_kind::conductor, k.alpha, k.roughness};
+        const gpu::bsdf b = gpu::make_bsdf(metal(white()), &side, white(), rec, -k.vf);
+        float pdf = 0;
+        sum[0] += static_cast<double>(gpu::eval_bsdf(b, node.l, pdf).y) * node.d_omega_l;
+        sum[1] += static_cast<double>(gpu::ggx_eval(k.nf, k.vf, node.l, k.alpha, white(), pdf).y) * node.d_omega_l;
+    }
+};
+
+// E3, E7
+GPU_TEST(ggx_energy, compensated)
+{
+    const bool quick = ctx.quick();
+    std::vector<quad_case> cases;
+    for (const double alpha : grid_alphas)
+    {
+        for (const int theta : grid_thetas)
+        {
+            cases.push_back(make_case(alpha, cos_degrees(theta)));
+        }
+    }
+    const std::vector<integrals> q =
+        h_quadrature(compensated_integrands{}, cases, quick ? quick_resolution : full_resolution);
+    const std::vector<float> compiled = compiled_table();
+    double planted = 0; // E7: the largest |E_ms - 1| with the table shifted one μ node, θv ≤ 80°
+    for (std::size_t k = 0; k < grid_size; ++k)
+    {
+        const std::string name = "compensated-" + grid_name(k);
+        const int theta = grid_thetas[k % grid_thetas.size()];
+        if (cases[k].alpha < gpu::min_ggx_alpha)
+        {
+            ctx.info(name, "the delta lobe below min_ggx_alpha: nothing to integrate");
+            continue;
+        }
+        const double e = q[k][0];
+        if (quick)
+        {
+            ctx.info(name, std::format("{:.9g} (quick: no verdict)", e));
+        }
+        else if (theta <= 80)
+        {
+            ctx.exact(name, e, 1, 3e-3);
+        }
+        else
+        {
+            // Grazing: the table's coarseness at α → 1 is reported, with a sanity bound (B.md §8.7)
+            ctx.info(name, std::format("{:.6f} at θv = 89°", e));
+            ctx.exact(name, e, 1, 2e-2);
+        }
+        if (theta <= 80)
+        {
+            const double shifted = q[k][1] / table_lookup(compiled, cos_degrees(theta), cases[k].roughness, 1);
+            const double d = std::abs(shifted - 1);
+            planted = d <= planted ? planted : d;
+        }
+    }
+    if (quick)
+    {
+        ctx.info("planted-shift", "quick: no verdict");
+    }
+    else
+    {
+        ctx.info("planted-shift-largest", std::format("{:.6f}", planted));
+        ctx.count("planted-shift", planted > 1e-2 ? 0 : 1, 0, 1); // the fault accepted: max |E_ms - 1| ≤ 10⁻²
+    }
+}
+
+// The points of E4 and of the lookup check: (μ, r) on 65 × 65 points of [0, 1]² for three F0, then the table's nodes
+struct factor_point
+{
+    float mu;
+    float r;
+    vec3<float> f0;
+};
+
+struct compensation_at
+{
+    const factor_point* points;
+    vec3<float>* factors;
+    __device__ void operator()(int k) const
+    {
+        factors[k] = gpu::ggx_compensation(points[k].f0, points[k].mu, points[k].r);
+    }
+};
+
+// E4: ggx_compensation finite and ≥ 1, exactly 1 where F0 = 0; and (not in B.md's list) equal to B.md §3.8's lookup of
+// the compiled-in table, 1 + F0 (1 - E)/E, to 10⁻⁵
+GPU_TEST(ggx_energy, factor)
+{
+    std::vector<factor_point> points;
+    const vec3<float> f0s[] = {{0.0f, 0.04f, 0.5f}, {0.913f, 1.0f, 0.0f}, {0.04f, 0.5f, 1.0f}};
+    for (const vec3<float>& f0 : f0s)
+    {
+        for (int b = 0; b <= 64; ++b)
+        {
+            for (int a = 0; a <= 64; ++a)
+            {
+                points.push_back({static_cast<float>((a / 64.0) * (a / 64.0)), b / 64.0f, f0}); // even in √μ
+            }
+        }
+    }
+    for (int j = 0; j < table_side; ++j)
+    {
+        for (int i = 0; i < table_side; ++i)
+        {
+            points.push_back({static_cast<float>((i / 31.0) * (i / 31.0)), j / 31.0f, f0s[2]});
+        }
+    }
+    const gpu_test::device_buffer<factor_point> on_gpu(points);
+    const gpu_test::device_buffer<vec3<float>> out(points.size());
+    for_each_index(compensation_at{on_gpu.get(), out.get()}, static_cast<int>(points.size()), "ggx_compensation");
+    const std::vector<vec3<float>> factors = out.download();
+    const std::vector<float> compiled = compiled_table();
+    std::int64_t faults = 0;
+    std::int64_t off = 0;
+    for (std::size_t k = 0; k < points.size(); ++k)
+    {
+        const double e = table_lookup(compiled, points[k].mu, points[k].r);
+        for (int c = 0; c < 3; ++c)
+        {
+            const double f0 = channel(points[k].f0, c);
+            const double f = channel(factors[k], c);
+            faults += std::isfinite(f) && f >= 1 && (f0 != 0 || f == 1) ? 0 : 1;
+            const double expected = 1 + f0 * (1 - e) / e;
+            off += std::abs(f - expected) <= 1e-5 * expected ? 0 : 1;
+        }
+    }
+    ctx.count("factor", faults, 0, static_cast<std::int64_t>(3 * points.size()));
+    ctx.count("factor-lookup", off, 0, static_cast<std::int64_t>(3 * points.size()));
+}
+
+// E5: the compensated conductor through bsdf.cuh, weight = eval/pdf and eval_bsdf's pdf = ggx_pdf (G4's tolerance)
+struct compensated_lobe_off
+{
+    quad_case k;
+    bool pdf_check;
+    __device__ bool operator()(gpu::pcg32& rng) const
+    {
+        gpu::hit_record<float> rec{};
+        rec.normal = k.nf;
+        rec.front_face = true;
+        const gpu::microfacet side{gpu::microfacet_kind::conductor, k.alpha, k.roughness};
+        const gpu::bsdf b = gpu::make_bsdf(metal(test_f0()), &side, test_f0(), rec, -k.vf);
+        gpu::bsdf_sample s{nan_vector(), nan_vector(), quiet_nan(), true};
+        if (!gpu::sample_bsdf(b, {k.vf, -k.vf}, rec, rng, s))
+        {
+            return false;
+        }
+        float pdf = quiet_nan();
+        const vec3<float> e = gpu::eval_bsdf(b, s.wi, pdf);
+        if (pdf_check)
+        {
+            // ggx_pdf is ggx_eval's density, within G4's tolerance (decision 12): the two inlined copies may round the
+            // half vector apart, which a narrow lobe's D turns into a relative error of up to 10⁻⁶/(α v·h)
+            const double expected = gpu::ggx_pdf(b.n, b.wo, s.wi, b.alpha);
+            const double tolerance = pdf_tolerance(b.alpha, recompute_half(b.wo, s.wi).vh);
+            return !(isfinite(pdf) && ::fabs(pdf - expected) <= tolerance * ::fabs(expected));
+        }
+        return !weight_matches(b.wo, s.wi, b.albedo, s.weight, e, pdf);
+    }
+};
+
+GPU_TEST(ggx_energy, lobe)
+{
+    const std::int64_t n = ctx.samples(pair_samples);
+    std::int64_t weight_off = 0;
+    std::int64_t pdf_off = 0;
+    std::int64_t all = 0;
+    for (std::size_t a = 0; a < grid_alphas.size(); ++a)
+    {
+        for (std::size_t t = 0; t < grid_thetas.size(); ++t)
+        {
+            const std::size_t k = a * grid_thetas.size() + t;
+            const quad_case c = make_case(grid_alphas[a], cos_degrees(grid_thetas[t]));
+            if (c.alpha < gpu::min_ggx_alpha)
+            {
+                continue;
+            }
+            weight_off += gpu_test::device_count(compensated_lobe_off{c, false}, compensated_lobe_seed + k, n);
+            pdf_off += gpu_test::device_count(compensated_lobe_off{c, true}, compensated_lobe_seed + k, n);
+            all += gpu_test::drawn(n);
+        }
+    }
+    ctx.count("lobe-weight-eval", weight_off, 0, all);
+    ctx.count("lobe-pdf", pdf_off, 0, all);
 }
 }

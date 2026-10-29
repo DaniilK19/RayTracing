@@ -41,6 +41,7 @@ struct bsdf
     vec3<float> n;         // hit_record::normal: unit, facing the incoming ray
     vec3<float> wo;        // unit, toward where the ray came from: -unit(ray direction)
     material<float> books; // books_delta: what scatter() takes
+    float roughness;       // conductor: r, the energy compensation's axis (α = r² was rounded from it on the host)
 };
 
 struct bsdf_sample
@@ -69,6 +70,7 @@ __device__ inline bsdf make_bsdf(const material<float>& m, const microfacet* sid
         b.kind = side->alpha >= min_ggx_alpha ? lobe::conductor : lobe::smooth_conductor;
         b.albedo = m.albedo;
         b.alpha = side->alpha;
+        b.roughness = side->roughness;
         return b;
     }
     switch (m.kind)
@@ -131,9 +133,15 @@ __device__ inline bool sample_bsdf(const bsdf& b, const ray<float>& in, const hi
         return true;
     }
     case lobe::conductor:
-        // The visible normals (ggx.cuh): two numbers; false below the horizon
+        // The visible normals (ggx.cuh): two numbers; false below the horizon. Turquin's factor puts back the light of
+        // the bounces among the facets; the density stays the single-scattering lobe's.
         out.delta = false;
-        return ggx_sample(b.n, b.wo, b.alpha, b.albedo, rng, out.wi, out.weight, out.pdf);
+        if (!ggx_sample(b.n, b.wo, b.alpha, b.albedo, rng, out.wi, out.weight, out.pdf))
+        {
+            return false;
+        }
+        out.weight *= ggx_compensation(b.albedo, dot(b.n, b.wo), b.roughness);
+        return true;
     case lobe::smooth_conductor:
         // The conductor's limit α → 0: one facet, the surface itself, so the mirror direction and Schlick's F at the
         // incidence (the light single scattering keeps tends to F). No random number. Unlike the books' metal, whose
@@ -168,7 +176,10 @@ __device__ inline color<float> eval_bsdf(const bsdf& b, const vec3<float>& wi, f
         pdf = uniform_sphere_density<float>;
         return uniform_sphere_density<float> * b.albedo;
     case lobe::conductor:
-        return ggx_eval(b.n, b.wo, wi, b.alpha, b.albedo, pdf);
+    {
+        const color<float> single = ggx_eval(b.n, b.wo, wi, b.alpha, b.albedo, pdf);
+        return ggx_compensation(b.albedo, dot(b.n, b.wo), b.roughness) * single;
+    }
     default:
         pdf = 0.0f;
         return {};

@@ -56,9 +56,9 @@ camera_settings furnace_camera()
 // A white furnace for the rough metals: five spheres of a metal that reflects everything (F0 = 1) under a sky of
 // radiance 1, from left to right the mirror (r = 0) and GGX at α = r² = 0.05, 0.3, 0.6 and 1, the widths of the
 // reference table in out/m4/understand/ggx.md. A convex sphere sees nothing but the sky, so a pixel's expected value
-// is the light its lobe keeps at the pixel's angle, E(μ) = ∫ f·cos θl dωl with F = 1: exactly 1 for the mirror, and
-// less for a GGX metal (0.31 at α = 1 seen head-on) by the light that single scattering loses, the rays the facets
-// would pass on to one another. The spheres stand 2 apart with a radius of 0.4: from the points of a sphere's centre
+// is the light its lobe keeps at the pixel's angle, E(μ) = ∫ f·cos θl dωl with F = 1: exactly 1 for the mirror, and 1
+// again for a GGX metal, whose single scattering alone keeps less (0.31 at α = 1 seen head-on) and Turquin's
+// compensation gives back the rest, the light the facets pass on to one another (ggx.cuh). The spheres stand 2 apart with a radius of 0.4: from the points of a sphere's centre
 // patch a neighbour reaches at most about 13° above the horizon (none at the patch's centre), where even the widest
 // lobe sends under 0.4% of its light, so the patch shows its own lobe alone.
 gpu_scene_parts ggx_furnace()

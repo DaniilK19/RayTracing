@@ -17,10 +17,12 @@
 // The lobe draws its directions by the facets the viewer sees, the visible normals (Heitz 2018), with the spherical
 // caps of Dupuy & Benyoub (HPG 2023): two random numbers, no tangent frame of its own. Every sample's weight
 // f·cos θl / p is then F·G2/G1(v), at most F: no sample carries more light than a facet reflects, while drawing h by D
-// alone gives weights that reach the hundreds at grazing angles (Walter eq. 41). The code is re-derived from the
-// papers' equations; no listing is copied.
+// alone gives weights that reach the hundreds at grazing angles (Walter eq. 41). One bounce off the facets is all the
+// model describes; ggx_compensation gives back the light that leaves after several (Turquin 2019). The code is
+// re-derived from the papers' equations; no listing is copied.
 #pragma once
 
+#include "ggx_energy.cuh"
 #include "material.cuh" // around
 #include "pdf.cuh"      // inverse_pi
 #include "random.cuh"
@@ -120,8 +122,9 @@ __device__ inline color<float> ggx_eval(const vec3<float>& n, const vec3<float>&
     return (d * cl / (2.0f * (cl * av + cv * al))) * schlick(f0, dot(v, h));
 }
 
-// p(l) alone: ggx_eval's density, by ggx_eval itself (its color, which nothing reads here, the compiler drops), so
-// the two can't differ
+// p(l) alone: ggx_eval's density, by ggx_eval itself (its color, which nothing reads here, the compiler drops): the
+// same formula, though two inlined copies may round its half vector apart (GpuTests compare them within D's
+// sensitivity, not bit for bit)
 __device__ inline float ggx_pdf(const vec3<float>& n, const vec3<float>& v, const vec3<float>& l, float alpha)
 {
     float pdf;
@@ -192,5 +195,42 @@ __device__ inline bool ggx_sample(const vec3<float>& n, const vec3<float>& v, fl
     weight = (cl * (cv + av) / (cl * av + cv * al)) * schlick(f0, vh);
     pdf = ggx_d(n, h, alpha2) / (2.0f * (cv + av));
     return true;
+}
+
+// The light a white conductor's single scattering keeps (F = 1) for the viewer at cos θv = μ and the roughness r:
+// E_ss(μ, r) = ∫ f·c_l dω_l, from ggx_energy.cuh's table (GpuTests' quadrature, nodes at √μ = i/31 and r = j/31),
+// interpolated bilinearly and clamped to the table. The columns are even in √μ, not in μ: a smooth metal keeps nearly
+// all of its light until the view grazes the surface, then E_ss falls within a few hundredths of μ, and nodes even in
+// μ (a first one at 0.032) would put 5% too much light into its silhouettes. Where both α and μ are small E_ss
+// depends on μ/α alone, which a bilinear cell across the table's diagonal follows loosely: within 1.2° of the
+// horizon a smooth metal's compensated energy can be a few percent off 1.
+__device__ inline float ggx_energy(float cos_v, float roughness)
+{
+    constexpr int last = ggx_energy_size - 1;
+    const float x = sqrtf(fmin(fmax(cos_v, 0.0f), 1.0f)) * static_cast<float>(last);
+    const float y = fmin(fmax(roughness, 0.0f), 1.0f) * static_cast<float>(last);
+    const int i = static_cast<int>(x) < last - 1 ? static_cast<int>(x) : last - 1; // ⌊x⌋ for x ≥ 0, a cell's corner
+    const int j = static_cast<int>(y) < last - 1 ? static_cast<int>(y) : last - 1;
+    const float fx = x - static_cast<float>(i);
+    const float fy = y - static_cast<float>(j);
+    const float* row = ggx_energy_table + j * ggx_energy_size + i;
+    const float below = (1.0f - fx) * row[0] + fx * row[1];
+    const float above = (1.0f - fx) * row[ggx_energy_size] + fx * row[ggx_energy_size + 1];
+    return (1.0f - fy) * below + fy * above;
+}
+
+// Turquin's multiple-scattering compensation (Turquin 2019, eq. 16), the factor f_ms/f_ss = 1 + F0·(1 − E)/E per
+// channel, E = E_ss(μ, r). Single scattering loses the light the facets pass on to one another, 1 − E of it with
+// F = 1: 59% on average over the angles at r = 1, 69% head-on. Turquin puts it back as a scaled copy of the
+// single-scattering lobe, closer to the reference than a diffuse lobe (Heitz et al. 2016), drawn with the same
+// sampling and the same density, so only the sample's weight and eval_bsdf change. A white metal then keeps
+// E·(1 + (1 − E)/E) = 1 of its light at every angle; in a colored one the light put back is tinted by F0. (The factor
+// depends on the view alone, so f is no longer reciprocal, which a path traced from the camera never notices:
+// sampling and eval see the same v.) E is clamped at 1, so the factor is never below 1; F0 = 0 gives exactly 1.
+__device__ inline color<float> ggx_compensation(const color<float>& f0, float cos_v, float roughness)
+{
+    const float e = fmin(ggx_energy(cos_v, roughness), 1.0f);
+    const float lost = (1.0f - e) / e; // the light lost per unit kept (E is at least 0.3 in the table)
+    return {fma(f0.x, lost, 1.0f), fma(f0.y, lost, 1.0f), fma(f0.z, lost, 1.0f)};
 }
 }
