@@ -1,0 +1,4 @@
+# A script with an exposure out of range (Step 75: from -24 to 24 stops)
+size 16 9
+exposure 30
+hold 1 +1

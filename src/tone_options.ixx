@@ -1,7 +1,8 @@
-// Module tone_options: how the GPU programs show an image's light, and their options --tonemap and --exposure. The
-// renderer applies a tone map on the GPU (gpu::session::display, tonemap.cu); this module names the tone maps, reads
-// the options, and works out what a scene shows: what the options choose, and the scene's own display (its entry in
-// gpu_scenes.ixx) for what they leave open.
+// Module tone_options: how the GPU programs show an image's light, their options --tonemap and --exposure, and the
+// names the window's keys, scripts and recordings use. The renderer applies a tone map on the GPU
+// (gpu::session::display, tonemap.cu); this module names the tone maps, reads the options, and works out what a scene
+// shows: what the options (or the window's keys) choose, and the scene's own display (its entry in gpu_scenes.ixx) for
+// what they leave open.
 module;
 
 // The renderer's display types, before `import std;` (see gpu_scene.ixx)
@@ -11,6 +12,10 @@ export module tone_options;
 
 import std;
 import cli;
+
+// The renderer's enum under this module's name: the window's scripts (viewer_script.ixx), which read and write text
+// only and include no renderer.h, name tone maps by it
+export using tone_map = gpu::tone_map;
 
 export struct tone_map_entry
 {
@@ -37,6 +42,25 @@ export constexpr const tone_map_entry* find_tone_map(std::string_view name)
 export constexpr std::string_view tone_map_name(gpu::tone_map op)
 {
     return std::ranges::find(tone_map_list, op, &tone_map_entry::value)->name;
+}
+
+// The tone map `step` places on in the list, round and round: the window's T (+1) and Shift+T (-1)
+export constexpr gpu::tone_map step_tone_map(gpu::tone_map op, int step)
+{
+    const auto count = static_cast<std::ptrdiff_t>(tone_map_list.size());
+    const std::ptrdiff_t at = std::ranges::find(tone_map_list, op, &tone_map_entry::value) - tone_map_list.begin();
+    return tone_map_list[static_cast<std::size_t>(((at + step) % count + count) % count)].value;
+}
+
+// The names, for messages: "books, none, agx or neutral"
+export std::string tone_map_names()
+{
+    std::string text;
+    for (std::size_t i = 0; i < tone_map_list.size(); ++i)
+    {
+        text += std::format("{}{}", i == 0 ? "" : i + 1 == tone_map_list.size() ? " or " : ", ", tone_map_list[i].name);
+    }
+    return text;
 }
 
 // The exposure's range in stops, either way: the renderer's (renderer.h), which refuses more
@@ -126,6 +150,14 @@ export std::expected<void, std::string> check_display(const display_choice& chos
                                            tone_map_name(shown.op)));
     }
     return {};
+}
+
+// Whether a printed command or a recording names the display: unless both the display shown and the scene's own are
+// the books' bytes. So the books' scenes' commands and recordings stay as they were, and a command names its display
+// wherever the scene's default could show another one: it renders its image whatever the defaults.
+export bool names_display(const gpu::display_options& shown, const gpu::display_options& scene)
+{
+    return shown != gpu::display_options{} || scene != gpu::display_options{};
 }
 
 // A file that takes the display's bytes when the tone map isn't the books': a PNG, by its extension in any letter case

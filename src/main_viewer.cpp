@@ -31,6 +31,7 @@ import random;
 import ray;
 import scenes;
 import strategy_options;
+import tone_options;
 import vec3;
 import view_options;
 import viewer_camera;
@@ -56,6 +57,7 @@ struct options
     bool all_books_kernel = false;
     bool quality_kernel = false;
     std::vector<std::filesystem::path> outputs; // saved when the window closes
+    display_choice display;                     // --tonemap, --exposure (tone_options.ixx)
     bool exit_when_done = false;
     std::optional<std::filesystem::path> frames; // a folder for every frame shown, as PNG
     bool frames_hud = false;                     // the frames with the on-screen display and the help on them
@@ -94,6 +96,9 @@ Options:
       --seed N         which random numbers to draw, from 0 (the default) to {}
   -o, --output FILE    save the image when the window closes: a .png or a .pfm; several -o save
                        several files
+      --tonemap NAME   {} (see RayTracingGPU): the display transform of the
+                       window and of a .png; a .pfm stays linear
+      --exposure EV    the light times 2^EV before the tone map, from {} to {}; not with books
       --exit-when-done close the window when the image has its samples (after saving -o)
   -h, --help           show this help
 
@@ -110,6 +115,9 @@ In the window:
   double-click         focus on what is under the cursor
   Tab, Shift+Tab       the next or the previous scene
   F2                   float32 or float64
+  T, Shift+T           the next or the previous tone map: books, none, agx, neutral
+  , and .              exposure down or up by 0.5 EV (not with books)
+  0                    exposure back to 0 EV
   Space                pause or go on refining
   Enter, Shift+Enter   twice or half the samples to refine to, in whole rounds of strata
   I                    the numbers on screen
@@ -123,22 +131,24 @@ In the window:
 Scripts and measurements (see docs/viewer.md):
       --script FILE    play a camera script instead of taking input, then close
       --headless       no window: play the script, or render the samples; then save and exit
-      --record FILE    write every frame shown with new samples as a script line, to render again
-                       with --headless --script FILE (a script's moves come out frame by frame)
+      --record FILE    write every frame shown with new samples or a new display as a script line, to
+                       render again with --headless --script FILE (a script's moves frame by frame)
       --input FILE     drive the window with scripted keyboard, mouse and window events
-      --frames DIR     save every frame shown with new samples as DIR\f00000.png... (the image only)
+      --frames DIR     save every frame shown with new samples or a new display as
+                       DIR\f00000.png... (the image only)
       --frames-hud     with --frames in a window: save the window as it is, the numbers and the help
                        on it
       --stats FILE     write a line of numbers per frame to a CSV file
       --refresh-hz N   give a moving view's frames the GPU time of frames at N Hz (for measurements;
                        default: the display's rate; the frames still come at the display's pace))",
-                 view_usage, max_strata, default_strata, std::numeric_limits<std::uint32_t>::max());
+                 view_usage, max_strata, default_strata, std::numeric_limits<std::uint32_t>::max(), tone_map_names(),
+                 -max_exposure, max_exposure);
 }
 
 // The options that take a value, besides the view options (is_view_option); the others are flags
 constexpr auto value_options = std::to_array<std::string_view>(
     {"-w", "--width", "-s", "--samples", "--strata", "-p", "--sampling", "--seed", "-o", "--output", "--frames",
-     "--stats", "--script", "--record", "--input", "--refresh-hz"});
+     "--stats", "--script", "--record", "--input", "--refresh-hz", "--tonemap", "--exposure"});
 
 std::expected<options, std::string> parse_options(std::span<char* const> args)
 {
@@ -231,6 +241,24 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
                 return std::unexpected(std::format("{}: expected a rate from 1 to 1000, not '{}'", arg, value));
             }
             opts.refresh_hz = hz;
+        }
+        else if (arg == "--tonemap")
+        {
+            const auto op = tone_map_option(value);
+            if (!op)
+            {
+                return std::unexpected(op.error());
+            }
+            opts.display.op = *op;
+        }
+        else if (arg == "--exposure")
+        {
+            const auto ev = exposure_option(arg, value);
+            if (!ev)
+            {
+                return std::unexpected(ev.error());
+            }
+            opts.display.exposure = *ev;
         }
         else // -w, --width, -s, --samples or --strata
         {
@@ -433,6 +461,13 @@ private:
     int pending_width_ = 0;         // a new size from the window, applied at the next iterate
     int pending_height_ = 0;
 
+    // The display (tone_options.ixx): what the command line, a script or the keys chose, for every scene; what they
+    // leave open is each scene's own. A change shows the image again through the new display, without restarting it:
+    // at the next iterate, as a frame of its own unless the image is refining anyway (redisplay_).
+    display_choice display_{opts_.display};
+    bool redisplay_ = false;
+    std::optional<gpu::display_options> recorded_display_; // what --record last wrote, if it ever wrote a display
+
     // The last frame shown, as the session's display() gave it, and its size: what a device reset puts back
     std::vector<std::uint8_t> shown_;
     int shown_width_ = 0;
@@ -543,6 +578,11 @@ private:
     SDL_AppResult switch_precision();
     SDL_AppResult switched(const std::expected<void, std::string>& used, const std::string& what);
     void change_target(bool more);
+    gpu::display_options scene_display() const;
+    gpu::display_options shown_display() const;
+    void step_display(int step);
+    void change_exposure(std::optional<double> step);
+    void display_changed(const gpu::display_options& before);
     void draw_overlay();
     void say(std::string message);
 };
@@ -584,6 +624,14 @@ SDL_AppResult viewer::fail(const std::string& message)
 // session of its own, its image started over; if even that fails, there is no session, and the caller ends.
 std::expected<void, std::string> viewer::use_settings(const render_settings& settings)
 {
+    // The display these settings would show: a tone map beyond the books computes in float32 only (as T and F2 keep
+    // it), checked also when the settings stay, for a script's tonemap line before its next frame
+    const gpu_scene_entry* entry = find_gpu_scene(settings.scene);
+    if (const gpu::display_options shown = effective_display(display_, entry ? entry->display : gpu::display_options{});
+        settings.fp64 && shown.op != gpu::tone_map::books)
+    {
+        return std::unexpected(std::format("{} works in float32 only", tone_map_name(shown.op)));
+    }
     if (session_ && settings == settings_)
     {
         return {};
@@ -764,6 +812,12 @@ std::string viewer::gpu_command(std::int64_t passes) const
     {
         command += " --quality-kernel";
     }
+    // The display, wherever it or the scene's own isn't the books' bytes (see names_display), with the exposure's
+    // shortest digits that read back as the same number
+    if (const gpu::display_options shown = shown_display(); names_display(shown, scene_display()))
+    {
+        command += std::format(" --tonemap {} --exposure {}", tone_map_name(shown.op), shown.exposure);
+    }
     return command;
 }
 
@@ -894,7 +948,7 @@ std::expected<gpu::accumulation, std::string> viewer::complete_pass()
         {
             skip_interval_ = true;
             session_->render_to({state.passes + 1, 0});
-            if (const auto kept = keep_frame(session_->display()); !kept)
+            if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
             {
                 return std::unexpected(kept.error());
             }
@@ -924,6 +978,22 @@ void viewer::save_view()
         std::println("Error: {}", img.error());
         return;
     }
+    // A tone map's PNG holds the bytes on screen, as RayTracingGPU's does (see bytes_to_image); the PFM the linear
+    // values
+    const gpu::display_options shown = shown_display();
+    std::optional<image> toned;
+    try
+    {
+        if (shown.op != gpu::tone_map::books)
+        {
+            toned = bytes_to_image(session_->display(shown), width_, height_);
+        }
+    }
+    catch (const std::exception& error)
+    {
+        std::println("Error: {}", error.what());
+        return;
+    }
     std::string name;
     do
     {
@@ -932,7 +1002,8 @@ void viewer::save_view()
     for (const std::string_view extension : {".png", ".pfm"})
     {
         const std::filesystem::path file = name + std::string(extension);
-        if (const auto saved = img->save(file); !saved)
+        const image& source = toned && extension == ".png" ? *toned : *img;
+        if (const auto saved = source.save(file); !saved)
         {
             std::println("Error: {} ({})", saved.error(), to_utf8(file));
             return;
@@ -940,7 +1011,9 @@ void viewer::save_view()
     }
     std::println("Saved {} and .pfm ({} samples per pixel). The same image:",
                  to_utf8(std::filesystem::absolute(name + ".png")), state->passes);
-    std::println("{} -o {}-gpu.pfm", gpu_command(state->passes), name);
+    // With a tone map the command saves the PNG too, whose bytes it renders again
+    std::println("{}{} -o {}-gpu.pfm", gpu_command(state->passes), toned ? std::format(" -o {}-gpu.png", name) : "",
+                 name);
 }
 
 // A message on screen for two seconds. A loop waiting for events wouldn't take it off, so a timer wakes it then.
@@ -977,6 +1050,11 @@ void viewer::print_settings() const
                      sampling, target_, settings_.strata, settings_.strata, precision);
         std::println("View: {}", format_view(settings_for(view_, width_, height_), height_));
     }
+    // A tone map is named, as RayTracingGPU names it; the books' bytes, as before, aren't
+    if (const gpu::display_options shown = shown_display(); shown.op != gpu::tone_map::books)
+    {
+        std::println("Display: {}, {}", tone_map_name(shown.op), format_exposure(shown.exposure));
+    }
 }
 
 // Tab, Shift+Tab: the next or the previous scene (see use_settings), at the window's size. It goes through the books'
@@ -998,9 +1076,17 @@ SDL_AppResult viewer::switch_scene(int step)
     return switched(use_settings(next), std::format("can't show {}", next.scene));
 }
 
-// F2: the other precision, in a new session at the same view (the moves still waiting are shown first)
+// F2: the other precision, in a new session at the same view (the moves still waiting are shown first). Under a tone
+// map other than books it stays in float32, where the tone maps compute, and says so.
 SDL_AppResult viewer::switch_precision()
 {
+    if (const gpu::display_options shown = shown_display(); !settings_.fp64 && shown.op != gpu::tone_map::books)
+    {
+        const std::string note = std::format("{} works in float32 only: T to books first", tone_map_name(shown.op));
+        std::println("Note: {}", note);
+        say(note);
+        return SDL_APP_CONTINUE;
+    }
     if (const auto applied = apply_pending_view(); !applied)
     {
         return fail(applied.error());
@@ -1049,6 +1135,66 @@ void viewer::change_target(bool more)
                           : std::format("refining to {} samples", target_));
 }
 
+// The scene's own display (its entry in gpu_scenes.ixx: the books' bytes for the books' scenes)
+gpu::display_options viewer::scene_display() const
+{
+    const gpu_scene_entry* entry = find_gpu_scene(settings_.scene);
+    return entry ? entry->display : gpu::display_options{};
+}
+
+// The display the window shows: the one chosen, else the scene's own
+gpu::display_options viewer::shown_display() const
+{
+    return effective_display(display_, scene_display());
+}
+
+// T, Shift+T: the next or the previous tone map. Those beyond the books compute in float only, so in float64 the
+// window keeps the books' bytes and says so.
+void viewer::step_display(int step)
+{
+    const gpu::display_options before = shown_display();
+    const gpu::tone_map next = step_tone_map(before.op, step);
+    if (settings_.fp64 && next != gpu::tone_map::books)
+    {
+        const std::string note = std::format("{} works in float32 only: F2 first", tone_map_name(next));
+        std::println("Note: {}", note);
+        say(note);
+        return;
+    }
+    display_.op = next;
+    display_changed(before);
+}
+
+// , and .: the exposure half a stop down or up, within ±24 EV; 0 (an empty step): back to 0 EV. The books' bytes have
+// no exposure: under books the keys change nothing and say so.
+void viewer::change_exposure(std::optional<double> step)
+{
+    const gpu::display_options before = shown_display();
+    if (before.op == gpu::tone_map::books)
+    {
+        const std::string note = "exposure applies to a tone map: T picks one";
+        std::println("Note: {}", note);
+        say(note);
+        return;
+    }
+    display_.exposure = step ? std::clamp(before.exposure + *step, -max_exposure, max_exposure) : 0.0;
+    display_changed(before);
+}
+
+// After a key changed the display: the console's line, and the image shown again through it at the next iterate,
+// with the numbers on screen. Nothing when it stayed as it was (an exposure at its limit, or 0 EV again).
+void viewer::display_changed(const gpu::display_options& before)
+{
+    const gpu::display_options now = shown_display();
+    if (now == before)
+    {
+        return;
+    }
+    std::println("Display: {}, {}", tone_map_name(now.op), format_exposure(now.exposure));
+    redisplay_ = true;
+    present_needed_ = true;
+}
+
 // The numbers at the top of the window, a note at the bottom and the help, in SDL's built-in 8×8 font, scaled with the
 // display: three short lines on a dark bar, and the controls over the dimmed image. No device facts: the window shows
 // the image's numbers.
@@ -1069,6 +1215,9 @@ void viewer::draw_overlay()
         "R                   back to the start view",
         "Tab, Shift+Tab      the next or previous scene",
         "F2                  float32 or float64",
+        "T, Shift+T          the next or previous tone map",
+        ", .                 exposure -/+ 0.5 EV",
+        "0                   exposure back to 0 EV",
         "Space               pause or go on refining",
         "Enter, Shift+Enter  twice or half the samples",
         "P                   save the image, print its command",
@@ -1080,9 +1229,15 @@ void viewer::draw_overlay()
     constexpr float note_height = line + 6;
     const auto w = static_cast<float>(width_);
     const auto h = static_cast<float>(height_);
+    // A tone map is named on the third line ("  agx +0.5 EV"); the books' bytes, the default, aren't
+    const gpu::display_options shown = shown_display();
+    const std::string tone = shown.op == gpu::tone_map::books
+                                 ? std::string()
+                                 : std::format("  {} {}", tone_map_name(shown.op), format_exposure(shown.exposure));
     // The numbers and the note at twice the display's scale (SDL's font is 8 pixels), but no larger than lets the
-    // widest line, about 56 characters, and both bars fit the window; at least 1
-    constexpr float widest = 56 * 8 + 16;
+    // widest line, about 56 characters (66 with a tone map's name on the third), and both bars fit the window; at
+    // least 1
+    const float widest = static_cast<float>((tone.empty() ? 56 : 66) * 8 + 16);
     const float scale = std::max(1.0f, std::min({std::round(2 * SDL_GetWindowDisplayScale(window_)),
                                                  std::floor(w / widest), std::floor(h / (bar_height + note_height + 8))}));
     // The help between the numbers and the note, at their scale or smaller where the window is short (the numbers keep
@@ -1135,8 +1290,8 @@ void viewer::draw_overlay()
             std::format("{}  {}x{}  {}  strata {}x{}", settings_.scene, width_, height_,
                         settings_.fp64 ? "float64" : "float32", settings_.strata, settings_.strata),
             progress,
-            std::format("vfov {:.4g}  aperture {:.4g}  focus {:.4g}{}", view_.vfov, view_.defocus_angle,
-                        view_.focus_dist, live ? "   H: help" : ""),
+            std::format("vfov {:.4g}  aperture {:.4g}  focus {:.4g}{}{}", view_.vfov, view_.defocus_angle,
+                        view_.focus_dist, tone, live ? "   H: help" : ""),
         };
         SDL_SetRenderDrawColor(renderer_, 0, 0, 0, 160);
         const SDL_FRect bar{0, 0, width, bar_height};
@@ -1227,6 +1382,14 @@ SDL_AppResult viewer::init()
             {
                 settings.sampling = sampling->strategy;
             }
+            else if (const auto* tonemap = std::get_if<set_tonemap>(&c))
+            {
+                display_.op = tonemap->op;
+            }
+            else if (const auto* exposure = std::get_if<set_exposure>(&c))
+            {
+                display_.exposure = exposure->exposure;
+            }
         }
     }
 
@@ -1257,6 +1420,18 @@ SDL_AppResult viewer::init()
     if (const auto checked = check_kernel(*built, settings.scene, settings.kernel, settings.fp64); !checked)
     {
         return fail(checked.error());
+    }
+    // The display, refused as RayTracingGPU refuses it: an exposure for the books' bytes, a tone map in float64
+    if (const auto checked = check_display(opts_.display, find_gpu_scene(settings.scene)->display, settings.fp64);
+        !checked)
+    {
+        return fail(checked.error());
+    }
+    // and a script's display before its first frame, in float64 (later ones: use_settings, at their frame's line)
+    if (const gpu::display_options shown = effective_display(display_, find_gpu_scene(settings.scene)->display);
+        opts_.script && settings.fp64 && shown.op != gpu::tone_map::books)
+    {
+        return fail(std::format("{}: {} works in float32 only", to_utf8(*opts_.script), tone_map_name(shown.op)));
     }
     width_ = built->frame.image_width;
     height_ = built->frame.image_height;
@@ -1551,10 +1726,18 @@ bool viewer::save_outputs()
             fail(img.error());
             return false;
         }
+        // A tone map's PNG from the display's bytes, as RayTracingGPU's (see bytes_to_image); a PFM from the pixels
+        const gpu::display_options shown = shown_display();
+        std::optional<image> toned;
+        if (shown.op != gpu::tone_map::books)
+        {
+            toned = bytes_to_image(session_->display(shown), width_, height_);
+        }
         std::string errors; // every file that failed, in one message (and one message box)
         for (const std::filesystem::path& output : opts_.outputs)
         {
-            if (const auto saved = img->save(output); !saved)
+            const image& source = toned && is_png(output) ? *toned : *img;
+            if (const auto saved = source.save(output); !saved)
             {
                 errors += std::format("{}{} ({})", errors.empty() ? "" : "\n", saved.error(), to_utf8(output));
                 continue;
@@ -1577,9 +1760,9 @@ bool viewer::save_outputs()
     }
 }
 
-// A frame with new samples, after display(): kept for the window, and written by --record and by --frames (without a
-// window, or with a minimized one, which presents nothing to read back: from the bytes, which the window shows as they
-// are)
+// A frame with new samples, or with the same ones through another display, after display(): kept for the window, and
+// written by --record and by --frames (without a window, or with a minimized one, which presents nothing to read back:
+// from the bytes, which the window shows as they are)
 std::expected<void, std::string> viewer::keep_frame(std::span<const std::uint8_t> bytes)
 {
     shown_.assign(bytes.begin(), bytes.end());
@@ -1594,18 +1777,35 @@ std::expected<void, std::string> viewer::keep_frame(std::span<const std::uint8_t
     return {};
 }
 
-// --record: the settings when they change, then the frame
+// --record: the settings when they change, then the frame. The display's lines follow the settings when the display,
+// or the scene's own, isn't the books' bytes (names_display), and once written they come with every change of the
+// settings or of the display: a script's display holds for every scene after it (see viewer_script), so a replay shows
+// each frame as the window did. A recording of the books' scenes that never left their bytes stays as it was.
 void viewer::record_frame()
 {
     if (!record_.is_open())
     {
         return;
     }
+    const gpu::display_options shown = shown_display();
+    const bool display_lines = recorded_display_ || names_display(shown, scene_display());
+    const display_setting display{shown.op, shown.exposure};
     if (recorded_settings_ != settings_)
     {
         record_ << format_settings(settings_.scene, settings_.fp64, settings_.kernel, settings_.sampling,
-                                   settings_.seed, settings_.strata);
+                                   settings_.seed, settings_.strata,
+                                   display_lines ? std::optional{display} : std::nullopt);
         recorded_settings_ = settings_;
+        if (display_lines)
+        {
+            recorded_display_ = shown;
+        }
+    }
+    else if (display_lines && recorded_display_ != shown)
+    {
+        // A display changed on the same settings: its lines alone, then a frame of the same passes and generation
+        record_ << format_display(display);
+        recorded_display_ = shown;
     }
     const gpu::accumulation state = session_->state();
     record_ << format_frame(state.passes, state.rows, generation_, width_, height_, view_);
@@ -1640,7 +1840,7 @@ std::expected<bool, std::string> viewer::play_next()
             const gpu::accumulation now = session_->state();
             const std::int64_t target = generation_ != before ? passes : now.passes + passes;
             script_report_ = session_->render_to({target, 0});
-            if (const auto kept = keep_frame(session_->display()); !kept)
+            if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
             {
                 return at(kept.error());
             }
@@ -1711,6 +1911,16 @@ std::expected<bool, std::string> viewer::play_next()
         {
             const auto* c = &std::get<set_sampling>(line.command);
             settings.sampling = c->strategy;
+        }
+        else if (std::holds_alternative<set_tonemap>(line.command))
+        {
+            // The display needs no new session: the next frame shows its image through it (a recorded frame of the
+            // same passes and generation renders nothing, and shows the image again)
+            display_.op = std::get<set_tonemap>(line.command).op;
+        }
+        else if (std::holds_alternative<set_exposure>(line.command))
+        {
+            display_.exposure = std::get<set_exposure>(line.command).exposure;
         }
         else if (std::holds_alternative<set_camera>(line.command))
         {
@@ -1799,7 +2009,7 @@ std::expected<bool, std::string> viewer::play_next()
             try
             {
                 script_report_ = session_->render_to(want);
-                if (const auto kept = keep_frame(session_->display()); !kept)
+                if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
                 {
                     return at(kept.error());
                 }
@@ -1817,7 +2027,7 @@ std::expected<bool, std::string> viewer::play_next()
     {
         const gpu::accumulation now = session_->state();
         script_report_ = session_->render_to({now.passes + hold_passes_, 0});
-        if (const auto kept = keep_frame(session_->display()); !kept)
+        if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
         {
             return std::unexpected(kept.error());
         }
@@ -1863,7 +2073,7 @@ SDL_AppResult viewer::run_headless()
         {
             const std::uint64_t start = SDL_GetTicksNS();
             const gpu::render_report report = session_->render_to({target_, 0});
-            if (const auto kept = keep_frame(session_->display()); !kept)
+            if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
             {
                 return fail(kept.error());
             }
@@ -2138,6 +2348,20 @@ SDL_AppResult viewer::event(const SDL_Event& e)
                 std::println("Error: {}", state.error());
             }
         }
+        // The display: the image shown again through it, without new samples (see redisplay_). , . and 0 by their
+        // character or by their place on a US keyboard, as - = [ ] above
+        else if (e.key.key == SDLK_T)
+        {
+            step_display((mods_ & SDL_KMOD_SHIFT) ? -1 : 1);
+        }
+        else if (is(SDLK_COMMA, SDL_SCANCODE_COMMA) || is(SDLK_PERIOD, SDL_SCANCODE_PERIOD))
+        {
+            change_exposure(is(SDLK_PERIOD, SDL_SCANCODE_PERIOD) ? 0.5 : -0.5);
+        }
+        else if (is(SDLK_0, SDL_SCANCODE_0))
+        {
+            change_exposure(std::nullopt);
+        }
         break;
     }
     case SDL_EVENT_WINDOW_FOCUS_LOST:
@@ -2322,6 +2546,7 @@ SDL_AppResult viewer::iterate()
     {
         gpu::render_report report;
         bool new_samples = false;
+        bool redisplayed = false; // the same samples through another display: a frame too (--frames, --record)
         bool presented = false;
         bool moving = false;
         bool done = false;
@@ -2378,15 +2603,30 @@ SDL_AppResult viewer::iterate()
                 const gpu::accumulation before = session_->state();
                 report = session_->render_for(budget, limit);
                 last_samples_ = samples_in(session_->state()) - samples_in(before);
-                if (const auto kept = keep_frame(session_->display()); !kept)
+                if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
                 {
                     return fail(kept.error());
                 }
                 new_samples = true;
+                redisplay_ = false; // this frame has the display as it is now
+            }
+            else if (redisplay_ && !minimized_pause)
+            {
+                // A display changed on an image that doesn't refine (done, or paused): its samples once more, through
+                // the new display, as a frame that adds none. keep_frame records it with the same passes, rows and
+                // generation, which a replay renders by rendering nothing; the rendering stays asleep.
+                if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
+                {
+                    return fail(kept.error());
+                }
+                redisplay_ = false;
+                redisplayed = true;
             }
             done = session_->state().passes >= target_;
         }
-        if (new_samples)
+        // A frame to show and to save: new samples, or the same ones through another display
+        const bool new_frame = new_samples || redisplayed;
+        if (new_frame)
         {
             present_needed_ = true;
         }
@@ -2397,7 +2637,7 @@ SDL_AppResult viewer::iterate()
             {
                 return SDL_APP_FAILURE;
             }
-            if ((upload_needed_ && !upload_shown()) || !draw_and_present(new_samples))
+            if ((upload_needed_ && !upload_shown()) || !draw_and_present(new_frame))
             {
                 return SDL_APP_FAILURE;
             }
@@ -2413,7 +2653,7 @@ SDL_AppResult viewer::iterate()
             }
             view_ms_ += wall_ms;
         }
-        write_stats(report, new_samples, presented, moving, wall_ms, dt_ms);
+        write_stats(report, new_frame, presented, moving, wall_ms, dt_ms);
         ++frame_;
         if (const auto sent = send_input(frame_); !sent)
         {
@@ -2462,9 +2702,10 @@ SDL_AppResult viewer::iterate()
     return SDL_APP_CONTINUE;
 }
 
-// --stats: a row per frame. new_samples: the frame has samples the one before didn't (the frames --frames saves);
-// presented: the window was drawn and presented; moving: the frame had a moving view's budget; time_ms: when the row
-// was written, from the start (the times of --input's `after MS` events count from there too).
+// --stats: a row per frame. new_samples: the frame has samples the one before didn't, or shows the same ones through
+// another display (the frames --frames saves); presented: the window was drawn and presented; moving: the frame had a
+// moving view's budget; time_ms: when the row was written, from the start (the times of --input's `after MS` events
+// count from there too).
 void viewer::write_stats(const gpu::render_report& report, bool new_samples, bool presented, bool moving,
                          double wall_ms, double dt_ms)
 {

@@ -1,0 +1,5 @@
+# A script asking for a tone map in float64, refused before its first frame (Step 75: the tone maps compute in float32)
+size 16 9
+precision double
+tonemap agx
+hold 1 +1

@@ -9,6 +9,7 @@ import std;
 import camera;
 import cli;
 import strategy_options;
+import tone_options;
 import vec3;
 import viewer_camera;
 
@@ -17,6 +18,10 @@ import viewer_camera;
 // One command per line; # starts a comment. Settings stay until changed:
 //   scene NAME | size W H | seed S | strata K | precision float|double | kernel auto|all-books|quality |
 //   sampling NAME|scene
+//   tonemap books|none|agx|neutral | exposure EV   the display the frames are shown with (EV from -24 to 24; the
+//                books' bytes take none): it doesn't change the image, so a frame after it may show the samples of
+//                the frame before through it. Without them each scene shows its own display, until one of them is
+//                given; then that one holds for every scene, as the window's T and exposure keys hold.
 //   camera [lookfrom "X,Y,Z"] [lookat "X,Y,Z"] [vfov D] [defocus-angle D] [focus-dist D]   (the view, changed)
 //   focus-at X Y   the focus distance of the surface seen at pixel (X, Y) of the image, as a double-click sets it
 // The camera stays when another setting changes; a new scene starts at its own view.
@@ -32,7 +37,7 @@ import viewer_camera;
 //   frame N R gen G size W H lookfrom "X,Y,Z" lookat "X,Y,Z" vfov D defocus-angle D focus-dist D
 //                one frame: that view at N complete passes (from 1) and R rows of the next one (below H); G numbers
 //                the views, a new G starting the image over even for the same camera (what --record writes, one line
-//                per frame shown with new samples)
+//                per frame shown with new samples, or with the same ones through a new display)
 // A script ends with a frame: lines after its last hold, move or frame would render nothing, and are an error.
 
 // The most passes a frame may have: as many as RayTracingGPU's -s
@@ -57,6 +62,8 @@ export struct set_kernel { kernel_choice kernel; };
 // empty: the scene's own. The type is written ::strategy: a member may not change what an unqualified name means in its
 // class, and this one is named strategy too.
 export struct set_sampling { std::optional<::strategy> strategy; };
+export struct set_tonemap { tone_map op; };
+export struct set_exposure { double exposure; };
 export struct set_camera { view_change view; };
 export struct focus_at { double x; double y; };
 export struct hold { int frames; std::int64_t passes; };
@@ -87,8 +94,8 @@ export struct frame
 };
 
 export using script_command =
-    std::variant<set_scene, set_size, set_seed, set_strata, set_precision, set_kernel, set_sampling, set_camera,
-                 focus_at, hold, move, frame>;
+    std::variant<set_scene, set_size, set_seed, set_strata, set_precision, set_kernel, set_sampling, set_tonemap,
+                 set_exposure, set_camera, focus_at, hold, move, frame>;
 
 export struct script_line
 {
@@ -301,6 +308,25 @@ std::expected<script_command, std::string> command(std::span<const std::string_v
         }
         return set_sampling{entry->value};
     }
+    if (verb == "tonemap")
+    {
+        const tone_map_entry* entry = w.size() == 2 ? find_tone_map(w[1]) : nullptr;
+        if (!entry)
+        {
+            return std::unexpected(std::format("tonemap is {}", tone_map_names()));
+        }
+        return set_tonemap{entry->value};
+    }
+    if (verb == "exposure")
+    {
+        const std::optional<double> ev = w.size() == 2 ? parse_exposure(w[1]) : std::nullopt;
+        if (!ev)
+        {
+            return std::unexpected(
+                std::format("exposure needs a number of stops from {} to {}", -max_exposure, max_exposure));
+        }
+        return set_exposure{*ev};
+    }
     if (verb == "camera")
     {
         set_camera result;
@@ -481,13 +507,31 @@ std::string quoted(const point3& p)
 }
 }
 
-// The settings lines that start a recording, and that follow a change of settings
+// The display a recording's frames are shown with: a tone map and its exposure in EV
+export struct display_setting
+{
+    tone_map op;
+    double exposure;
+};
+
+// Its lines, the exposure with the shortest digits that read back as the same number, so a replay shows the frames
+// with exactly the window's exposure
+export std::string format_display(const display_setting& display)
+{
+    return std::format("tonemap {}\nexposure {}\n", tone_map_name(display.op), display.exposure);
+}
+
+// The settings lines that start a recording, and that follow a change of settings; the display's lines after them,
+// when it is given (the window gives it unless both the display and the scene's own are the books' bytes, so the
+// books' scenes' recordings stay as they were)
 export std::string format_settings(std::string_view scene, bool fp64, kernel_choice kernel,
-                                   std::optional<strategy> s, std::uint32_t seed, int strata)
+                                   std::optional<strategy> s, std::uint32_t seed, int strata,
+                                   const std::optional<display_setting>& display = std::nullopt)
 {
     const std::string name = s ? std::string(strategy_name(*s)) : std::string("scene");
-    return std::format("scene {}\nprecision {}\nkernel {}\nsampling {}\nseed {}\nstrata {}\n", scene,
-                       fp64 ? "double" : "float", kernel_choice_name(kernel), name, seed, strata);
+    return std::format("scene {}\nprecision {}\nkernel {}\nsampling {}\nseed {}\nstrata {}\n{}", scene,
+                       fp64 ? "double" : "float", kernel_choice_name(kernel), name, seed, strata,
+                       display ? format_display(*display) : std::string());
 }
 
 // One frame shown: its view (from the camera's settings) and how far it was rendered

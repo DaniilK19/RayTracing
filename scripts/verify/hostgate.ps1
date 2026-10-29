@@ -8,7 +8,8 @@
 #   3. RayTracingGPU: five small renders (float64; a strategy; rounds of strata with short launches; the lights list;
 #      the kernel for all three books on a first-book scene), the PFM's and the PNG's bytes, and the Scene, View,
 #      Kernel, mean radiance and rays-traced lines;
-#   4. with -Tour: docs\viewer-tour.txt, the README GIF's script, rendered headless: every frame and the --record file.
+#   4. with -Tour: docs\viewer-tour.txt, the README GIF's script, rendered headless: every frame and the --record file;
+#   5. tests\regress-tone.txt (from Step 75): the window's tone maps, against the step before's (see below).
 # Every render goes through gpu.ps1 (the queue and the GPU log). Results go to out\m4\runs\stepNN\host\.
 #   powershell -ExecutionPolicy Bypass -File scripts\verify\hostgate.ps1 -Step 71 [-Tour] [-Accept]
 # Texts that differ from the allowed differences fail the gate and are left in out\m4\cli-allowed\NN.pending.diff for
@@ -270,6 +271,71 @@ if ($Tour) {
     $failures += Compare-WithBaseline "window, the GIF's tour (frames and --record)" $tourLines "tour.txt" {
         Get-ScriptFrames $refViewer "tour (reference)" "docs\viewer-tour.txt" (Join-Path $run "tour-ref") `
             (Join-Path $run "tour-ref-record.txt")
+    }
+}
+
+# --- 5. The window's tone maps, step to step -------------------------------------------------------------------------
+# Step 70's window has no tone maps, so tests\regress-tone.txt (from Step 75) is compared with the newest earlier step's
+# accepted lines (out\m4\chained\stepNN\regress-tone.txt): its console (times masked), every frame and its --record. A
+# difference is left in out\m4\chained\NN.pending.txt for review; -Accept then accepts exactly it, and keeps the lines
+# as step NN's, as with the command lines' texts.
+
+$toneScript = "tests\regress-tone.txt"
+if (Test-Path -LiteralPath (Join-Path $project $toneScript)) {
+    $toneFolder = Join-Path $run "regress-tone"
+    $toneRecord = Join-Path $run "regress-tone-record.txt"
+    New-Folder $toneFolder
+    $toneOut = Invoke-Queued "regress-tone" $newViewer @("--headless", "--script", $toneScript, "--frames", $toneFolder,
+        "--record", $toneRecord)
+    if ($script:code -ne 0) { $toneOut | ForEach-Object { Write-Host "  $_" }; throw "hostgate: regress-tone failed" }
+    $toneLines = @($toneOut | Where-Object { $_ -notmatch '^gpu\.ps1:' } |
+        ForEach-Object { $_ -replace ', [0-9.]+ s$', '' })
+    $toneLines += Get-Hashes $toneFolder "f*.png"
+    $toneLines += "record " + (Get-FileHash -LiteralPath $toneRecord -Algorithm SHA256).Hash
+    $toneText = ($toneLines -join "`n").TrimEnd()
+
+    $chained = Join-Path $m4 "chained"
+    $toneEarlier = @(Get-ChildItem -LiteralPath $chained -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^step(\d+)$' -and [int]$Matches[1] -lt $Step -and
+            (Test-Path -LiteralPath (Join-Path $_.FullName "regress-tone.txt")) } |
+        Sort-Object { [int]($_.Name.Substring(4)) } | Select-Object -Last 1)
+    $tonePrevious = $null
+    $toneFrom = "no earlier step"
+    if ($toneEarlier.Count -gt 0) {
+        $tonePrevious = ([IO.File]::ReadAllText((Join-Path $toneEarlier[0].FullName "regress-tone.txt")) -replace
+            "`r`n", "`n").TrimEnd()
+        $toneFrom = "Step " + $toneEarlier[0].Name.Substring(4)
+    }
+    $tonePending = Join-Path $chained ("{0}.pending.txt" -f $Step)
+    $toneKeep = Join-Path $chained ("step{0}" -f $Step)
+    if ($null -ne $tonePrevious -and $tonePrevious -ceq $toneText) {
+        Write-Output ("window, regress-tone.txt: identical to {0}'s ({1} lines)" -f $toneFrom, $toneLines.Count)
+        if ($Accept) {
+            New-Item -ItemType Directory -Force $toneKeep | Out-Null
+            [IO.File]::WriteAllText((Join-Path $toneKeep "regress-tone.txt"), $toneText + "`n")
+        }
+    }
+    elseif ($Accept -and (Test-Path -LiteralPath $tonePending) -and
+        ([IO.File]::ReadAllText($tonePending) -replace "`r`n", "`n").TrimEnd() -ceq $toneText) {
+        New-Item -ItemType Directory -Force $toneKeep | Out-Null
+        Move-Item -LiteralPath $tonePending (Join-Path $toneKeep "regress-tone.txt") -Force
+        Write-Output ("window, regress-tone.txt: the reviewed lines accepted as Step {0}'s ({1} lines)" -f $Step,
+            $toneLines.Count)
+    }
+    else {
+        New-Item -ItemType Directory -Force $chained | Out-Null
+        [IO.File]::WriteAllText($tonePending, $toneText + "`n")
+        Write-Output ("window, regress-tone.txt: DIFFERENT from {0}'s: review {1}, then -Accept" -f $toneFrom,
+            $tonePending)
+        if ($null -eq $tonePrevious) {
+            $toneLines | Select-Object -First 40 | ForEach-Object { Write-Output "  + $_" }
+        }
+        else {
+            Compare-Object -ReferenceObject @($tonePrevious -split "`n") -DifferenceObject @($toneText -split "`n") `
+                -CaseSensitive | Select-Object -First 40 | ForEach-Object {
+                    Write-Output ("  {0} {1}" -f $(if ($_.SideIndicator -eq "=>") { "+" } else { "-" }), $_.InputObject) }
+        }
+        $failures++
     }
 }
 

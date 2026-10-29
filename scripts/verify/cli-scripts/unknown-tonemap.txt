@@ -1,0 +1,4 @@
+# A script naming a tone map the window doesn't know (Step 75 adds tonemap books|none|agx|neutral)
+size 16 9
+tonemap bogus
+hold 1 +1

@@ -1,0 +1,32 @@
+# The window's tone maps and exposure, driven by scripted input (see docs/viewer.md, "Scripted input"), recorded and
+# replayed. It quits by itself after P, so it runs without --exit-when-done (which would close the window as soon as
+# the image is done, before the keys below):
+#   RayTracingViewer cornell -w 320 --height 180 -s 64 --input tests\window-tone.input --record r.txt --frames A
+#   RayTracingViewer --headless --script r.txt --frames B
+# Every frame in A equals the one in B of the same number (decoded: SDL and stb write different PNG files), and a frame
+# shown again through a new display carries the passes, rows and generation of the one before it in r.txt.
+#
+# Paused before the first frame: a new view still gets its first pass, and the image stays there, in the books' bytes.
+at 0 key Space
+# books -> none on the paused image: its one pass shown again (a frame of 1 pass, whose display lines are the first
+# the recording writes, on settings it wrote before)
+at 3 key T
+# Two keys in one batch: +0.5 EV, and Space goes on refining: the next frame has new samples, through the new display
+at 5 key .
+at 5 key Space
+# The image is done long before frame 200 (64 samples at 320x180; once done, the loop runs on fast while events are
+# left). Shift+T: none -> books, its bytes again (the exposure waits for a tone map)
+at 200 key-down Left Shift
+at 200 key T
+at 200 key-up Left Shift
+# books -> none -> agx in one batch: one frame, agx at the +0.5 EV held
+at 210 key T
+at 210 key T
+# F2 under agx: a note, and the session stays in float32 (no frame)
+at 220 key F2
+# +1 EV, then 0 EV
+at 230 key .
+at 240 key 0
+# agx at 0 EV saved as cornell-view-NNN.png and .pfm in the current folder, and its RayTracingGPU command printed
+at 250 key P
+at 260 quit

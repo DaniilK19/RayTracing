@@ -1,0 +1,27 @@
+# The window's tone maps for scripts/verify/hostgate.ps1 (from Step 75): tiny frames through every display, rendered
+# with
+#   RayTracingViewer --headless --script tests\regress-tone.txt --frames <folder> --record <file>
+# Their bytes, the recording and what the window prints must stay the same from step to step (each step compares with
+# the one before: Step 70's window has no tone maps). The Cornell box in the books' bytes, then the same 16 passes
+# shown again through agx (a frame of the same passes and view renders nothing), a pass in progress through neutral
+# (its top 4 rows hold one sample more), a clipped none, and a scene change under a display chosen by the script,
+# which holds for every scene, then back to the books' bytes.
+size 96 54
+strata 4
+seed 0
+scene cornell
+frame 16 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+tonemap agx
+exposure 0.5
+frame 16 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+tonemap neutral
+exposure -1
+frame 16 4 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+tonemap none
+exposure 2
+frame 17 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+scene light
+hold 1 +16
+tonemap books
+exposure 0
+hold 1 +4

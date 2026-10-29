@@ -93,6 +93,8 @@ V cornell --quality-kernel --headless -w 16 -s 1
 V --quality-kernel --all-books-kernel --headless -w 16 -s 1
 V --tonemap bogus --headless -w 16 -s 1
 V --exposure 1 --headless -w 16 -s 1
+V --tonemap agx --fp64 --headless -w 16 -s 1
+V --tonemap agx --exposure 25 --headless -w 16 -s 1
 
 # The window's scripts (scripts/verify/cli-scripts): errors found when the script is read or started, before a frame
 V --headless --script scripts\verify\cli-scripts\unknown-scene.txt
@@ -104,3 +106,6 @@ V --headless --script scripts\verify\cli-scripts\later-kernel.txt
 V --headless --script scripts\verify\cli-scripts\no-such-file.txt
 V --headless --script scripts\verify\cli-scripts\gpu-scene.txt -o out\m4\runs\cli-case.pfm
 V --headless --script scripts\verify\cli-scripts\quality-mixture.txt
+V --headless --script scripts\verify\cli-scripts\unknown-tonemap.txt
+V --headless --script scripts\verify\cli-scripts\bad-exposure.txt
+V --headless --script scripts\verify\cli-scripts\fp64-tonemap.txt
