@@ -19,12 +19,14 @@ import constant_medium;
 import hittable;
 import image;
 import instance;
+import gpu_scenes;
 import material;
 import perlin;
 import quad;
 import random;
 import scenes;
 import sphere;
+import strategy_options;
 import texture;
 import vec3;
 import view_options;
@@ -74,6 +76,12 @@ export gpu::camera_desc to_gpu(const camera_frame& frame, sampling_strategy samp
             .sky_bottom = to_gpu(frame.background.bottom),
             .sky_top = to_gpu(frame.background.top),
             .sampling = to_gpu(sampling)};
+}
+
+// The same for a strategy of the GPU programs: the camera's part of it, the books' strategy it samples bounces with
+export gpu::camera_desc to_gpu(const camera_frame& frame, strategy sampling)
+{
+    return to_gpu(frame, entry_of(sampling).books.value_or(sampling_strategy::material));
 }
 
 // Where an object inside instances ends up in the world. The CPU moves every ray into an instance's coordinates and
@@ -521,7 +529,7 @@ export struct scene_overrides
 {
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
-    std::optional<sampling_strategy> sampling;
+    std::optional<strategy> sampling; // a strategy of the GPU programs (strategy_options.ixx)
     view_options view; // the image's height and the camera (view_options.ixx)
     // Rounds of strata (see gpu::session): the side of every pixel's grid of samples. Without it the samples are
     // rounded to one grid, as the books' camera does; with it they are exactly the samples asked for, in rounds of the
@@ -532,20 +540,21 @@ export struct scene_overrides
 // A scene translated for the GPU, and what it was made from
 export struct gpu_build
 {
-    // The CPU's scene, with the overrides in cpu.camera: its strategy is the one asked for, and with strata its
-    // samples_per_pixel is the grid's strata² (the samples are `passes`)
+    // The CPU's scene, with the overrides in cpu.camera: its strategy is the books' part of the one asked for, and
+    // with strata its samples_per_pixel is the grid's strata² (the samples are `passes`)
     scene cpu;
-    camera_frame frame;         // the pixel grid and the lens, as the CPU's camera computes them from cpu.camera
-    sampling_strategy sampling; // the strategy rendered with: the one the CPU would use (effective_sampling)
-    gpu::scene_desc desc;       // the renderer's data, with the lights list for the strategies that aim at it
-    std::int64_t passes;        // how many to render: frame.sqrt_spp², or with strata the samples asked for
+    camera_frame frame;    // the pixel grid and the lens, as the CPU's camera computes them from cpu.camera
+    strategy requested;    // the strategy asked for (-p), or the scene's own
+    strategy sampling;     // the strategy rendered with: as the CPU would (effective_sampling: without lamps, material)
+    gpu::scene_desc desc;  // the renderer's data, with the lights list for the strategies that aim at it
+    std::int64_t passes;   // how many to render: frame.sqrt_spp², or with strata the samples asked for
 };
 
 // Builds the scene called `name` with the CPU's code, applies the overrides and translates it, or says why the GPU
 // can't render it: the whole message, as the programs print it after "Error: ".
 export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view name, const scene_overrides& overrides)
 {
-    const scene_entry* entry = find_scene(name);
+    const gpu_scene_entry* entry = find_gpu_scene(name);
     if (!entry)
     {
         return std::unexpected(std::format("unknown scene '{}'", name));
@@ -565,7 +574,8 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
     // random, a marble texture shuffles its Perlin tables), so a second build in the same process would make another
     // scene. Starting the generator over gives every build the scene of a fresh process, the scene RayTracing renders.
     seed_random(std::mt19937_64::default_seed);
-    scene s = entry->build();
+    gpu_scene_parts parts = entry->build();
+    scene& s = parts.cpu;
     s.camera.image_width = overrides.image_width.value_or(s.camera.image_width);
     s.camera.samples_per_pixel = overrides.samples_per_pixel.value_or(s.camera.samples_per_pixel);
     const int samples = s.camera.samples_per_pixel;
@@ -573,7 +583,11 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
     {
         s.camera.samples_per_pixel = *overrides.strata * *overrides.strata; // the camera's grid: strata × strata
     }
-    s.camera.sampling = overrides.sampling.value_or(s.camera.sampling);
+    // The strategy: the one asked for, or the scene's own (its entry's, else its camera's); the camera renders its
+    // books' part
+    const strategy requested =
+        overrides.sampling.value_or(entry->default_strategy.value_or(from_books(s.camera.sampling)));
+    s.camera.sampling = entry_of(requested).books.value_or(sampling_strategy::material);
     // After the width: an exact height sets the aspect ratio from it
     if (const auto applied = apply(overrides.view, s.camera); !applied)
     {
@@ -604,8 +618,12 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
         desc->lights = std::move(*lights);
     }
     const std::int64_t passes = overrides.strata ? samples : std::int64_t{frame.sqrt_spp} * frame.sqrt_spp;
-    return gpu_build{
-        .cpu = std::move(s), .frame = frame, .sampling = sampling, .desc = std::move(*desc), .passes = passes};
+    return gpu_build{.cpu = std::move(s),
+                     .frame = frame,
+                     .requested = requested,
+                     .sampling = from_books(sampling),
+                     .desc = std::move(*desc),
+                     .passes = passes};
 }
 
 // The renderer's pixels (rows from the top, then r, g, b) in the CPU's image class, so the mean radiance and the saved

@@ -14,8 +14,9 @@ import std;
 import camera;
 import cli;
 import gpu_scene;
+import gpu_scenes;
 import image;
-import scenes;
+import strategy_options;
 import view_options;
 
 // --- The command line ------------------------------------------------------------------------------------------
@@ -31,8 +32,8 @@ struct options
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
     std::optional<int> strata; // rounds of strata × strata: -s is then exact (see gpu::session)
-    std::optional<sampling_strategy> sampling;
-    view_options view; // the camera, if not the scene's own
+    std::optional<strategy> sampling; // a strategy of strategy_options.ixx: the books' four, then the GPU's own
+    view_options view;                // the camera, if not the scene's own
     std::uint32_t seed = 0;
     std::vector<std::filesystem::path> outputs; // one per -o; parse_options adds <scene name>-gpu.png if there is none
     bool fp64 = false;
@@ -46,12 +47,8 @@ void print_usage()
     std::println("Usage: RayTracingGPU [scene] [options]\n\n"
                  "Renders RayTracing's scenes on an NVIDIA graphics card with CUDA.\n\n"
                  "Scenes:");
-    for (const scene_entry& entry : scene_list)
-    {
-        std::println("  {:10} {}", entry.name, entry.description);
-    }
-    std::println(R"(  Default: {}.
-
+    std::print("{}", scenes_usage(default_gpu_scene));
+    std::println(R"(
 Options:
   -w, --width N        image width in pixels (each scene has its own default); the height follows
                        the scene's aspect ratio, unless --height is given
@@ -82,13 +79,8 @@ Options:
   -h, --help           show this help
 
 Sampling (-p):)",
-                 default_gpu_scene, view_usage, max_strata, max_launch_ms, std::numeric_limits<std::uint32_t>::max());
-    for (const sampling_entry& entry : sampling_list)
-    {
-        // camera_settings{} holds the camera's defaults
-        const bool is_default = entry.strategy == camera_settings{}.sampling;
-        std::println("  {:10} {}{}", entry.name, entry.description, is_default ? " (default)" : "");
-    }
+                 view_usage, max_strata, max_launch_ms, std::numeric_limits<std::uint32_t>::max());
+    std::print("{}", strategy_usage());
 }
 
 std::expected<options, std::string> parse_options(std::span<char* const> args)
@@ -113,10 +105,10 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             continue;
         }
 
-        // An argument without a dash is the scene name: any of RayTracing's scenes
+        // An argument without a dash is the scene name: any of the GPU programs' scenes (gpu_scenes.ixx)
         if (!arg.starts_with('-'))
         {
-            if (!find_scene(arg))
+            if (!find_gpu_scene(arg))
             {
                 return std::unexpected(std::format("unknown scene '{}'", arg));
             }
@@ -167,13 +159,13 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         }
         if (is_sampling)
         {
-            // Any of RayTracing's strategy names
-            const auto it = std::ranges::find(sampling_list, value, &sampling_entry::name);
-            if (it == sampling_list.end())
+            // Any of the GPU programs' strategy names (strategy_options.ixx)
+            const strategy_entry* entry = find_strategy(value);
+            if (!entry)
             {
                 return std::unexpected(std::format("unknown sampling strategy '{}'", value));
             }
-            opts.sampling = it->strategy;
+            opts.sampling = entry->value;
             continue;
         }
         if (is_seed)
@@ -268,13 +260,9 @@ int main(int argc, char* argv[])
         return 1;
     }
     const camera_frame& frame = built->frame;
-    const sampling_strategy requested = built->cpu.camera.sampling; // -p, or the scene's own
-    const sampling_strategy sampling = built->sampling;
-
-    // Every sampling_strategy has an entry in sampling_list (see camera.ixx), so find will find it
-    const auto entry = std::ranges::find(sampling_list, sampling, &sampling_entry::strategy);
-    std::println("Scene: {}, sampling: {}{}", opts->scene, entry->name,
-                 sampling != requested ? " (no lights: the sky is the light)" : "");
+    // The strategy rendered with, and whether it isn't the one asked for (-p, or the scene's own)
+    std::println("Scene: {}, sampling: {}{}", opts->scene, strategy_name(built->sampling),
+                 built->sampling != built->requested ? " (no lights: the sky is the light)" : "");
     // The view as options: pasted into a command line, they give this camera again bit for bit (and with the same
     // other options the same image), and they are the place to start from to change it
     std::println("View: {}", format_view(built->cpu.camera, frame.image_height));

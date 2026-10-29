@@ -8,6 +8,7 @@ export module viewer_script;
 import std;
 import camera;
 import cli;
+import strategy_options;
 import vec3;
 import viewer_camera;
 
@@ -53,7 +54,9 @@ export struct set_seed { std::uint32_t seed; };
 export struct set_strata { int strata; };
 export struct set_precision { bool fp64; };
 export struct set_kernel { bool all_books; };
-export struct set_sampling { std::optional<sampling_strategy> strategy; }; // empty: the scene's own
+// empty: the scene's own. The type is written ::strategy: a member may not change what an unqualified name means in its
+// class, and this one is named strategy too.
+export struct set_sampling { std::optional<::strategy> strategy; };
 export struct set_camera { view_change view; };
 export struct focus_at { double x; double y; };
 export struct hold { int frames; std::int64_t passes; };
@@ -288,13 +291,12 @@ std::expected<script_command, std::string> command(std::span<const std::string_v
         {
             return set_sampling{};
         }
-        const auto it = w.size() == 2 ? std::ranges::find(sampling_list, w[1], &sampling_entry::name)
-                                      : sampling_list.end();
-        if (it == sampling_list.end())
+        const strategy_entry* entry = w.size() == 2 ? find_strategy(w[1]) : nullptr;
+        if (!entry)
         {
             return std::unexpected("sampling needs a strategy's name, or scene");
         }
-        return set_sampling{it->strategy};
+        return set_sampling{entry->value};
     }
     if (verb == "camera")
     {
@@ -478,12 +480,11 @@ std::string quoted(const point3& p)
 
 // The settings lines that start a recording, and that follow a change of settings
 export std::string format_settings(std::string_view scene, bool fp64, bool all_books,
-                                   std::optional<sampling_strategy> s, std::uint32_t seed, int strata)
+                                   std::optional<strategy> s, std::uint32_t seed, int strata)
 {
-    const std::string strategy =
-        s ? std::string(std::ranges::find(sampling_list, *s, &sampling_entry::strategy)->name) : std::string("scene");
+    const std::string name = s ? std::string(strategy_name(*s)) : std::string("scene");
     return std::format("scene {}\nprecision {}\nkernel {}\nsampling {}\nseed {}\nstrata {}\n", scene,
-                       fp64 ? "double" : "float", all_books ? "all-books" : "auto", strategy, seed, strata);
+                       fp64 ? "double" : "float", all_books ? "all-books" : "auto", name, seed, strata);
 }
 
 // One frame shown: its view (from the camera's settings) and how far it was rendered

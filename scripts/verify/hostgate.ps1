@@ -120,6 +120,8 @@ function Invoke-Text([string]$exe, [string[]]$arguments, [string]$caseLine) {
     $text += "--- exit code $($p.ExitCode)`n"
     $text = $text -replace "`r`n", "`n"
     $text = $text.Replace($project, "<root>").Replace(($project -replace '\\', '/'), "<root>")
+    # A case that renders a tiny image prints its times: masked
+    $text = $text -replace '(?m), [0-9.]+ s$', '' -replace ', [0-9.]+ million per second', ''
     return $text
 }
 

@@ -94,3 +94,4 @@ V --headless --script scripts\verify\cli-scripts\no-last-frame.txt
 V --headless --script scripts\verify\cli-scripts\later-sampling.txt
 V --headless --script scripts\verify\cli-scripts\later-kernel.txt
 V --headless --script scripts\verify\cli-scripts\no-such-file.txt
+V --headless --script scripts\verify\cli-scripts\gpu-scene.txt -o out\m4\runs\cli-case.pfm

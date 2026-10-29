@@ -1,0 +1,6 @@
+# A scene of the GPU programs' own, which RayTracing doesn't have, with a strategy named: the window accepts the scene
+# in a script, and the command it prints for the image it saves names the strategy (a tiny render of 16×9, 1 pass)
+size 16 9
+scene furnace
+sampling mixture
+hold 1 +1

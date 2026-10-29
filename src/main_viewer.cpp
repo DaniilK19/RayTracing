@@ -22,6 +22,7 @@ import std;
 import camera;
 import cli;
 import gpu_scene;
+import gpu_scenes;
 import hittable;
 import image;
 import interval;
@@ -29,6 +30,7 @@ import material;
 import random;
 import ray;
 import scenes;
+import strategy_options;
 import vec3;
 import view_options;
 import viewer_camera;
@@ -47,7 +49,7 @@ struct options
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
     int strata = default_strata;
-    std::optional<sampling_strategy> sampling;
+    std::optional<strategy> sampling; // strategy_options.ixx
     view_options view;
     std::uint32_t seed = 0;
     bool fp64 = false;
@@ -71,12 +73,8 @@ void print_usage()
                  "Shows RayTracing's scenes in a window, rendered on an NVIDIA graphics card with CUDA: the\n"
                  "image refines while the view stands still. Options as in RayTracingGPU.\n\n"
                  "Scenes:");
-    for (const scene_entry& entry : scene_list)
-    {
-        std::println("  {:10} {}", entry.name, entry.description);
-    }
-    std::println(R"(  Default: {}.
-
+    std::print("{}", scenes_usage(default_viewer_scene));
+    std::println(R"(
 Options:
   -w, --width N        image width in pixels: the window's (default: the scene's aspect ratio at
                        the rows of --height, or at 720 rows made smaller if the screen is); the
@@ -132,8 +130,7 @@ Scripts and measurements (see docs/viewer.md):
       --stats FILE     write a line of numbers per frame to a CSV file
       --refresh-hz N   give a moving view's frames the GPU time of frames at N Hz (for measurements;
                        default: the display's rate; the frames still come at the display's pace))",
-                 default_viewer_scene, view_usage, max_strata, default_strata,
-                 std::numeric_limits<std::uint32_t>::max());
+                 view_usage, max_strata, default_strata, std::numeric_limits<std::uint32_t>::max());
 }
 
 // The options that take a value, besides the view options (is_view_option); the others are flags
@@ -164,7 +161,7 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         }
         if (!arg.starts_with('-'))
         {
-            if (!find_scene(arg))
+            if (!find_gpu_scene(arg))
             {
                 return std::unexpected(std::format("unknown scene '{}'", arg));
             }
@@ -206,12 +203,12 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         }
         else if (arg == "-p" || arg == "--sampling")
         {
-            const auto it = std::ranges::find(sampling_list, value, &sampling_entry::name);
-            if (it == sampling_list.end())
+            const strategy_entry* entry = find_strategy(value);
+            if (!entry)
             {
                 return std::unexpected(std::format("unknown sampling strategy '{}'", value));
             }
-            opts.sampling = it->strategy;
+            opts.sampling = entry->value;
         }
         else if (arg == "--seed")
         {
@@ -392,7 +389,7 @@ struct render_settings
     std::string scene;
     bool fp64 = false;
     bool all_books_kernel = false;
-    std::optional<sampling_strategy> sampling; // empty: the scene's own
+    std::optional<strategy> sampling; // empty: the scene's own
     std::uint32_t seed = 0;
     int strata = default_strata;
     bool operator==(const render_settings&) const = default;
@@ -744,8 +741,7 @@ std::string viewer::gpu_command(std::int64_t passes) const
                                       settings_.strata, settings_.seed);
     if (settings_.sampling)
     {
-        command += std::format(" -p {}",
-                               std::ranges::find(sampling_list, *settings_.sampling, &sampling_entry::strategy)->name);
+        command += std::format(" -p {}", strategy_name(*settings_.sampling));
     }
     if (settings_.fp64)
     {
@@ -951,29 +947,38 @@ void viewer::say(std::string message)
 // The scene's line on the console, at the start and after a switch
 void viewer::print_settings() const
 {
-    const auto entry = std::ranges::find(sampling_list, build_->sampling, &sampling_entry::strategy);
+    const std::string_view sampling = strategy_name(build_->sampling);
     const std::string precision = settings_.fp64 ? "float64" : "float32";
     if (opts_.script)
     {
         // The script decides the frames and the views
-        std::println("Scene: {}, sampling: {}, rounds of {}×{} strata, {}", settings_.scene, entry->name,
+        std::println("Scene: {}, sampling: {}, rounds of {}×{} strata, {}", settings_.scene, sampling,
                      settings_.strata, settings_.strata, precision);
     }
     else
     {
         std::println("Scene: {}, sampling: {}, {} samples per pixel in rounds of {}×{} strata, {}", settings_.scene,
-                     entry->name, target_, settings_.strata, settings_.strata, precision);
+                     sampling, target_, settings_.strata, settings_.strata, precision);
         std::println("View: {}", format_view(settings_for(view_, width_, height_), height_));
     }
 }
 
-// Tab, Shift+Tab: the next or the previous scene (see use_settings), at the window's size
+// Tab, Shift+Tab: the next or the previous scene (see use_settings), at the window's size. It goes through the books'
+// scenes; from a test scene, Tab goes to the first of them and Shift+Tab to the last.
 SDL_AppResult viewer::switch_scene(int step)
 {
-    const auto count = static_cast<int>(scene_list.size());
-    const auto at = std::ranges::find(scene_list, settings_.scene, &scene_entry::name) - scene_list.begin();
+    const auto in_cycle = [](const gpu_scene_entry& e) { return e.role == scene_role::book; };
+    const std::vector<const gpu_scene_entry*> cycle = gpu_scene_list() | std::views::filter(in_cycle) |
+                                                      std::views::transform([](const auto& e) { return &e; }) |
+                                                      std::ranges::to<std::vector>();
+    const auto count = static_cast<std::ptrdiff_t>(cycle.size());
+    std::ptrdiff_t at = std::ranges::find(cycle, settings_.scene, &gpu_scene_entry::name) - cycle.begin();
+    if (at == count)
+    {
+        at = step > 0 ? -1 : count;
+    }
     render_settings next = settings_;
-    next.scene = std::string(scene_list[static_cast<std::size_t>((at + step + count) % count)].name);
+    next.scene = std::string(cycle[static_cast<std::size_t>((at + step + count) % count)]->name);
     return switched(use_settings(next), std::format("can't show {}", next.scene));
 }
 
@@ -1164,7 +1169,7 @@ SDL_AppResult viewer::init()
             const script_command& c = line.command;
             if (const auto* scene = std::get_if<set_scene>(&c))
             {
-                if (!find_scene(scene->name))
+                if (!find_gpu_scene(scene->name))
                 {
                     return fail(std::format("{}: line {}: unknown scene '{}'", to_utf8(*opts_.script), line.line,
                                             scene->name));
@@ -1631,7 +1636,7 @@ std::expected<bool, std::string> viewer::play_next()
         if (std::holds_alternative<set_scene>(line.command))
         {
             const auto* c = &std::get<set_scene>(line.command);
-            if (!find_scene(c->name))
+            if (!find_gpu_scene(c->name))
             {
                 return at(std::format("unknown scene '{}'", c->name));
             }

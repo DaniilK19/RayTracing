@@ -1,0 +1,7 @@
+# Line ends: git's own guess for text, but bash scripts keep LF in every checkout (bash reads a CR at a line's end as
+# part of the command), and images, the GIF and the HDR environment maps are binary: never converted, never diffed.
+*.sh text eol=lf
+*.png binary
+*.jpg binary
+*.gif binary
+*.hdr binary
