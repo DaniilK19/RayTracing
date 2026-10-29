@@ -1,10 +1,11 @@
 // The shadow ray of a light sample: does anything lie between the vertex and the point of the light it aimed at? A
 // question with a yes or no answer, so the search can stop at the first primitive it finds, where closest_hit (bvh.cuh)
 // must look on for a nearer one. An any-hit search: OptiX's OPTIX_RAY_FLAG_TERMINATE_ON_FIRST_HIT does the same on the
-// ray tracing hardware.
+// ray tracing hardware. And if nothing blocks it, how much of the light the smoke and fog on the way let through.
 #pragma once
 
 #include "bvh.cuh"
+#include "constant_medium.cuh"
 #include "quad.cuh"
 #include "sphere.cuh"
 #include "vec3.cuh"
@@ -105,5 +106,61 @@ __device__ inline bool occluded(const bvh_view<float>& tree, const ray<float>& r
         }
     }
     return false;
+}
+
+// The chance that (0.001, t_max) of r crosses every volume of smoke without meeting a particle: the expected value of
+// the kernel's own free-flight test (medium_collision in constant_medium.cuh) over exactly the segment it would test.
+// medium_collision lets a ray pass a medium when neg_inv_density·log(ξ) exceeds the length L of its stretch inside,
+// that is when ξ < e^(−ρL) with the density ρ = −1/neg_inv_density: with probability e^(−ρL) (to the 2^-24 steps of
+// ξ), for each medium on its own, so the chance to pass them all is the product. The path's own ray along the shadow
+// ray would pass with that chance, and so the light the material's ray finds carries the same factor on average: it is
+// common to both techniques, and the weights (mis.cuh) don't change.
+//
+// Computed, not drawn: the drawn test answers 0 or 1, which adds a relative noise of √((1 − T)/T) to every light
+// sample, 23% through the final scene's haze (T ≈ 0.95) and 206% through a block of the smoke scene (T ≈ 0.19); its
+// expected value adds none and draws no random number (Novák et al., "Monte Carlo Methods for Volumetric Light
+// Transport Simulation", Eurographics STAR 2018, section 5.2: the expected-value estimator, against the track-length
+// one).
+//
+// The steps are medium_collision's own: the box test against [0.001, t_max]; the boundary's two crossings with their
+// 0.0001 exit rule (boundary_crossings, a sphere where it is at the ray's time); the segment [max(line_in, 0.001),
+// min(line_out, t_max)], nothing if its start isn't below its end; its length in world units. Every volume is
+// bounded, so the environment's t_max = ∞ ends at the boundary's exit.
+__device__ inline float transmittance(const media_view<float>& media, const ray<float>& r, float t_max)
+{
+    if (media.count == 0)
+    {
+        return 1.0f;
+    }
+    const float t_min = 0.001f;
+    const float inverse_a = 1.0f / r.direction.length_squared();
+    const vec3<float> inverse_direction{safe_inverse(r.direction.x), safe_inverse(r.direction.y),
+                                        safe_inverse(r.direction.z)};
+    const vec3<float> origin_scaled = r.origin * inverse_direction;
+    const float length = sqrt(r.direction.length_squared()); // t counts in lengths of the direction
+    float exponent = 0.0f; // Σ L_k / neg_inv_density_k = −Σ ρ_k·L_k
+    for (int k = 0; k < media.count; ++k)
+    {
+        const medium<float>& m = media.media[k];
+        if (box_entry(m.box_min, m.box_max, inverse_direction, origin_scaled, t_min, t_max) == infinity<float>)
+        {
+            continue;
+        }
+        float line_in;
+        float line_out;
+        if (!boundary_crossings(m, media.boundary_quads, r, inverse_a, line_in, line_out))
+        {
+            continue;
+        }
+        float t_in = fmax(line_in, t_min);
+        const float t_out = fmin(line_out, t_max);
+        if (t_in >= t_out)
+        {
+            continue;
+        }
+        t_in = fmax(t_in, 0.0f); // medium_collision's max(t_in, 0), which t_min already covers
+        exponent += (t_out - t_in) * length / m.neg_inv_density;
+    }
+    return ::expf(exponent); // e^0 = 1 exactly where no volume is crossed
 }
 }

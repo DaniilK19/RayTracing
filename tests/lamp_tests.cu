@@ -10,7 +10,7 @@
 //     heuristic's limits (W1 in the table below);
 //   - the estimator at one vertex against Lambert's polygon formula (1760; Arvo 1995) and a sphere's irradiance
 //     π·L·sin²θmax·cos β (T4);
-//   - the depth and counting rules on a toy scene rendered through gpu::render (T6);
+//   - the depth and counting rules on a toy scene rendered through gpu::render (T6), and through smoke (T6m);
 //   - the shadow ray's any-hit search against a loop over every primitive (T7);
 //   - the media's transmittance against medium_collision's own free flights and against chords in closed form (T5).
 // Each suite has planted faults (X1-X3) that the same checks must reject.
@@ -1537,19 +1537,29 @@ GPU_TEST(lamps, t6)
     const gpu::render_result r[2][3] = {
         {render(2, combinations[0], 7671), render(2, combinations[1], 7672), render(2, combinations[2], 7673)},
         {render(3, combinations[0], 7674), render(3, combinations[1], 7675), render(3, combinations[2], 7676)}};
+    // A second material render per depth, so that nee and mis are each compared with a material image of their own:
+    // with one, a material render far from its mean would show as the same offset in both checks
+    const gpu::render_result second_material[2] = {render(2, combinations[0], 7677), render(3, combinations[0], 7678)};
 
     std::int64_t not_finite = 0;
     std::int64_t values = 0;
+    const auto count_finite = [&](const gpu::render_result& image) {
+        for (const double x : image.pixels)
+        {
+            not_finite += std::isfinite(x) ? 0 : 1;
+        }
+        values += static_cast<std::int64_t>(image.pixels.size());
+    };
     for (const auto& by_depth : r)
     {
         for (const gpu::render_result& image : by_depth)
         {
-            for (const double x : image.pixels)
-            {
-                not_finite += std::isfinite(x) ? 0 : 1;
-            }
-            values += static_cast<std::int64_t>(image.pixels.size());
+            count_finite(image);
         }
+    }
+    for (const gpu::render_result& image : second_material)
+    {
+        count_finite(image);
     }
     ctx.count("t6-finite", not_finite, 0, values);
 
@@ -1561,8 +1571,8 @@ GPU_TEST(lamps, t6)
         {
             const gpu::render_result& image = r[d][k];
             const std::string mode = mode_name(combinations[k]);
-            // T6a: the same expected image as the material's
-            const gpu_test::mean_estimate diff = pixel_difference(material, image);
+            // T6a: the same expected image as the material's (nee against one material render, mis against the other)
+            const gpu_test::mean_estimate diff = pixel_difference(k == 1 ? material : second_material[d], image);
             ctx.mean("t6-" + mode + "-" + depth, diff.mean, diff.standard_error, 0);
             // T6c: one shadow ray per continuation, at every non-delta vertex with rays_left > 1
             const auto rays = static_cast<std::int64_t>(image.rays);
@@ -1588,12 +1598,21 @@ GPU_TEST(lamps, t6)
                          number(static_cast<double>(image.shadow_rays) / camera_rays) + " shadow rays");
         }
     }
+    // nee against mis, the two renders of light samples, at each depth
+    for (int d = 0; d < 2; ++d)
+    {
+        const gpu_test::mean_estimate diff = pixel_difference(r[d][1], r[d][2]);
+        ctx.mean("t6-nee-mis-d" + std::to_string(d + 2), diff.mean, diff.standard_error, 0);
+    }
     // T6b: the power of T6a, made explicit: a light sample at the last vertex would add M_3 − M_2 to N_2
     const gpu_test::mean_estimate power = pixel_difference(r[0][0], r[1][0]);
     const double z = power.mean / power.standard_error;
     ctx.must_reject("t6-power", z, 0, z > 0 ? gpu_test::normal_two_sided_p(z) : 1.0, gpu_test::normal_two_sided_p(8));
     // W2: the material's own samples alone trace no shadow ray
-    ctx.exact("counting-material", static_cast<double>(r[0][0].shadow_rays + r[1][0].shadow_rays), 0, 0);
+    ctx.exact("counting-material",
+              static_cast<double>(r[0][0].shadow_rays + r[1][0].shadow_rays + second_material[0].shadow_rays +
+                                  second_material[1].shadow_rays),
+              0, 0);
 }
 
 // --- T7: occluded against a loop over every primitive ----------------------------------------------------------------
@@ -1882,5 +1901,623 @@ GPU_TEST(lamps, t7)
 {
     test_occluded(ctx, 1, 7681, "t7-occluded-leaf1");
     test_occluded(ctx, 8, 7691, "t7-occluded-leaf8");
+}
+
+// =====================================================================================================================
+// Suite media (Step 77)
+// =====================================================================================================================
+
+// The media of D.md §7, centred on the origin: MS a sphere of radius 2, ρ = 0.5; MSm the same moving by (1, 0, 0); MB
+// the box [−1.5, 1.5] × [−1, 1] × [−2, 2], ρ = 0.3; MR that box turned 30° about y, then 20° about x, ρ = 0.8; MO MS
+// and MB together
+enum class medium_set
+{
+    ms,
+    msm,
+    mb,
+    mr,
+    mo,
+};
+
+gpu::medium_desc sphere_medium(const gpu::vec3d& displacement, int material)
+{
+    gpu::medium_desc m{.boundary = gpu::boundary_shape::sphere, .neg_inv_density = -2, .material = material};
+    m.sphere = {.center = {0, 0, 0}, .radius = 2, .displacement = displacement};
+    return m;
+}
+
+// A box's six faces (the books' box)
+std::vector<gpu::quad_desc> box_quads(const gpu::vec3d& lo, const gpu::vec3d& hi)
+{
+    const double dx = hi.x - lo.x;
+    const double dy = hi.y - lo.y;
+    const double dz = hi.z - lo.z;
+    return {{.q = {lo.x, lo.y, hi.z}, .u = {dx, 0, 0}, .v = {0, dy, 0}},
+            {.q = {hi.x, lo.y, hi.z}, .u = {0, 0, -dz}, .v = {0, dy, 0}},
+            {.q = {hi.x, lo.y, lo.z}, .u = {-dx, 0, 0}, .v = {0, dy, 0}},
+            {.q = {lo.x, lo.y, lo.z}, .u = {0, 0, dz}, .v = {0, dy, 0}},
+            {.q = {lo.x, hi.y, hi.z}, .u = {dx, 0, 0}, .v = {0, 0, -dz}},
+            {.q = {lo.x, lo.y, lo.z}, .u = {dx, 0, 0}, .v = {0, 0, dz}}};
+}
+
+// R_x(x°)·R_y(y°) of a point or a vector
+gpu::vec3d turned(const gpu::vec3d& p, double y_degrees, double x_degrees)
+{
+    const double a = y_degrees * std::numbers::pi / 180;
+    const double b = x_degrees * std::numbers::pi / 180;
+    const gpu::vec3d r{std::cos(a) * p.x + std::sin(a) * p.z, p.y, -std::sin(a) * p.x + std::cos(a) * p.z};
+    return {r.x, std::cos(b) * r.y - std::sin(b) * r.z, std::sin(b) * r.y + std::cos(b) * r.z};
+}
+
+gpu::medium_desc box_medium(double density, bool turn, int material)
+{
+    std::vector<gpu::quad_desc> quads = box_quads({-1.5, -1, -2}, {1.5, 1, 2});
+    if (turn)
+    {
+        for (gpu::quad_desc& q : quads)
+        {
+            q = {.q = turned(q.q, 30, 20), .u = turned(q.u, 30, 20), .v = turned(q.v, 30, 20)};
+        }
+    }
+    return {.boundary = gpu::boundary_shape::convex_quads,
+            .quads = quads,
+            .neg_inv_density = -1 / density,
+            .material = material};
+}
+
+gpu::scene_desc media_scene(medium_set which)
+{
+    gpu::scene_desc s;
+    const int smoke = add_material(s, gpu::material_kind::isotropic, {0.9, 0.9, 0.9});
+    switch (which)
+    {
+    case medium_set::ms:
+        s.media.push_back(sphere_medium({0, 0, 0}, smoke));
+        break;
+    case medium_set::msm:
+        s.media.push_back(sphere_medium({1, 0, 0}, smoke));
+        break;
+    case medium_set::mb:
+        s.media.push_back(box_medium(0.3, false, smoke));
+        break;
+    case medium_set::mr:
+        s.media.push_back(box_medium(0.8, true, smoke));
+        break;
+    case medium_set::mo:
+        s.media.push_back(sphere_medium({0, 0, 0}, smoke));
+        s.media.push_back(box_medium(0.3, false, smoke));
+        break;
+    }
+    return s;
+}
+
+constexpr medium_set medium_sets[] = {medium_set::ms, medium_set::msm, medium_set::mb, medium_set::mr, medium_set::mo};
+const char* const medium_names[] = {"ms", "msm", "mb", "mr", "mo"};
+
+// T5's rays: 60% from 6 away (outside every medium at every time), aimed at a point within 2.5 of the centre, so that
+// most cross; 40% from within 0.9 of the centre (inside every medium); t_max ∞ for half, uniform in (0.5, 10) for the
+// rest; the time uniform in [0, 1)
+struct media_ray
+{
+    gpu::ray<float> r;
+    float t_max;
+    bool inside;
+};
+
+__device__ inline media_ray random_media_ray(gpu::pcg32& rng)
+{
+    media_ray m{};
+    const float time = gpu::random_real<float>(rng);
+    m.inside = gpu::random_real<float>(rng) < 0.4f;
+    vec3<float> origin;
+    vec3<float> direction;
+    if (m.inside)
+    {
+        origin = point_in_ball(rng, {0.0f, 0.0f, 0.0f}, 0.9f);
+        direction = gpu::random_unit_vector<float>(rng);
+    }
+    else
+    {
+        origin = 6.0f * gpu::random_unit_vector<float>(rng);
+        direction = gpu::unit_vector(point_in_ball(rng, {0.0f, 0.0f, 0.0f}, 2.5f) - origin);
+    }
+    m.t_max = gpu::random_real<float>(rng) < 0.5f ? infinite : uniform_in(rng, 0.5f, 10.0f);
+    m.r = {origin, direction, time};
+    return m;
+}
+
+// The oracle: medium_collision for every medium, with numbers of its own each, as closest_event calls it; the ray
+// survives if none collides
+__device__ inline bool survives(const gpu::media_view<float>& media, const gpu::ray<float>& r, float t_max,
+                                gpu::pcg32& rng)
+{
+    const float inverse_a = 1.0f / r.direction.length_squared();
+    const vec3<float> inverse{gpu::safe_inverse(r.direction.x), gpu::safe_inverse(r.direction.y),
+                              gpu::safe_inverse(r.direction.z)};
+    const vec3<float> origin_scaled = r.origin * inverse;
+    bool collided = false;
+    for (int k = 0; k < media.count; ++k)
+    {
+        float t;
+        const bool hit = gpu::medium_collision(media.media[k], media.boundary_quads, r, inverse_a, inverse,
+                                               origin_scaled, 0.001f, t_max, rng, t);
+        collided = collided || hit;
+    }
+    return !collided;
+}
+
+// X3's fault: the chord from where the line enters the volume, behind the origin too (t_in = line_in, no clamp)
+__device__ inline float planted_transmittance(const gpu::medium<float>& m, const gpu::quad<float>* quads,
+                                              const gpu::ray<float>& r, float t_max)
+{
+    float line_in;
+    float line_out;
+    if (!gpu::boundary_crossings(m, quads, r, 1.0f / r.direction.length_squared(), line_in, line_out))
+    {
+        return 1.0f;
+    }
+    const float t_out = fminf(line_out, t_max);
+    if (!(line_in < t_out))
+    {
+        return 1.0f;
+    }
+    return expf((t_out - line_in) * sqrtf(r.direction.length_squared()) / m.neg_inv_density);
+}
+
+// The oracle's chance of surviving one medium, in closed form: the segment exactly as medium_collision makes it
+// (constant_medium.cuh: the box, the boundary's crossings and its 0.0001 rule, the clamps), and e^(−ρ·length)
+__device__ inline double segment_survival(const gpu::medium<float>& m, const gpu::quad<float>* quads,
+                                          const gpu::ray<float>& r, float t_max)
+{
+    const float t_min = 0.001f;
+    const float inverse_a = 1.0f / r.direction.length_squared();
+    const vec3<float> inverse{gpu::safe_inverse(r.direction.x), gpu::safe_inverse(r.direction.y),
+                              gpu::safe_inverse(r.direction.z)};
+    const vec3<float> origin_scaled = r.origin * inverse;
+    if (gpu::box_entry(m.box_min, m.box_max, inverse, origin_scaled, t_min, t_max) == infinite)
+    {
+        return 1;
+    }
+    float line_in;
+    float line_out;
+    if (!gpu::boundary_crossings(m, quads, r, inverse_a, line_in, line_out))
+    {
+        return 1;
+    }
+    float t_in = fmaxf(line_in, t_min);
+    const float t_out = fminf(line_out, t_max);
+    if (t_in >= t_out)
+    {
+        return 1;
+    }
+    t_in = fmaxf(t_in, 0.0f);
+    const float inside = (t_out - t_in) * sqrtf(r.direction.length_squared());
+    return ::exp(double(inside) / double(m.neg_inv_density));
+}
+
+// T5: Σ(survived − T), Σ T(1 − T): z = the first / √(the second)
+struct t5_ray
+{
+    gpu::media_view<float> media;
+    bool planted; // X3: the inside rays' T without the t_min clamp (MS)
+    __device__ void operator()(gpu::pcg32& rng, double* sums) const
+    {
+        const media_ray m = random_media_ray(rng);
+        float t = gpu::transmittance(media, m.r, m.t_max);
+        if (planted && m.inside)
+        {
+            t = planted_transmittance(media.media[0], media.boundary_quads, m.r, m.t_max);
+        }
+        const bool survived = survives(media, m.r, m.t_max, rng);
+        sums[0] += (survived ? 1.0 : 0.0) - t;
+        sums[1] += double(t) * (1.0 - t);
+    }
+};
+
+// --- T5b: chords in closed form --------------------------------------------------------------------------------------
+
+struct chord_case
+{
+    gpu::ray<float> r;
+    float t_max;
+};
+
+struct transmittance_of
+{
+    gpu::media_view<float> media;
+    const chord_case* cases;
+    __device__ float operator()(int i) const { return gpu::transmittance(media, cases[i].r, cases[i].t_max); }
+};
+
+GPU_TEST(media, chord)
+{
+    const gpu_test::device_scene ms(media_scene(medium_set::ms));
+    constexpr double rho = 0.5;
+    constexpr double radius = 2;
+    struct expectation
+    {
+        std::string name;
+        double value;
+        double tolerance; // relative; 0: exactly
+    };
+    std::vector<chord_case> cases;
+    std::vector<expectation> expected;
+    // From (−10, b, 0) along +x through the whole sphere: T = exp(−ρ·2√(R² − b²)), b as the GPU has it
+    const std::pair<double, const char*> impacts[] = {{0, "chord-b0"},        {0.25, "chord-b0.25R"},
+                                                      {0.5, "chord-b0.5R"},   {0.75, "chord-b0.75R"},
+                                                      {0.95, "chord-b0.95R"}, {0.995, "chord-b0.995R"}};
+    for (const auto& [fraction, name] : impacts)
+    {
+        const float b = static_cast<float>(fraction * radius);
+        cases.push_back({{{-10.0f, b, 0.0f}, {1.0f, 0.0f, 0.0f}}, infinite});
+        expected.push_back({name, std::exp(-rho * 2 * std::sqrt(radius * radius - double(b) * b)), 1e-5});
+    }
+    cases.push_back({{{-10.0f, static_cast<float>(1.001 * radius), 0.0f}, {1.0f, 0.0f, 0.0f}}, infinite});
+    expected.push_back({"chord-miss", 1, 0});
+    // From the centre outward: the segment starts at t_min = 0.001
+    cases.push_back({{{0.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}}, infinite});
+    expected.push_back({"chord-from-centre", std::exp(-rho * (radius - 0.001)), 1e-5});
+    // From outside, stopping at the centre (t_max = 10)
+    cases.push_back({{{-10.0f, 0.0f, 0.0f}, {1.0f, 0.0f, 0.0f}}, 10.0f});
+    expected.push_back({"chord-to-centre", std::exp(-rho * radius), 1e-5});
+    // Directions that aren't unit (the camera's rays aren't): t counts lengths of d, the chord stays the world's
+    cases.push_back({{{-10.0f, 0.0f, 0.0f}, {2.0f, 0.0f, 0.0f}}, infinite});
+    expected.push_back({"chord-long-direction", std::exp(-rho * 2 * radius), 1e-5});
+    cases.push_back({{{-10.0f, 0.0f, 0.0f}, {0.5f, 0.0f, 0.0f}}, 20.0f});
+    expected.push_back({"chord-short-direction-to-centre", std::exp(-rho * radius), 1e-5});
+
+    const gpu_test::device_buffer<chord_case> device_cases(cases);
+    const std::vector<float> t =
+        device_map<float>(transmittance_of{ms.view().media, device_cases.get()}, static_cast<int>(cases.size()));
+    for (std::size_t i = 0; i < cases.size(); ++i)
+    {
+        if (expected[i].tolerance == 0)
+        {
+            ctx.exact(expected[i].name, t[i], expected[i].value, 0);
+        }
+        else
+        {
+            ctx.exact(expected[i].name, t[i] / expected[i].value, 1, expected[i].tolerance);
+        }
+    }
+}
+
+// --- T5c: the limits -------------------------------------------------------------------------------------------------
+
+// Rays that meet no medium: from 8 away going away, or toward the media but ending at least 3.5 from the centre (every
+// medium lies within 3 of it at every time)
+struct t5c_clear
+{
+    gpu::media_view<float> media;
+    __device__ void operator()(gpu::pcg32& rng, unsigned long long* tally) const
+    {
+        const float time = gpu::random_real<float>(rng);
+        const vec3<float> origin = 8.0f * gpu::random_unit_vector<float>(rng);
+        vec3<float> d;
+        float t_max;
+        if (gpu::random_real<float>(rng) < 0.5f)
+        {
+            d = gpu::random_unit_vector<float>(rng);
+            if (gpu::dot(d, origin) < 0.0f)
+            {
+                d = -d;
+            }
+            t_max = gpu::random_real<float>(rng) < 0.5f ? infinite : uniform_in(rng, 0.5f, 10.0f);
+        }
+        else
+        {
+            d = gpu::unit_vector(point_in_ball(rng, {0.0f, 0.0f, 0.0f}, 2.0f) - origin);
+            t_max = uniform_in(rng, 0.5f, 4.5f);
+        }
+        const gpu::ray<float> r{origin, d, time};
+        ++tally[0];
+        if (!(gpu::transmittance(media, r, t_max) == 1.0f))
+        {
+            ++tally[1];
+        }
+    }
+};
+
+// T ∈ (0, 1] on T5's rays
+struct t5c_range
+{
+    gpu::media_view<float> media;
+    __device__ void operator()(gpu::pcg32& rng, unsigned long long* tally) const
+    {
+        const media_ray m = random_media_ray(rng);
+        const float t = gpu::transmittance(media, m.r, m.t_max);
+        ++tally[0];
+        if (!(t > 0.0f && t <= 1.0f))
+        {
+            ++tally[1];
+        }
+    }
+};
+
+// MO's T is MS's times MB's: the media are independent
+struct t5c_overlap
+{
+    gpu::media_view<float> ms;
+    gpu::media_view<float> mb;
+    gpu::media_view<float> mo;
+    __device__ void operator()(gpu::pcg32& rng, unsigned long long* tally) const
+    {
+        const media_ray m = random_media_ray(rng);
+        const double both = gpu::transmittance(mo, m.r, m.t_max);
+        const double product = double(gpu::transmittance(ms, m.r, m.t_max)) * gpu::transmittance(mb, m.r, m.t_max);
+        ++tally[0];
+        if (!(::fabs(both - product) <= 1e-6 * product))
+        {
+            ++tally[1];
+        }
+    }
+};
+
+GPU_TEST(media, limits)
+{
+    const std::int64_t n = ctx.samples(full_samples);
+    std::array<std::int64_t, 2> clear{};
+    std::array<std::int64_t, 2> range{};
+    for (int k = 0; k < 5; ++k)
+    {
+        const gpu_test::device_scene scene(media_scene(medium_sets[k]));
+        add(clear, device_tally<2>(t5c_clear{scene.view().media}, 7711 + static_cast<std::uint64_t>(k), n));
+        add(range, device_tally<2>(t5c_range{scene.view().media}, 7716 + static_cast<std::uint64_t>(k), n));
+    }
+    ctx.count("limits-clear", clear[1], 0, clear[0]);
+    ctx.count("limits-range", range[1], 0, range[0]);
+    const gpu_test::device_scene ms(media_scene(medium_set::ms));
+    const gpu_test::device_scene mb(media_scene(medium_set::mb));
+    const gpu_test::device_scene mo(media_scene(medium_set::mo));
+    const auto overlap =
+        device_tally<2>(t5c_overlap{ms.view().media, mb.view().media, mo.view().media}, 7721, n);
+    ctx.count("limits-overlap", overlap[1], 0, overlap[0]);
+}
+
+// --- T5d: at the boundary's 0.0001 rule ------------------------------------------------------------------------------
+
+// MS rays passing b = R(1 − δ) from the centre, δ log-uniform in [10^-8, 10^-4], along an axis (±x, ±y, ±z): then
+// |d|² = 1 and d·oc are exact however nvcc fuses them, and transmittance and the oracle get the same roots, bit for bit
+struct t5d_ray
+{
+    gpu::media_view<float> media;
+    __device__ void operator()(gpu::pcg32& rng, unsigned long long* tally) const
+    {
+        const int axis = ::min(static_cast<int>(gpu::random_real<float>(rng) * 6.0f), 5);
+        const float sign = axis % 2 == 0 ? 1.0f : -1.0f;
+        vec3<float> d{};
+        vec3<float> e1{};
+        vec3<float> e2{};
+        switch (axis / 2)
+        {
+        case 0:
+            d = {sign, 0.0f, 0.0f};
+            e1 = {0.0f, 1.0f, 0.0f};
+            e2 = {0.0f, 0.0f, 1.0f};
+            break;
+        case 1:
+            d = {0.0f, sign, 0.0f};
+            e1 = {0.0f, 0.0f, 1.0f};
+            e2 = {1.0f, 0.0f, 0.0f};
+            break;
+        default:
+            d = {0.0f, 0.0f, sign};
+            e1 = {1.0f, 0.0f, 0.0f};
+            e2 = {0.0f, 1.0f, 0.0f};
+            break;
+        }
+        const float delta = 1e-8f * expf(gpu::random_real<float>(rng) * logf(1e4f));
+        const float b = 2.0f * (1.0f - delta);
+        float s;
+        float c;
+        sincospif(2.0f * gpu::random_real<float>(rng), &s, &c);
+        const gpu::ray<float> r{-10.0f * d + (b * c) * e1 + (b * s) * e2, d};
+        const double t = gpu::transmittance(media, r, infinite);
+        const double expected = segment_survival(media.media[0], media.boundary_quads, r, infinite);
+        ++tally[0];
+        if (!(::fabs(t - expected) <= 1e-5 * expected))
+        {
+            ++tally[1];
+        }
+        tally[2] += expected < 1 ? 1 : 0; // the rule kept a chord
+    }
+};
+
+GPU_TEST(media, grazing)
+{
+    const gpu_test::device_scene ms(media_scene(medium_set::ms));
+    const auto t = device_tally<3>(t5d_ray{ms.view().media}, 7731, ctx.samples(full_samples));
+    ctx.count("grazing", t[1], 0, t[0]);
+    ctx.info("grazing-chords", std::to_string(t[2]) + " of " + std::to_string(t[0]) +
+                                   " rays kept a chord, the others none");
+}
+
+// --- T5 and X3 -------------------------------------------------------------------------------------------------------
+
+GPU_TEST(media, t5)
+{
+    const std::int64_t n = ctx.samples(full_samples);
+    const auto rays = static_cast<double>(gpu_test::drawn(n));
+    for (int k = 0; k < 5; ++k)
+    {
+        const gpu_test::device_scene scene(media_scene(medium_sets[k]));
+        const auto s = device_sums<2>(t5_ray{scene.view().media, false}, 7701 + static_cast<std::uint64_t>(k), n);
+        // z = Σ(survived − T) / √(Σ T(1 − T)), as a mean of survived − T with its standard error
+        ctx.mean(std::string("t5-") + medium_names[k], s[0] / rays, std::sqrt(s[1]) / rays, 0);
+    }
+    const gpu_test::device_scene ms(media_scene(medium_set::ms));
+    const auto planted = device_sums<2>(t5_ray{ms.view().media, true}, 7706, n);
+    const double z = planted[0] / std::sqrt(planted[1]);
+    ctx.must_reject("planted-tmin", z, 0, gpu_test::normal_two_sided_p(z), gpu_test::normal_two_sided_p(8));
+}
+
+// --- T3p: particles take light samples -------------------------------------------------------------------------------
+
+GPU_TEST(media, particles)
+{
+    // light's two lamps (pmf ½) and the smoke MS around the points
+    gpu::scene_desc s = light_setup();
+    const int smoke = add_material(s, gpu::material_kind::isotropic, {0.9, 0.9, 0.9});
+    s.media.push_back(sphere_medium({0, 0, 0}, smoke));
+    const lamp_scene lamps(s, false);
+    const std::int64_t n = ctx.samples(full_samples);
+    const auto total = test_weights(lamps, 2, 1, true, 7741, n);
+    std::int64_t pdf = 0;
+    for (int k = 0; k < 2; ++k)
+    {
+        const auto& t = total[static_cast<std::size_t>(k)];
+        const std::string name = std::string("t3-particles-") + (k == 0 ? "nee" : "mis");
+        ctx.count(name, t[t3_wrong], 0, t[t3_tested]);
+        ctx.info(name + "-tested", std::to_string(t[t3_tested]) + " directions from both techniques");
+        pdf += t[t3_pdf];
+    }
+    ctx.count("t3-particles-pdf", pdf, 0, 4 * gpu_test::drawn(n));
+}
+
+// --- T5v: the shadow ray through smoke -------------------------------------------------------------------------------
+
+struct t5v_ray
+{
+    gpu::quality_view v;
+    gpu::quad<float> wall;
+    int wall_id;
+    __device__ void operator()(gpu::pcg32& rng, unsigned long long* tally) const
+    {
+        // From x = −5 toward the wall at x = 3, through the smoke, hitting the wall far from its edges
+        const float y = uniform_in(rng, -0.5f, 0.5f);
+        const float z = uniform_in(rng, -0.5f, 0.5f);
+        const float dy = uniform_in(rng, -0.1f, 0.1f);
+        const float dz = uniform_in(rng, -0.1f, 0.1f);
+        const gpu::ray<float> r{{-5.0f, y, z}, gpu::unit_vector(vec3<float>{1.0f, dy, dz})};
+        const float t_max = uniform_in(rng, 0.5f, 16.0f);
+        const int skip = gpu::random_real<float>(rng) < 0.3f ? wall_id : -1;
+        float t;
+        bool front;
+        const bool on_wall = gpu::hit_quad(wall, r, 0.001f, infinite, t, front);
+        if (on_wall && fabsf(t - t_max) <= 1e-3f * t_max)
+        {
+            return; // too close to call
+        }
+        ++tally[0];
+        const bool blocked = skip != wall_id && on_wall && t <= t_max;
+        const gpu::bvh_tracer tracer{v};
+        const float visible = tracer.visibility(r, gpu::spawn{-1, false}, t_max, skip);
+        const float expected = blocked ? 0.0f : gpu::transmittance(v.base.media, r, t_max);
+        const bool ok = blocked ? visible == 0.0f : fabsf(visible - expected) <= 1e-6f * expected;
+        if (!ok)
+        {
+            ++tally[1];
+        }
+        tally[2] += !blocked && expected < 1.0f ? 1 : 0; // unblocked through the smoke: T itself is checked
+    }
+};
+
+GPU_TEST(media, visibility)
+{
+    gpu::scene_desc s;
+    const int smoke = add_material(s, gpu::material_kind::isotropic, {0.9, 0.9, 0.9});
+    const int matte = add_material(s, gpu::material_kind::lambertian, {0.5, 0.5, 0.5});
+    const gpu::quad_desc wall{.q = {3, -3, -3}, .u = {0, 6, 0}, .v = {0, 0, 6}, .material = matte};
+    s.quads.push_back(wall);
+    s.media.push_back(sphere_medium({0, 0, 0}, smoke));
+    const gpu_test::device_scene scene(s);
+    gpu::quality_view v{};
+    v.base = scene.view();
+    v.microfacets = nullptr;
+    v.lamps = {};
+    v.environment = {};
+    v.light_pmf = 0;
+    v.combination = light_combination::power_heuristic;
+    const auto t = device_tally<3>(t5v_ray{v, gpu::make_quad<float>(wall), scene.quad_ids()[0]}, 7751, 10'000);
+    ctx.count("visibility", t[1], 0, t[0]);
+    ctx.info("visibility-through-smoke", std::to_string(t[2]) + " of " + std::to_string(t[0]) +
+                                             " rays unblocked through the smoke");
+}
+
+// --- T6m: the integrator through smoke -------------------------------------------------------------------------------
+
+// T6's toy scene with a box of smoke between the lamp and the floor, of density 1.5 (a ray across it keeps about a
+// fifth of its light): particles take light samples, their shadow rays cross the smoke, and with a black smoke the
+// paths that enter it end at zero throughput under nee and mis while -p material's go on carrying nothing
+gpu::scene_desc toy_scene_with_smoke(int depth, light_combination c, double albedo, int size, int sqrt_spp)
+{
+    gpu::scene_desc s = toy_scene(depth, c, size, sqrt_spp);
+    const int smoke = add_material(s, gpu::material_kind::isotropic, {albedo, albedo, albedo});
+    s.media.push_back({.boundary = gpu::boundary_shape::convex_quads,
+                       .quads = box_quads({-0.5, 0.2, -0.6}, {0.5, 1.2, 0.4}),
+                       .neg_inv_density = -1 / 1.5,
+                       .material = smoke});
+    return s;
+}
+
+// T6a, T6c and T6d through trace_quality_ray with media: nee and mis against two material renders of their own, the
+// counting rule (one shadow ray per continuation: none from a black particle, whose path ends), and the same rays per
+// sample as the material's in the grey smoke
+GPU_TEST(media, integrator)
+{
+    const bool quick = ctx.quick();
+    const int size = quick ? 32 : 64;
+    const int sqrt_spp = quick ? 2 : 16;
+    const std::int64_t camera_rays = static_cast<std::int64_t>(size) * size * sqrt_spp * sqrt_spp;
+    struct smoke_case
+    {
+        double albedo;
+        const char* name;
+    };
+    const smoke_case smokes[] = {{0.9, "grey"}, {0.0, "black"}};
+    std::uint64_t seed = 7760;
+    std::int64_t not_finite = 0;
+    std::int64_t values = 0;
+    std::int64_t material_shadow_rays = 0;
+    for (const smoke_case& smoke : smokes)
+    {
+        for (int depth = 2; depth <= 3; ++depth)
+        {
+            const auto render = [&](light_combination c) {
+                return gpu::render(toy_scene_with_smoke(depth, c, smoke.albedo, size, sqrt_spp),
+                                   {.seed = seed++, .quality_kernel = true});
+            };
+            const gpu::render_result material[2] = {render(light_combination::bsdf_only),
+                                                    render(light_combination::bsdf_only)};
+            const gpu::render_result sampled[2] = {render(light_combination::lights_only),
+                                                   render(light_combination::power_heuristic)};
+            for (const gpu::render_result* image : {&material[0], &material[1], &sampled[0], &sampled[1]})
+            {
+                for (const double x : image->pixels)
+                {
+                    not_finite += std::isfinite(x) ? 0 : 1;
+                }
+                values += static_cast<std::int64_t>(image->pixels.size());
+            }
+            material_shadow_rays += static_cast<std::int64_t>(material[0].shadow_rays + material[1].shadow_rays);
+            const std::string tag = std::string(smoke.name) + "-d" + std::to_string(depth);
+            for (int k = 0; k < 2; ++k)
+            {
+                const gpu::render_result& image = sampled[k];
+                const std::string mode = mode_name(k == 0 ? light_combination::lights_only
+                                                          : light_combination::power_heuristic);
+                const gpu_test::mean_estimate diff = pixel_difference(material[k], image);
+                ctx.mean("t6m-" + mode + "-" + tag, diff.mean, diff.standard_error, 0);
+                const auto rays = static_cast<std::int64_t>(image.rays);
+                const auto shadow = static_cast<std::int64_t>(image.shadow_rays);
+                const std::int64_t continuations = rays - camera_rays;
+                ctx.count("t6m-counting-" + tag + "-" + mode,
+                          shadow > continuations ? shadow - continuations : continuations - shadow,
+                          std::max<std::int64_t>(2, static_cast<std::int64_t>(1e-4 * static_cast<double>(camera_rays))),
+                          camera_rays);
+                const double ratio = static_cast<double>(image.rays) / static_cast<double>(material[k].rays);
+                if (smoke.albedo > 0 && !quick)
+                {
+                    ctx.exact("t6m-rays-" + tag + "-" + mode, ratio, 1, 0.002);
+                }
+                else
+                {
+                    ctx.info("t6m-rays-" + tag + "-" + mode, "rays per sample / material's = " + number(ratio));
+                }
+            }
+        }
+    }
+    ctx.count("t6m-finite", not_finite, 0, values);
+    ctx.exact("t6m-counting-material", static_cast<double>(material_shadow_rays), 0, 0);
 }
 }

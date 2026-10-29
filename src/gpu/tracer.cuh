@@ -47,11 +47,15 @@ struct bvh_tracer
     }
 
     // Whether anything blocks (0.001, t_max) of r, the primitive `skip` aside, and if not, the share of light the media
-    // let through: the shadow ray of a light sample (shadow.cuh). The light samples don't reach into smoke and fog
-    // yet (renderer.cu refuses them there): nothing blocked is 1.
+    // let through: the shadow ray of a light sample (shadow.cuh). The volumes are tested only if no surface blocks the
+    // ray: they aren't the BVH's, and an OptiX tracer would keep them outside its acceleration structure too.
     __device__ float visibility(const ray<float>& r, spawn s, float t_max, int skip) const
     {
-        return occluded(view.base.tree, r, t_max, s.from, s.inward, skip) ? 0.0f : 1.0f;
+        if (occluded(view.base.tree, r, t_max, s.from, s.inward, skip))
+        {
+            return 0.0f;
+        }
+        return transmittance(view.base.media, r, t_max);
     }
 };
 static_assert(tracer<bvh_tracer>);

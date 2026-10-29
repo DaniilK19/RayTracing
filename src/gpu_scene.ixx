@@ -628,10 +628,6 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
     if ((requested == strategy::nee || requested == strategy::mis) &&
         (gpu::count_lamps(*desc) > 0 || desc->quality.environment))
     {
-        if (!desc->media.empty())
-        {
-            return std::unexpected(std::format("-p {} doesn't render smoke and fog yet", strategy_name(requested)));
-        }
         desc->quality.combination = requested == strategy::nee ? gpu::light_combination::lights_only
                                                                : gpu::light_combination::power_heuristic;
         rendered = requested;

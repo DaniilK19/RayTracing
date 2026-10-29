@@ -126,15 +126,16 @@ __device__ bool trace_quality_ray(quality_path& q, const T& tracer, const qualit
 
     const microfacet* side = view.microfacets ? &view.microfacets[s.material] : nullptr;
     const bsdf b = make_bsdf(mat, side, c, s.rec, p.r.direction);
-    // A light sample here? Not under -p material, not where the material has no density (a delta vertex: no light
-    // sample could ever find the one direction it reflects into), and not from a particle of smoke, which waits for the
-    // shadow rays' transmittance through the volumes (renderer.cu refuses smoke and fog under -p nee and -p mis until
-    // then). The depth rule: a light sample stands for the next ray, a path one ray longer, so it is taken only where
-    // the path may still trace one, rays_left > 1 before the decrement below (the books' counting). A light sample at
-    // the last vertex would add paths of max_depth + 1 rays, which -p material never traces, and the strategies would
-    // no longer converge to the same image.
+    // A light sample here? Not under -p material, and not where the material has no density (a delta vertex: no light
+    // sample could ever find the one direction it reflects into). A particle of smoke takes one too, with its phase
+    // function albedo/(4π) for f, where the books' mixture keeps a particle's own samples (isotropic::mixes_in_lights
+    // is false): a choice of noise, the same expected image, and thin haze gets its light from the lamps at every
+    // particle. The depth rule: a light sample stands for the next ray, a path one ray longer, so it is taken only
+    // where the path may still trace one, rays_left > 1 before the decrement below (the books' counting). A light
+    // sample at the last vertex would add paths of max_depth + 1 rays, which -p material never traces, and the
+    // strategies would no longer converge to the same image.
     const bool nee = view.combination != light_combination::bsdf_only && p.rays_left > 1 && !is_delta(b) &&
-                     b.kind != lobe::isotropic && light_count(view) > 0 && largest_channel(p.throughput) > 0.0f;
+                     light_count(view) > 0 && largest_channel(p.throughput) > 0.0f;
     light_sample ls;
     color<float> contribution{};
     const bool lit = nee && light_contribution(view, b, p.throughput, s.rec.p, rng, ls, contribution);
@@ -147,8 +148,9 @@ __device__ bool trace_quality_ray(quality_path& q, const T& tracer, const qualit
     if (lit)
     {
         // From the vertex as the path's next ray leaves it (the self-intersection rules of closest_hit: the primitive
-        // it leaves, and whether it goes into that sphere), at the path's time, so a moving sphere is where the path
-        // saw it; up to the sampled point of the light, the lamp itself skipped
+        // it leaves, and whether it goes into that sphere; a particle leaves none, and its outward normal is 0), at
+        // the path's time, so a moving sphere or boundary is where the path saw it; up to the sampled point of the
+        // light, the lamp itself skipped; through the smoke and fog on the way (bvh_tracer::visibility)
         ++shadow_rays;
         const ray<float> shadow{s.rec.p, ls.wi, p.r.time};
         const float visible =
@@ -163,6 +165,16 @@ __device__ bool trace_quality_ray(quality_path& q, const T& tracer, const qualit
     p.throughput *= next.weight;
     q.bsdf_pdf = nee ? next.pdf : 0.0f;
     q.specular = next.delta;
+    // A path whose throughput is exactly 0 can't find any more light: a particle of the smoke scene's black block, of
+    // albedo 0. Under -p nee and -p mis it ends here, with the same image and fewer rays (the particle's light sample,
+    // whose f is 0 too, traced no shadow ray). -p material traces on, as the books' kernels do, so its rays per sample
+    // stay theirs.
+    if (view.combination != light_combination::bsdf_only && p.throughput.x == 0.0f && p.throughput.y == 0.0f &&
+        p.throughput.z == 0.0f)
+    {
+        sample = q.radiance;
+        return true;
+    }
     if (--p.rays_left == 0)
     {
         sample = q.radiance; // the path may trace no more rays (the CPU's depth reached 0)
