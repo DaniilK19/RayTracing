@@ -317,6 +317,11 @@ struct scene_desc
     quality_desc quality;           // empty for the books' scenes; a scene that needs it renders with the quality kernel
 };
 
+// How many lamps the quality kernel's light set holds in the scene (lamp_table.cu): its quads and its spheres that
+// stand still whose material is diffuse_light with one solid color. -p nee and -p mis fall back to -p material in a
+// scene with none and no environment map, as the books' strategies that aim at lamps do without a lights list.
+int count_lamps(const scene_desc& scene);
+
 // The number type the GPU computes with. A GeForce card does arithmetic on 32-bit floats about
 // 64 times as fast as on the 64-bit doubles the CPU ray tracer uses, so float32 is the GPU's natural choice and
 // float64 is there to compare with.

@@ -816,10 +816,16 @@ void validate(const scene_desc& scene)
 
     // The quality kernel's own data (scene_desc::quality)
     const quality_desc& quality = scene.quality;
-    // --- light sampling (track D): the combinations beyond the material's own samples come with the light samples
-    if (quality.combination != light_combination::bsdf_only)
+    // --- light sampling (track D): one of the three combinations. Their shadow rays don't see smoke and fog yet: they
+    // would pass through a volume as if it were empty, and its particles take no light samples.
+    if (quality.combination != light_combination::bsdf_only && quality.combination != light_combination::lights_only &&
+        quality.combination != light_combination::power_heuristic)
     {
-        throw std::runtime_error("light sampling isn't implemented yet");
+        throw std::runtime_error("unknown light combination");
+    }
+    if (quality.combination != light_combination::bsdf_only && !scene.media.empty())
+    {
+        throw std::runtime_error("light samples don't pass through smoke and fog yet");
     }
     // --- microfacets (track B): one side entry per material, or none
     if (!quality.microfacets.empty())

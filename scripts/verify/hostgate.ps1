@@ -333,7 +333,8 @@ if (Test-Path -LiteralPath (Join-Path $project $toneScript)) {
         else {
             Compare-Object -ReferenceObject @($tonePrevious -split "`n") -DifferenceObject @($toneText -split "`n") `
                 -CaseSensitive | Select-Object -First 40 | ForEach-Object {
-                    Write-Output ("  {0} {1}" -f $(if ($_.SideIndicator -eq "=>") { "+" } else { "-" }), $_.InputObject) }
+                    $sign = if ($_.SideIndicator -eq "=>") { "+" } else { "-" }
+                    Write-Output ("  {0} {1}" -f $sign, $_.InputObject) }
         }
         $failures++
     }

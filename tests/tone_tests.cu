@@ -1578,7 +1578,7 @@ GPU_TEST(tone, reference_bytes)
 }
 }
 
-// --- Step criteria (A.md §7, run by Claude; gates F, SASS, HOST, CARRY as final.md B) --------------------------------
+// --- Step criteria (A.md §7; gates F, SASS, HOST, CARRY as final.md B) -----------------------------------------------
 // Step 74 (tone_map_kernel new; quality_kernel identical to Step 73's by --prev):
 //   1. $GT tone: exit 0 (T1-T18).
 //   2. $G cornell -w 160 -s 16 --seed 3 -o a.png -o a.pfm, and the same with --tonemap books: both files identical

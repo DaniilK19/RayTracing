@@ -8,6 +8,7 @@
 
 #include "camera.cuh"
 #include "quality_view.cuh"
+#include "shadow.cuh"
 
 namespace gpu
 {
@@ -46,10 +47,11 @@ struct bvh_tracer
     }
 
     // Whether anything blocks (0.001, t_max) of r, the primitive `skip` aside, and if not, the share of light the media
-    // let through: the shadow ray of a light sample. A stub until the light samples come (no light is sampled yet).
-    __device__ float visibility(const ray<float>& /*r*/, spawn /*s*/, float /*t_max*/, int /*skip*/) const
+    // let through: the shadow ray of a light sample (shadow.cuh). The light samples don't reach into smoke and fog
+    // yet (renderer.cu refuses them there): nothing blocked is 1.
+    __device__ float visibility(const ray<float>& r, spawn s, float t_max, int skip) const
     {
-        return 0.0f;
+        return occluded(view.base.tree, r, t_max, s.from, s.inward, skip) ? 0.0f : 1.0f;
     }
 };
 static_assert(tracer<bvh_tracer>);

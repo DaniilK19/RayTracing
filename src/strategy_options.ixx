@@ -16,6 +16,8 @@ export enum class strategy
     material,
     lights,
     mixture,
+    nee, // the quality kernel's light samples: next-event estimation
+    mis, // light samples and the material's own, by multiple importance sampling
 };
 
 export struct strategy_entry
@@ -46,6 +48,11 @@ export constexpr std::array strategy_list{
     books_entry(strategy::material, sampling_strategy::material),
     books_entry(strategy::lights, sampling_strategy::lights),
     books_entry(strategy::mixture, sampling_strategy::mixture),
+    strategy_entry{"nee", strategy::nee, "a shadow ray to a light at every bounce; the quality kernel, float",
+                   std::nullopt},
+    strategy_entry{"mis", strategy::mis,
+                   "shadow rays and the material's samples, weighed: low noise; the quality kernel, float",
+                   std::nullopt},
 };
 
 // The entry of a name, or nullptr

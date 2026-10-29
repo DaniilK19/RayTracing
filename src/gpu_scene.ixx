@@ -618,12 +618,30 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
         }
         desc->lights = std::move(*lights);
     }
+    // The quality kernel's light samples (-p nee, -p mis): a combination of its own, while its camera samples bounces
+    // as the material scatters (the books' part of the strategy, above). A scene with no lamp of the light set
+    // (gpu/lamps.cuh) and no environment map has nothing to sample: it renders as -p material, with RayTracing's note,
+    // in the kernel the scene picks, as the CPU's effective_sampling falls back from lights and mixture without a
+    // lights list. (The scene's environment map must be in desc->quality by here, so that a scene lit by the sky alone
+    // samples it.)
+    strategy rendered = from_books(sampling);
+    if ((requested == strategy::nee || requested == strategy::mis) &&
+        (gpu::count_lamps(*desc) > 0 || desc->quality.environment))
+    {
+        if (!desc->media.empty())
+        {
+            return std::unexpected(std::format("-p {} doesn't render smoke and fog yet", strategy_name(requested)));
+        }
+        desc->quality.combination = requested == strategy::nee ? gpu::light_combination::lights_only
+                                                               : gpu::light_combination::power_heuristic;
+        rendered = requested;
+    }
     const std::int64_t passes = overrides.strata ? samples : std::int64_t{frame.sqrt_spp} * frame.sqrt_spp;
     return gpu_build{.cpu = std::move(s),
                      .frame = frame,
                      .requested = requested,
                      .sampling_given = overrides.sampling.has_value(),
-                     .sampling = from_books(sampling),
+                     .sampling = rendered,
                      .desc = std::move(*desc),
                      .passes = passes};
 }

@@ -74,6 +74,9 @@ V --script script.txt --input input.txt
 G -p nee -w 16 -s 1 -o out\m4\runs\cli-case.png
 G -p mis -w 16 -s 1 -o out\m4\runs\cli-case.png
 G cornell -p mis --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
+G final -p mis -w 16 -s 1 -o out\m4\runs\cli-case.png
+G smoke -p nee -w 16 -s 1 -o out\m4\runs\cli-case.png
+G cornell -p nee --all-books-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --quality-kernel --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --quality-kernel -p mixture -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --quality-kernel --all-books-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
@@ -87,6 +90,9 @@ G --tonemap agx --exposure nan -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --tonemap agx --exposure 25 -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --tonemap neutral --exposure -24.5 -w 16 -s 1 -o out\m4\runs\cli-case.png
 V -p mis --fp64 --headless -w 16 -s 1
+V final -p mis --headless -w 16 -s 1
+V cornell -p mis --fp64 --headless -w 16 -s 1
+V cornell -p mis --all-books-kernel --headless -w 16 -s 1
 V --quality-kernel --fp64 --headless -w 16 -s 1
 V --quality-kernel -p mixture --headless -w 16 -s 1
 V cornell --quality-kernel --headless -w 16 -s 1

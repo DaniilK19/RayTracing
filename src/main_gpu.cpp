@@ -74,7 +74,7 @@ Options:
                        render with the kernel for all three books, also the first book's scenes
                        (a check: the same image, bit for bit expected; and the price of generality)
       --quality-kernel render with the quality kernel, the third one, also the books' scenes under
-                       -p material (a check: the same image, bit for bit expected)
+                       -p material (a check: the same image within its noise, mostly bit for bit)
       --launch-ms N    how long one kernel launch should take, in milliseconds, from 1 to {}
                        (default 50): a check, as the image doesn't depend on it, only the speed
       --seed N         which random numbers to draw, from 0 (the default) to {}:
@@ -396,6 +396,13 @@ int main(int argc, char* argv[])
     const double samples = static_cast<double>(width) * height * static_cast<double>(rays_per_pixel);
     std::println("Rays traced: {:.1f} million ({:.2f} per sample), {:.1f} million per second", rays / 1e6,
                  rays / samples, rays / result.seconds / 1e6);
+    // Under -p nee and -p mis, the light samples' rays toward the lights, apart: they look for any blocker, not the
+    // closest hit, so the rays above keep the meaning they have in the books' kernels
+    if (built->desc.quality.combination != gpu::light_combination::bsdf_only)
+    {
+        const auto shadow_rays = static_cast<double>(result.shadow_rays);
+        std::println("Shadow rays: {:.1f} million ({:.2f} per sample)", shadow_rays / 1e6, shadow_rays / samples);
+    }
 
     // The pixels go into the CPU's image class, so the mean radiance below and the saved files are computed exactly
     // as in RayTracing
