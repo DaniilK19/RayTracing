@@ -41,8 +41,10 @@
 #include "bvh.cuh"
 #include "camera.cuh"
 #include "constant_medium.cuh"
+#include "device_memory.h"
 #include "display.cuh"
 #include "material.cuh"
+#include "quality.cuh"
 #include "random.cuh"
 #include "scene.cuh"
 #include "sphere.cuh"
@@ -88,89 +90,6 @@ constexpr int small_scene_shapes = 8;
 constexpr double first_view_probe_samples = 1 << 16;
 template <real_number Real>
 constexpr double next_view_probe_samples = sizeof(Real) == sizeof(double) ? 1 << 18 : 1 << 20;
-
-// Turns a CUDA error code into an exception. Most CUDA functions return a cudaError_t instead of throwing. The runtime
-// also keeps the last error for cudaGetLastError, which reports it again later: a caught failure (an allocation too
-// large for the GPU) would then make the next launch look as if it had failed. So an error reported here is cleared.
-// (An error in a running kernel can't be cleared: it ends CUDA in the process, and every later call reports it.)
-void check(cudaError_t result, const char* what)
-{
-    if (result != cudaSuccess)
-    {
-        (void)cudaGetLastError();
-        throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(result));
-    }
-}
-
-// An array in the GPU's memory that owns it, like a std::vector: cudaMalloc in the constructor and cudaFree in the
-// destructor (RAII), so the memory is freed however render() ends, an exception included.
-template <typename T>
-class device_array
-{
-public:
-    explicit device_array(std::size_t size) : size_(size)
-    {
-        if (size_ > 0)
-        {
-            check(cudaMalloc(&data_, size_ * sizeof(T)), "allocating GPU memory");
-        }
-    }
-
-    explicit device_array(const std::vector<T>& values) : device_array(values.size())
-    {
-        if (size_ > 0)
-        {
-            check(cudaMemcpy(data_, values.data(), size_ * sizeof(T), cudaMemcpyHostToDevice), "copying to the GPU");
-        }
-    }
-
-    ~device_array() { cudaFree(data_); } // nothing to do for nullptr
-
-    // A copy would free the same memory twice; a move hands it over (a move-constructed array leaves the other one
-    // empty, an assignment swaps the two)
-    device_array(const device_array&) = delete;
-    device_array& operator=(const device_array&) = delete;
-    device_array(device_array&& other) noexcept
-        : size_(std::exchange(other.size_, 0)), data_(std::exchange(other.data_, nullptr))
-    {
-    }
-    device_array& operator=(device_array&& other) noexcept
-    {
-        std::swap(size_, other.size_);
-        std::swap(data_, other.data_);
-        return *this; // the other array frees what this one held
-    }
-
-    T* data() const { return data_; }
-    std::size_t size() const { return size_; }
-
-    void fill_with_zeros() { fill_with_zeros(size_); }
-
-    // The first `count` elements only
-    void fill_with_zeros(std::size_t count)
-    {
-        if (count > 0)
-        {
-            check(cudaMemset(data_, 0, count * sizeof(T)), "clearing GPU memory");
-        }
-    }
-
-    std::vector<T> to_host() const { return to_host(size_); }
-
-    std::vector<T> to_host(std::size_t count) const
-    {
-        std::vector<T> values(count);
-        if (count > 0)
-        {
-            check(cudaMemcpy(values.data(), data_, count * sizeof(T), cudaMemcpyDeviceToHost), "copying from the GPU");
-        }
-        return values;
-    }
-
-private:
-    std::size_t size_;
-    T* data_ = nullptr;
-};
 
 // A CUDA event: a mark in the GPU's queue of work. When the GPU gets to it, it notes the time.
 class event
@@ -893,6 +812,32 @@ void validate(const scene_desc& scene)
     {
         throw std::runtime_error("the scene has too many shapes for the GPU renderer");
     }
+
+    // The quality kernel's own data (scene_desc::quality)
+    const quality_desc& quality = scene.quality;
+    // --- light sampling (track D): the combinations beyond the material's own samples come with the light samples
+    if (quality.combination != light_combination::bsdf_only)
+    {
+        throw std::runtime_error("light sampling isn't implemented yet");
+    }
+    // --- microfacets (track B): one side entry per material, or none
+    if (!quality.microfacets.empty())
+    {
+        if (quality.microfacets.size() != scene.materials.size())
+        {
+            throw std::runtime_error("the materials' GGX side entries must be one per material");
+        }
+        if (std::ranges::any_of(quality.microfacets,
+                                [](const microfacet_desc& m) { return m.kind != microfacet_kind::none; }))
+        {
+            throw std::runtime_error("rough metals and glossy coats aren't implemented yet");
+        }
+    }
+    // --- environment (track C)
+    if (quality.environment)
+    {
+        throw std::runtime_error("environment maps aren't implemented yet");
+    }
 }
 
 // Whether a sphere moves while the shutter is open
@@ -1080,6 +1025,11 @@ public:
                 .lights = {.lights = lights_.data(), .count = static_cast<int>(lights_.size())}};
     }
 
+    // The global id of each sphere and quad of scene_desc, by its index there (bvh::sphere_ids, quad_ids): the quality
+    // kernel's lamps are found by them
+    std::span<const int> sphere_ids() const { return sphere_ids_; }
+    std::span<const int> quad_ids() const { return quad_ids_; }
+
 private:
     device_scene(const scene_desc& scene, const bvh<Real>& tree, const images_on_device& images,
                  const media_on_device<Real>& media)
@@ -1104,7 +1054,9 @@ private:
           noises_(to_noises<Real>(scene)),
           lights_(to_lights<Real>(scene, tree)),
           motion_(motion(scene)),
-          sampling_(scene.camera.sampling)
+          sampling_(scene.camera.sampling),
+          sphere_ids_(tree.sphere_ids),
+          quad_ids_(tree.quad_ids)
     {
     }
 
@@ -1136,6 +1088,8 @@ private:
     device_array<light<Real>> lights_;
     bool motion_;
     sampling_strategy sampling_;
+    std::vector<int> sphere_ids_;
+    std::vector<int> quad_ids_;
 };
 
 // The kernel of the given kind on one launch's work. <<<grid, block>>> is CUDA's syntax for a launch: the kernel runs
@@ -1163,10 +1117,26 @@ void launch_kernel(const camera<Real>& cam, const scene_view<Real>& scene, std::
     check(cudaGetLastError(), "launching the kernel");
 }
 
-// The kernel is chosen by what the scene contains, and by the option that asks for the general one
+// Whether the scene has what only the quality kernel renders: a GGX side entry, an environment map
+bool needs_quality_kernel(const scene_desc& scene)
+{
+    return std::ranges::any_of(scene.quality.microfacets,
+                               [](const microfacet_desc& m) { return m.kind != microfacet_kind::none; }) ||
+           scene.quality.environment.has_value();
+}
+
+// The kernel is chosen by what the scene contains, and by the options that ask for another one. The quality kernel
+// renders a scene that needs it, a combination of light samples, or any scene when asked (--quality-kernel); the books'
+// two kernels render the rest, as before.
+bool uses_quality_kernel(const scene_desc& scene, const session_options& options)
+{
+    return options.quality_kernel || needs_quality_kernel(scene) ||
+           scene.quality.combination != light_combination::bsdf_only;
+}
+
 bool uses_first_book_kernel(const scene_desc& scene, const session_options& options)
 {
-    return !options.all_books_kernel && first_book_scene(scene);
+    return !uses_quality_kernel(scene, options) && !options.all_books_kernel && first_book_scene(scene);
 }
 }
 
@@ -1186,6 +1156,7 @@ struct session::impl
     virtual std::vector<double> pixels() const = 0;
     virtual std::span<const std::uint8_t> display() = 0;
     virtual std::uint64_t rays() const = 0;
+    virtual std::uint64_t shadow_rays() const = 0;
     virtual bool has_view() const = 0;
     virtual double kernel_seconds() const = 0;
     virtual const kernel_info& kernel() const = 0;
@@ -1199,13 +1170,20 @@ public:
         : options_(options),
           sampling_(scene.camera.sampling),
           device_(scene),
+          quality_(uses_quality_kernel(scene, options)),
           first_book_(uses_first_book_kernel(scene, options)),
-          kernel_(first_book_ ? describe_kernel<Real, kernel_kind::first_book>()
-                              : describe_kernel<Real, kernel_kind::all_books>()),
-          resident_blocks_(first_book_ ? resident_blocks<Real, kernel_kind::first_book>()
-                                       : resident_blocks<Real, kernel_kind::all_books>()),
-          ray_count_(1)
+          kernel_(chosen_kernel_info()),
+          resident_blocks_(chosen_resident_blocks()),
+          ray_count_(2) // the rays traced, and the quality kernel's shadow rays
     {
+        // The quality kernel computes in float only (session's constructor refuses it in double)
+        if constexpr (std::same_as<Real, float>)
+        {
+            if (quality_)
+            {
+                quality_scene_ = detail::upload_quality(scene, device_.sphere_ids(), device_.quad_ids());
+            }
+        }
         start_view(scene.camera, first_view_probe_samples, std::numeric_limits<double>::infinity());
     }
 
@@ -1332,6 +1310,11 @@ public:
         check_view();
         return ray_count_.to_host().front();
     }
+    std::uint64_t shadow_rays() const override
+    {
+        check_view();
+        return ray_count_.to_host()[1];
+    }
     double kernel_seconds() const override
     {
         check_view();
@@ -1341,6 +1324,33 @@ public:
     const kernel_info& kernel() const override { return kernel_; }
 
 private:
+    // The chosen kernel's description and blocks per wave. The quality kernel exists in float only: `if constexpr`
+    // keeps it out of the double session's code entirely.
+    kernel_info chosen_kernel_info() const
+    {
+        if constexpr (std::same_as<Real, float>)
+        {
+            if (quality_)
+            {
+                return detail::quality_kernel_info();
+            }
+        }
+        return first_book_ ? describe_kernel<Real, kernel_kind::first_book>()
+                           : describe_kernel<Real, kernel_kind::all_books>();
+    }
+    int chosen_resident_blocks() const
+    {
+        if constexpr (std::same_as<Real, float>)
+        {
+            if (quality_)
+            {
+                return detail::quality_resident_blocks();
+            }
+        }
+        return first_book_ ? resident_blocks<Real, kernel_kind::first_book>()
+                           : resident_blocks<Real, kernel_kind::all_books>();
+    }
+
     std::size_t values_in_view() const
     {
         return static_cast<std::size_t>(camera_.image_width) * static_cast<std::size_t>(camera_.image_height) * 3;
@@ -1425,7 +1435,15 @@ private:
     {
         const std::uint64_t seed = options_.seed + static_cast<std::uint64_t>(planner().round()) * round_seed_step;
         start_.record();
-        if (first_book_)
+        if (quality_)
+        {
+            if constexpr (std::same_as<Real, float>)
+            {
+                detail::launch_quality(*quality_scene_, cam_, device_.view(), seed, work.first_pass, work.pass_count,
+                                       work.first_row, work.row_count, sums_.data(), ray_count_.data());
+            }
+        }
+        else if (first_book_)
         {
             launch_kernel<Real, kernel_kind::first_book>(cam_, device_.view(), seed, work, sums_.data(),
                                                          ray_count_.data());
@@ -1449,7 +1467,9 @@ private:
     session_options options_;
     sampling_strategy sampling_; // the scene's
     device_scene<Real> device_;
-    bool first_book_;
+    bool quality_;    // the quality kernel renders (float only)
+    bool first_book_; // the first book's kernel renders; neither: the kernel for all three books
+    detail::quality_scene_ptr quality_scene_; // the quality kernel's own arrays, if it renders
     kernel_info kernel_;
     int resident_blocks_;
     camera_desc camera_;
@@ -1471,6 +1491,22 @@ session::session(const scene_desc& scene, const session_options& options)
     {
         throw std::invalid_argument(
             std::format("a launch must be planned to take more than 0 and at most {} seconds", max_launch_seconds));
+    }
+    // What the quality kernel can't render (the programs say it first, in their own words)
+    if (uses_quality_kernel(scene, options))
+    {
+        if (options.arithmetic == precision::float64)
+        {
+            throw std::invalid_argument("the quality kernel computes in float only");
+        }
+        if (options.all_books_kernel)
+        {
+            throw std::invalid_argument("the quality kernel and the kernel for all three books can't both render");
+        }
+        if (scene.camera.sampling != sampling_strategy::material)
+        {
+            throw std::invalid_argument("the quality kernel samples bounces as the material scatters (-p material)");
+        }
     }
     check(cudaSetDevice(0), "selecting the CUDA device");
     if (options.wait == wait_mode::sleep)
@@ -1534,6 +1570,11 @@ std::span<const std::uint8_t> session::display()
 std::uint64_t session::rays() const
 {
     return impl_->rays();
+}
+
+std::uint64_t session::shadow_rays() const
+{
+    return impl_->shadow_rays();
 }
 
 bool session::has_view() const
@@ -1627,6 +1668,7 @@ render_result render(const scene_desc& scene, const render_options& options)
     session one(scene, {.seed = options.seed,
                          .arithmetic = options.arithmetic,
                          .all_books_kernel = options.all_books_kernel,
+                         .quality_kernel = options.quality_kernel,
                          .launch_seconds = options.launch_seconds});
     if (options.passes < 0)
     {
@@ -1645,7 +1687,9 @@ render_result render(const scene_desc& scene, const render_options& options)
     result.pixels = one.pixels();
     result.kernel_seconds = one.kernel_seconds();
     result.rays = one.rays();
+    result.shadow_rays = one.shadow_rays();
     result.kernel = one.kernel();
+    // render_result::rgba stays empty: the books' bytes are the PNG's, which the programs make from the pixels
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
     return result;
 }

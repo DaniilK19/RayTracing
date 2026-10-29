@@ -148,7 +148,9 @@ if(CMAKE_CUDA_COMPILER)
     # optimizations off and make the kernels hundreds of times slower (400-600 times, measured on the test GPU), so a
     # render of a second would take ten minutes. -lineinfo, in Debug and RelWithDebInfo, only maps the GPU's machine
     # code to source lines, for profilers such as Nsight Compute.
-    add_library(gpu_renderer STATIC src/gpu/renderer.cu src/gpu/display.cu)
+    # quality.cu, the third kernel's (light and materials beyond the books), is a translation unit of its own too, with
+    # renderer.cu's flags: nvcc compiles the books' kernels in renderer.cu as if it didn't exist.
+    add_library(gpu_renderer STATIC src/gpu/renderer.cu src/gpu/display.cu src/gpu/quality.cu)
     target_compile_options(gpu_renderer PRIVATE -Xcompiler=/W4 $<$<CONFIG:Debug,RelWithDebInfo>:-lineinfo>)
     # The window's conversion of the image to bytes (display.cu) must give the bytes of the PNG files, which the CPU
     # computes: -fmad=false keeps nvcc from fusing a multiplication and an addition into one operation with one

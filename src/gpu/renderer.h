@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -229,6 +230,50 @@ struct camera_desc
     bool operator==(const camera_desc&) const = default;
 };
 
+// --- Beyond the books: what the quality kernel renders besides the books' tables (quality.cu) -------------------
+//
+// A third kernel, for light and materials the books don't have: light sampled at every bounce, rough metals, an
+// environment map. The books' two kernels stay as they are, instruction for instruction (see the kernels in
+// renderer.cu): what only the third kernel reads is kept apart from the books' tables, in these structures.
+
+// How the quality kernel combines the light it finds
+enum class light_combination
+{
+    bsdf_only,       // -p material: the material's own samples alone
+    lights_only,     // -p nee: a light sample at every bounce; light the material's samples find counts only where no
+                     // light sample could have found it
+    power_heuristic, // -p mis: both, weighted by Veach's power heuristic
+};
+
+enum class microfacet_kind
+{
+    none,      // the material as the books define it
+    conductor, // a rough metal: GGX with the metal's albedo as F0 (the material must be metal, fuzz 0)
+    gloss,     // a GGX coat of F0 0.04 over the material's matte color (the material must be lambertian)
+};
+
+// A material's GGX side entry: an array of its own, so material<Real> keeps the layout the books' kernels index
+struct microfacet_desc
+{
+    microfacet_kind kind = microfacet_kind::none;
+    double roughness = 0; // r in [0, 1]; the GGX width is α = r²; gloss needs α ≥ 1e-3
+};
+
+// An HDR image around the scene, seen from inside: equirectangular, +y up, row 0 the file's top (+y)
+struct environment_desc
+{
+    image_desc image;       // linear radiance, at most 2048×1024 texels, finite and ≥ 0
+    double yaw_degrees = 0; // turns the map about +y
+    double scale = 1;       // multiplies its radiance; its sampling density is unchanged
+};
+
+struct quality_desc
+{
+    light_combination combination = light_combination::bsdf_only;
+    std::vector<microfacet_desc> microfacets;    // empty, or one per scene_desc::materials entry
+    std::optional<environment_desc> environment; // the quality kernel's sky instead of camera.sky_bottom/sky_top
+};
+
 // --- The scene, and how to render it --------------------------------------------------------------------------------
 
 struct scene_desc
@@ -242,6 +287,7 @@ struct scene_desc
     std::vector<quad_desc> quads;
     std::vector<medium_desc> media;
     std::vector<light_desc> lights; // the lights list's shapes: empty unless camera.sampling is lights or mixture
+    quality_desc quality;           // empty for the books' scenes; a scene that needs it renders with the quality kernel
 };
 
 // The number type the GPU computes with. A GeForce card does arithmetic on 32-bit floats about
@@ -274,6 +320,10 @@ struct render_options
     // renderer.cu): a check that the general code computes the first book's paths as Step 46 does, and a measure of
     // what its generality costs
     bool all_books_kernel = false;
+    // Render with the quality kernel even a scene the books' kernels render (in float, sampled as the material
+    // scatters): a check that its code computes the books' paths (the same images, bit for bit, when it was added).
+    // The quality kernel refuses float64, all_books_kernel and a strategy other than material (std::invalid_argument).
+    bool quality_kernel = false;
     // How long one kernel launch should take, in seconds, more than 0 and at most max_launch_seconds
     // (std::invalid_argument otherwise; see launch_planner in renderer.cu). The image doesn't depend on it, only the
     // speed: 0.1 rendered 2.5% faster than 0.05, and 0.025 5% slower.
@@ -288,7 +338,7 @@ struct render_options
 // multiprocessor keeps in flight (its occupancy, see blocks_per_multiprocessor in renderer.cu)
 struct kernel_info
 {
-    std::string name;                       // "first book" or "all books"
+    std::string name;                       // "first book", "all books" or "quality"
     int registers = 0;                      // per thread
     // per thread: the BVH stack, the scratch arrays of CUDA's math functions (sin's reduction of huge arguments takes
     // 48 bytes in double), and registers spilled to memory, if any
@@ -306,6 +356,8 @@ struct render_result
     double kernel_seconds = 0;  // the passes alone, timed on the GPU
     std::uint64_t rays = 0;     // rays traced: camera rays and all their bounces
     kernel_info kernel;
+    std::uint64_t shadow_rays = 0; // the quality kernel's rays toward a light, apart from `rays` (0 in the others)
+    std::vector<std::uint8_t> rgba; // the display's bytes after a tone map other than the books' (empty otherwise)
 };
 
 struct device_info
@@ -344,6 +396,7 @@ struct session_options
     std::uint64_t seed = 0;
     precision arithmetic = precision::float32;
     bool all_books_kernel = false;
+    bool quality_kernel = false;  // see render_options
     double launch_seconds = 0.05; // how long a launch is planned to take (see render_options and launch_planner)
     // How the session waits for its launches. A CUDA event is waited for by spinning unless it is created to sleep,
     // whatever the device's flag (see query_device), so a sleeping session needs both: without the device's, its
@@ -435,8 +488,9 @@ public:
     // next display() or set_camera. Throws std::logic_error unless the image has a complete pass.
     std::span<const std::uint8_t> display();
 
-    std::uint64_t rays() const;    // rays traced since the view was set
-    double kernel_seconds() const; // the launches' time on the GPU since the view was set
+    std::uint64_t rays() const;        // rays traced since the view was set
+    std::uint64_t shadow_rays() const; // the quality kernel's rays toward a light since then (see render_result)
+    double kernel_seconds() const;     // the launches' time on the GPU since the view was set
     const kernel_info& kernel() const;
 
 private:

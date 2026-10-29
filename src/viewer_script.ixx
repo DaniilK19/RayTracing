@@ -15,7 +15,7 @@ import viewer_camera;
 // --- Scripts -------------------------------------------------------------------------------------------------------
 //
 // One command per line; # starts a comment. Settings stay until changed:
-//   scene NAME | size W H | seed S | strata K | precision float|double | kernel auto|all-books |
+//   scene NAME | size W H | seed S | strata K | precision float|double | kernel auto|all-books|quality |
 //   sampling NAME|scene
 //   camera [lookfrom "X,Y,Z"] [lookat "X,Y,Z"] [vfov D] [defocus-angle D] [focus-dist D]   (the view, changed)
 //   focus-at X Y   the focus distance of the surface seen at pixel (X, Y) of the image, as a double-click sets it
@@ -53,7 +53,7 @@ export struct set_size { int width; int height; };
 export struct set_seed { std::uint32_t seed; };
 export struct set_strata { int strata; };
 export struct set_precision { bool fp64; };
-export struct set_kernel { bool all_books; };
+export struct set_kernel { kernel_choice kernel; };
 // empty: the scene's own. The type is written ::strategy: a member may not change what an unqualified name means in its
 // class, and this one is named strategy too.
 export struct set_sampling { std::optional<::strategy> strategy; };
@@ -279,11 +279,14 @@ std::expected<script_command, std::string> command(std::span<const std::string_v
     }
     if (verb == "kernel")
     {
-        if (w.size() != 2 || (w[1] != "auto" && w[1] != "all-books"))
+        for (const kernel_choice k : {kernel_choice::automatic, kernel_choice::all_books, kernel_choice::quality})
         {
-            return std::unexpected("kernel is auto or all-books");
+            if (w.size() == 2 && w[1] == kernel_choice_name(k))
+            {
+                return set_kernel{k};
+            }
         }
-        return set_kernel{w[1] == "all-books"};
+        return std::unexpected("kernel is auto, all-books or quality");
     }
     if (verb == "sampling")
     {
@@ -479,12 +482,12 @@ std::string quoted(const point3& p)
 }
 
 // The settings lines that start a recording, and that follow a change of settings
-export std::string format_settings(std::string_view scene, bool fp64, bool all_books,
+export std::string format_settings(std::string_view scene, bool fp64, kernel_choice kernel,
                                    std::optional<strategy> s, std::uint32_t seed, int strata)
 {
     const std::string name = s ? std::string(strategy_name(*s)) : std::string("scene");
     return std::format("scene {}\nprecision {}\nkernel {}\nsampling {}\nseed {}\nstrata {}\n", scene,
-                       fp64 ? "double" : "float", all_books ? "all-books" : "auto", name, seed, strata);
+                       fp64 ? "double" : "float", kernel_choice_name(kernel), name, seed, strata);
 }
 
 // One frame shown: its view (from the camera's settings) and how far it was rendered

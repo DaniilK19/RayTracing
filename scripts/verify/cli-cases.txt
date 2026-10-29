@@ -77,12 +77,17 @@ G cornell -p mis --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --quality-kernel --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --quality-kernel -p mixture -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --quality-kernel --all-books-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
+G cornell --quality-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
+G weekend -p mixture --quality-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --tonemap bogus -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --tonemap agx --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --exposure 1 -w 16 -s 1 -o out\m4\runs\cli-case.png
 G --exposure abc -w 16 -s 1 -o out\m4\runs\cli-case.png
 V -p mis --fp64 --headless -w 16 -s 1
 V --quality-kernel --fp64 --headless -w 16 -s 1
+V --quality-kernel -p mixture --headless -w 16 -s 1
+V cornell --quality-kernel --headless -w 16 -s 1
+V --quality-kernel --all-books-kernel --headless -w 16 -s 1
 V --tonemap bogus --headless -w 16 -s 1
 V --exposure 1 --headless -w 16 -s 1
 
@@ -95,3 +100,4 @@ V --headless --script scripts\verify\cli-scripts\later-sampling.txt
 V --headless --script scripts\verify\cli-scripts\later-kernel.txt
 V --headless --script scripts\verify\cli-scripts\no-such-file.txt
 V --headless --script scripts\verify\cli-scripts\gpu-scene.txt -o out\m4\runs\cli-case.pfm
+V --headless --script scripts\verify\cli-scripts\quality-mixture.txt

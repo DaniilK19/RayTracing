@@ -54,6 +54,7 @@ struct options
     std::uint32_t seed = 0;
     bool fp64 = false;
     bool all_books_kernel = false;
+    bool quality_kernel = false;
     std::vector<std::filesystem::path> outputs; // saved when the window closes
     bool exit_when_done = false;
     std::optional<std::filesystem::path> frames; // a folder for every frame shown, as PNG
@@ -89,6 +90,7 @@ Options:
       --fp64           compute in 64-bit doubles: a check of the floats, many times slower
       --all-books-kernel
                        render with the kernel for all three books, also the first book's scenes
+      --quality-kernel render with the quality kernel, also the books' scenes under -p material
       --seed N         which random numbers to draw, from 0 (the default) to {}
   -o, --output FILE    save the image when the window closes: a .png or a .pfm; several -o save
                        several files
@@ -149,11 +151,12 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             opts.help = true;
             continue;
         }
-        if (arg == "--fp64" || arg == "--all-books-kernel" || arg == "--exit-when-done" || arg == "--headless" ||
-            arg == "--frames-hud")
+        if (arg == "--fp64" || arg == "--all-books-kernel" || arg == "--quality-kernel" || arg == "--exit-when-done" ||
+            arg == "--headless" || arg == "--frames-hud")
         {
             (arg == "--fp64"               ? opts.fp64
              : arg == "--all-books-kernel" ? opts.all_books_kernel
+             : arg == "--quality-kernel"   ? opts.quality_kernel
              : arg == "--headless"         ? opts.headless
              : arg == "--frames-hud"       ? opts.frames_hud
                                            : opts.exit_when_done) = true;
@@ -388,7 +391,7 @@ struct render_settings
 {
     std::string scene;
     bool fp64 = false;
-    bool all_books_kernel = false;
+    kernel_choice kernel = kernel_choice::automatic;
     std::optional<strategy> sampling; // empty: the scene's own
     std::uint32_t seed = 0;
     int strata = default_strata;
@@ -602,6 +605,11 @@ std::expected<void, std::string> viewer::use_settings(const render_settings& set
     {
         return std::unexpected(built.error());
     }
+    // What the quality kernel can't render (the float-only rule, the books' strategies but the material's)
+    if (const auto checked = check_kernel(*built, settings.scene, settings.kernel, settings.fp64); !checked)
+    {
+        return std::unexpected(checked.error());
+    }
     camera_settings view = built->cpu.camera; // the scene's sampling and samples, with its view
     if (same_scene)
     {
@@ -619,7 +627,8 @@ std::expected<void, std::string> viewer::use_settings(const render_settings& set
         session_.emplace(desc, gpu::session_options{.seed = s.seed,
                                                     .arithmetic = s.fp64 ? gpu::precision::float64
                                                                          : gpu::precision::float32,
-                                                    .all_books_kernel = s.all_books_kernel,
+                                                    .all_books_kernel = s.kernel == kernel_choice::all_books,
+                                                    .quality_kernel = s.kernel == kernel_choice::quality,
                                                     .launch_seconds = still_seconds,
                                                     .wait = gpu::wait_mode::sleep});
         ++generation_;
@@ -747,9 +756,13 @@ std::string viewer::gpu_command(std::int64_t passes) const
     {
         command += " --fp64";
     }
-    if (settings_.all_books_kernel)
+    if (settings_.kernel == kernel_choice::all_books)
     {
         command += " --all-books-kernel";
+    }
+    else if (settings_.kernel == kernel_choice::quality)
+    {
+        command += " --quality-kernel";
     }
     return command;
 }
@@ -948,7 +961,10 @@ void viewer::say(std::string message)
 void viewer::print_settings() const
 {
     const std::string_view sampling = strategy_name(build_->sampling);
-    const std::string precision = settings_.fp64 ? "float64" : "float32";
+    // The quality kernel is named (the books' two, as before, aren't): the image is its own
+    const std::string precision =
+        std::string(settings_.fp64 ? "float64" : "float32") +
+        (session_ && session_->kernel().name == "quality" ? ", the quality kernel" : "");
     if (opts_.script)
     {
         // The script decides the frames and the views
@@ -1146,7 +1162,9 @@ SDL_AppResult viewer::init()
     // the script's, and the window has the script's size from the start)
     render_settings settings{.scene = std::string(opts_.scene),
                              .fp64 = opts_.fp64,
-                             .all_books_kernel = opts_.all_books_kernel,
+                             .kernel = opts_.quality_kernel     ? kernel_choice::quality
+                                       : opts_.all_books_kernel ? kernel_choice::all_books
+                                                                : kernel_choice::automatic,
                              .sampling = opts_.sampling,
                              .seed = opts_.seed,
                              .strata = opts_.strata};
@@ -1203,7 +1221,7 @@ SDL_AppResult viewer::init()
             }
             else if (const auto* kernel = std::get_if<set_kernel>(&c))
             {
-                settings.all_books_kernel = kernel->all_books;
+                settings.kernel = kernel->kernel;
             }
             else if (const auto* sampling = std::get_if<set_sampling>(&c))
             {
@@ -1229,6 +1247,16 @@ SDL_AppResult viewer::init()
     if (!built)
     {
         return fail(built.error());
+    }
+    // The kernel asked for, refused here as RayTracingGPU refuses it: before the files, the window and CUDA
+    if (opts_.all_books_kernel && opts_.quality_kernel)
+    {
+        return fail(
+            "--all-books-kernel picks the books' kernel for all three books; --quality-kernel needs the quality kernel");
+    }
+    if (const auto checked = check_kernel(*built, settings.scene, settings.kernel, settings.fp64); !checked)
+    {
+        return fail(checked.error());
     }
     width_ = built->frame.image_width;
     height_ = built->frame.image_height;
@@ -1575,7 +1603,7 @@ void viewer::record_frame()
     }
     if (recorded_settings_ != settings_)
     {
-        record_ << format_settings(settings_.scene, settings_.fp64, settings_.all_books_kernel, settings_.sampling,
+        record_ << format_settings(settings_.scene, settings_.fp64, settings_.kernel, settings_.sampling,
                                    settings_.seed, settings_.strata);
         recorded_settings_ = settings_;
     }
@@ -1677,7 +1705,7 @@ std::expected<bool, std::string> viewer::play_next()
         else if (std::holds_alternative<set_kernel>(line.command))
         {
             const auto* c = &std::get<set_kernel>(line.command);
-            settings.all_books_kernel = c->all_books;
+            settings.kernel = c->kernel;
         }
         else if (std::holds_alternative<set_sampling>(line.command))
         {

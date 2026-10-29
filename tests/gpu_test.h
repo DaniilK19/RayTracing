@@ -55,6 +55,9 @@ public:
     explicit context(bool quick) : quick_(quick) {}
 
     bool quick() const { return quick_; }
+    // A value the command line gave a suite (GpuTests ggx-energy --write FILE): --write or --check, if given
+    const std::string* argument(std::string_view name) const;
+    void set_argument(std::string name, std::string value) { arguments_.emplace_back(std::move(name), std::move(value)); }
     // The number of samples a check draws: `full`, or at most 10^4 with --quick
     std::int64_t samples(std::int64_t full) const { return quick_ && full > 10000 ? 10000 : full; }
 
@@ -75,6 +78,7 @@ private:
     std::string suite_;
     std::vector<check_result> results_;
     std::vector<std::pair<std::size_t, std::string>> infos_; // printed after the check they follow
+    std::vector<std::pair<std::string, std::string>> arguments_;
     std::int64_t start_ns_ = 0;                             // when the suite began (steady clock)
 };
 

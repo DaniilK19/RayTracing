@@ -1,9 +1,15 @@
 // Partition gpu_scenes:parts, the types of the GPU programs' list of scenes (see gpu_scenes.ixx). A module partition
 // (C++20) is a part of one module in a file of its own: gpu_scenes re-exports it, and the files that add scenes beyond
 // the books import it without importing each other.
+module;
+
+// The renderer's types (a GGX side entry), before `import std;` (see gpu_scene.ixx)
+#include "gpu/renderer.h"
+
 export module gpu_scenes:parts;
 
 import std;
+import material;
 import scenes;
 import strategy_options;
 
@@ -36,6 +42,9 @@ export struct environment_choice
 export struct gpu_scene_parts
 {
     scene cpu;
+    // The GGX side entry of a CPU material, found by its address when the scene is translated: the CPU material is the
+    // placeholder that carries the color (a metal's albedo is F0, a matte one's texture the coat's base)
+    std::vector<std::pair<const material*, gpu::microfacet_desc>> microfacets;
     environment_choice environment;
 };
 

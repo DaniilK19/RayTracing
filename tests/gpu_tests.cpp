@@ -1,7 +1,7 @@
 // GpuTests: numeric tests of the GPU renderer's device functions, on the GPU: the samplers draw what their densities
 // say, the densities integrate to 1, the estimators converge to known values. See gpu_test.h for the checks and the
 // report; the suites are the files tests/*_tests.cu.
-//   GpuTests [all | SUITE...] [--quick] [--list]
+//   GpuTests [all | SUITE...] [--quick] [--list] [--write FILE] [--check FILE]
 // Exit code: 0 every check passes, 1 a check fails, 2 an error (an unknown suite or option, a CUDA error), 77 no CUDA
 // device or no driver (as ctest's SKIP_RETURN_CODE: the tests are skipped on a computer without an NVIDIA GPU). A
 // driver or runtime that is there but fails is an error, 2: a broken installation must not pass for a skipped test.
@@ -10,10 +10,13 @@
 #include <cuda_runtime_api.h>
 
 #include "gpu_test.h"
+#include "host_services.h"
 #include "renderer.h"
 #include "statistics.h"
 
 import std;
+import image;
+import vec3;
 
 namespace gpu_test
 {
@@ -21,6 +24,148 @@ std::vector<test_entry>& registry()
 {
     static std::vector<test_entry> tests;
     return tests;
+}
+
+// --- The host services of host_services.h -------------------------------------------------------------------------
+
+namespace host
+{
+namespace
+{
+std::filesystem::path executable_folder; // set by main
+
+// The run's temp folder, made on first use and removed when the program ends (a static object's destructor)
+struct temp_holder
+{
+    std::filesystem::path path;
+    ~temp_holder()
+    {
+        if (!path.empty())
+        {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    }
+};
+}
+
+std::filesystem::path temp_folder()
+{
+    static temp_holder temp;
+    if (temp.path.empty())
+    {
+        temp.path = std::filesystem::temp_directory_path() /
+                    std::format("gpu-tests-{}", std::chrono::steady_clock::now().time_since_epoch().count());
+        std::filesystem::create_directories(temp.path);
+    }
+    return temp.path;
+}
+
+std::filesystem::path find_repo_file(std::string_view relative)
+{
+    for (const std::filesystem::path& start : {std::filesystem::current_path(), executable_folder})
+    {
+        for (std::filesystem::path folder = start; !folder.empty(); folder = folder.parent_path())
+        {
+            if (std::filesystem::exists(folder / relative))
+            {
+                return folder / relative;
+            }
+            if (folder == folder.parent_path())
+            {
+                break; // the root
+            }
+        }
+    }
+    throw std::runtime_error(std::format("no {} in the current folder, the executable's or above them", relative));
+}
+
+gpu::image_desc load_image(const std::filesystem::path& file)
+{
+    auto loaded = image::load(file);
+    if (!loaded)
+    {
+        throw std::runtime_error(std::format("{}: {}", file.string(), loaded.error()));
+    }
+    gpu::image_desc desc{.width = loaded->width(), .height = loaded->height()};
+    desc.rgb.reserve(3 * static_cast<std::size_t>(desc.width) * static_cast<std::size_t>(desc.height));
+    for (int y = 0; y < desc.height; ++y)
+    {
+        for (int x = 0; x < desc.width; ++x)
+        {
+            const color& c = (*loaded)[x, y]; // doubles made from stb_image's floats: back to floats exactly
+            desc.rgb.push_back(static_cast<float>(c.x));
+            desc.rgb.push_back(static_cast<float>(c.y));
+            desc.rgb.push_back(static_cast<float>(c.z));
+        }
+    }
+    return desc;
+}
+
+std::vector<double> bytes_to_linear(std::span<const std::uint8_t> rgba, int width, int height)
+{
+    if (rgba.size() != 4 * static_cast<std::size_t>(width) * static_cast<std::size_t>(height))
+    {
+        throw std::invalid_argument("bytes_to_linear: 4 bytes per pixel");
+    }
+    std::vector<double> values;
+    values.reserve(3 * static_cast<std::size_t>(width) * static_cast<std::size_t>(height));
+    for (std::size_t i = 0; i < rgba.size(); i += 4)
+    {
+        for (std::size_t k = 0; k < 3; ++k)
+        {
+            const double g = (rgba[i + k] + 0.5) / 256;
+            values.push_back(g * g);
+        }
+    }
+    return values;
+}
+
+std::vector<std::uint8_t> png_round_trip(std::span<const std::uint8_t> rgba, int width, int height)
+{
+    const std::vector<double> values = bytes_to_linear(rgba, width, height);
+    image img(width, height);
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            const std::size_t i = 3 * (static_cast<std::size_t>(y) * width + x);
+            img[x, y] = color{values[i], values[i + 1], values[i + 2]};
+        }
+    }
+    const std::filesystem::path file = temp_folder() / "round-trip.png";
+    if (const auto saved = img.save_png(file); !saved)
+    {
+        throw std::runtime_error(saved.error());
+    }
+    auto loaded = image::load(file);
+    if (!loaded)
+    {
+        throw std::runtime_error(loaded.error());
+    }
+    // stb_image decodes byte k as (k/255)^2.2: the byte whose decoding is nearest
+    std::array<double, 256> decoded{};
+    for (int k = 0; k < 256; ++k)
+    {
+        decoded[static_cast<std::size_t>(k)] = std::pow(k / 255.0, 2.2);
+    }
+    const auto byte_of = [&decoded](double v) {
+        const auto nearest = std::ranges::min_element(decoded, {}, [v](double d) { return std::abs(d - v); });
+        return static_cast<std::uint8_t>(nearest - decoded.begin());
+    };
+    std::vector<std::uint8_t> bytes;
+    for (int y = 0; y < height; ++y)
+    {
+        for (int x = 0; x < width; ++x)
+        {
+            const color& c = (*loaded)[x, y];
+            bytes.push_back(byte_of(c.x));
+            bytes.push_back(byte_of(c.y));
+            bytes.push_back(byte_of(c.z));
+        }
+    }
+    return bytes;
+}
 }
 
 namespace
@@ -87,6 +232,12 @@ void context::count(std::string_view name, std::int64_t found, std::int64_t allo
 {
     results_.push_back({.name = std::string(name), .kind = check_kind::count, .estimate = static_cast<double>(found),
                         .limit = static_cast<double>(allowed), .out_of = out_of});
+}
+
+const std::string* context::argument(std::string_view name) const
+{
+    const auto it = std::ranges::find(arguments_, name, &std::pair<std::string, std::string>::first);
+    return it == arguments_.end() ? nullptr : &it->second;
 }
 
 void context::info(std::string_view name, std::string_view text)
@@ -168,9 +319,12 @@ int context::end_suite()
 int main(int argc, char* argv[])
 {
     using namespace gpu_test;
+    std::error_code no_folder;
+    host::executable_folder = std::filesystem::absolute(argv[0], no_folder).parent_path(); // for find_repo_file
     bool quick = false;
     bool list = false;
     std::vector<std::string> wanted;
+    std::vector<std::pair<std::string, std::string>> arguments; // --write FILE, --check FILE
     for (int i = 1; i < argc; ++i)
     {
         const std::string_view arg = argv[i];
@@ -184,10 +338,20 @@ int main(int argc, char* argv[])
         }
         else if (arg == "-h" || arg == "--help")
         {
-            std::println("Usage: GpuTests [all | SUITE...] [--quick] [--list]\n"
+            std::println("Usage: GpuTests [all | SUITE...] [--quick] [--list] [--write FILE] [--check FILE]\n"
                          "Numeric tests of the GPU renderer's device functions (see tests/gpu_test.h).\n"
+                         "--write and --check give a suite a file (a table it writes or checks).\n"
                          "Exit code: 0 pass, 1 a check fails, 2 an error, 77 no CUDA device.");
             return 0;
+        }
+        else if (arg == "--write" || arg == "--check")
+        {
+            if (i + 1 == argc)
+            {
+                std::println("Error: {} needs a file", arg);
+                return 2;
+            }
+            arguments.emplace_back(std::string(arg), std::string(argv[++i]));
         }
         else if (arg.starts_with('-'))
         {
@@ -256,6 +420,10 @@ int main(int argc, char* argv[])
 
     int failures = 0;
     context ctx(quick);
+    for (auto& [name, value] : arguments)
+    {
+        ctx.set_argument(std::move(name), std::move(value));
+    }
     for (const std::string& name : wanted)
     {
         ctx.begin_suite(name);

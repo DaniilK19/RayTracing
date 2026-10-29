@@ -1,0 +1,6 @@
+# A script that asks for the quality kernel on a scene whose own strategy is the mixture (the Cornell box): refused
+# before its first frame, as the quality kernel samples as the material scatters
+size 16 9
+scene cornell
+kernel quality
+hold 1 +1

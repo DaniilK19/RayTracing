@@ -1,5 +1,7 @@
-# A script with the kernel of a later step: unknown until Step 73, then a tiny headless render of 16×9
+# A script with the kernel of a later step: unknown until Step 73, then a tiny headless render of 16×9 in the quality
+# kernel, which samples as the material scatters (the Cornell box's own strategy is the mixture)
 size 16 9
 scene cornell
+sampling material
 kernel quality
 hold 1 +1

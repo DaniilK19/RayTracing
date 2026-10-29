@@ -24,8 +24,9 @@ import view_options;
 constexpr std::string_view default_gpu_scene = "weekend";
 constexpr int max_launch_ms = static_cast<int>(gpu::max_launch_seconds * 1000);
 
-// The options are RayTracing's, plus the GPU programs' own: --fp64, --all-books-kernel, --launch-ms, --strata and the
-// view options (view_options.ixx). std::optional tells "not given: take it from the scene" apart from any given value.
+// The options are RayTracing's, plus the GPU programs' own: --fp64, --all-books-kernel, --quality-kernel, --launch-ms,
+// --strata and the view options (view_options.ixx). std::optional tells "not given: take it from the scene" apart from
+// any given value.
 struct options
 {
     std::string_view scene = default_gpu_scene;
@@ -38,6 +39,7 @@ struct options
     std::vector<std::filesystem::path> outputs; // one per -o; parse_options adds <scene name>-gpu.png if there is none
     bool fp64 = false;
     bool all_books_kernel = false;
+    bool quality_kernel = false;
     int launch_ms = 50; // how long one kernel launch should take (see render_options::launch_seconds)
     bool help = false;
 };
@@ -69,6 +71,8 @@ Options:
       --all-books-kernel
                        render with the kernel for all three books, also the first book's scenes
                        (a check: the same image, bit for bit expected; and the price of generality)
+      --quality-kernel render with the quality kernel, the third one, also the books' scenes under
+                       -p material (a check: the same image, bit for bit expected)
       --launch-ms N    how long one kernel launch should take, in milliseconds, from 1 to {}
                        (default 50): a check, as the image doesn't depend on it, only the speed
       --seed N         which random numbers to draw, from 0 (the default) to {}:
@@ -102,6 +106,11 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         if (arg == "--all-books-kernel")
         {
             opts.all_books_kernel = true;
+            continue;
+        }
+        if (arg == "--quality-kernel")
+        {
+            opts.quality_kernel = true;
             continue;
         }
 
@@ -259,6 +268,21 @@ int main(int argc, char* argv[])
         std::println("Error: {}", built.error());
         return 1;
     }
+    // The kernel asked for, and what the quality kernel can't render (see check_kernel in gpu_scene.ixx)
+    if (opts->quality_kernel && opts->all_books_kernel)
+    {
+        std::println("Error: --all-books-kernel picks the books' kernel for all three books; --quality-kernel needs "
+                     "the quality kernel");
+        return 1;
+    }
+    const kernel_choice chosen = opts->quality_kernel     ? kernel_choice::quality
+                                 : opts->all_books_kernel ? kernel_choice::all_books
+                                                          : kernel_choice::automatic;
+    if (const auto checked = check_kernel(*built, opts->scene, chosen, opts->fp64); !checked)
+    {
+        std::println("Error: {}", checked.error());
+        return 1;
+    }
     const camera_frame& frame = built->frame;
     // The strategy rendered with, and whether it isn't the one asked for (-p, or the scene's own)
     std::println("Scene: {}, sampling: {}{}", opts->scene, strategy_name(built->sampling),
@@ -300,6 +324,7 @@ int main(int argc, char* argv[])
             .arithmetic = opts->fp64 ? gpu::precision::float64 : gpu::precision::float32,
             .progress = show_progress,
             .all_books_kernel = opts->all_books_kernel,
+            .quality_kernel = opts->quality_kernel,
             .launch_seconds = opts->launch_ms / 1000.0,
             .passes = rays_per_pixel};
         result = gpu::render(built->desc, gpu_options);
@@ -315,7 +340,7 @@ int main(int argc, char* argv[])
     // Both times come from the renderer: the whole render() call (the BVH, copying the scene to the GPU and the image
     // back, all the passes), and the passes alone, timed on the GPU
     std::println("Render time: {:.2f} s (GPU passes: {:.2f} s)", result.seconds, result.kernel_seconds);
-    // Which of the two kernels rendered (see the kernels in renderer.cu), and what decides how many of its threads
+    // Which of the three kernels rendered (see the kernels in renderer.cu), and what decides how many of its threads
     // the GPU keeps in flight: the registers a thread takes (see blocks_per_multiprocessor)
     const gpu::kernel_info& kernel = result.kernel;
     std::println("Kernel: {}, {} registers and {} bytes of local memory per thread, {} blocks of {} threads per "

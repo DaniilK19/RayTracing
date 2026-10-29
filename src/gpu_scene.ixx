@@ -545,6 +545,7 @@ export struct gpu_build
     scene cpu;
     camera_frame frame;    // the pixel grid and the lens, as the CPU's camera computes them from cpu.camera
     strategy requested;    // the strategy asked for (-p), or the scene's own
+    bool sampling_given;   // requested came from -p
     strategy sampling;     // the strategy rendered with: as the CPU would (effective_sampling: without lamps, material)
     gpu::scene_desc desc;  // the renderer's data, with the lights list for the strategies that aim at it
     std::int64_t passes;   // how many to render: frame.sqrt_spp², or with strata the samples asked for
@@ -621,9 +622,79 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
     return gpu_build{.cpu = std::move(s),
                      .frame = frame,
                      .requested = requested,
+                     .sampling_given = overrides.sampling.has_value(),
                      .sampling = from_books(sampling),
                      .desc = std::move(*desc),
                      .passes = passes};
+}
+
+// Whether the quality kernel renders the scene (see the kernels in renderer.cu): asked for, or needed by what the scene
+// has (light samples, rough metals, an environment map)
+export bool renders_with_quality_kernel(const gpu_build& build, kernel_choice kernel)
+{
+    const gpu::quality_desc& q = build.desc.quality;
+    return kernel == kernel_choice::quality || q.combination != gpu::light_combination::bsdf_only ||
+           q.environment.has_value() || std::ranges::any_of(q.microfacets, [](const gpu::microfacet_desc& m) {
+               return m.kind != gpu::microfacet_kind::none;
+           });
+}
+
+// What the quality kernel can't render, as the programs say it after "Error: ", before anything is rendered (the
+// renderer refuses it too, in its own words): float64, the kernel for all three books, and the books' strategies but
+// the material's. `scene` is the scene's name, for the message.
+export std::expected<void, std::string> check_kernel(const gpu_build& build, std::string_view scene,
+                                                     kernel_choice kernel, bool fp64)
+{
+    if (!renders_with_quality_kernel(build, kernel))
+    {
+        return {};
+    }
+    // What the scene has that only the quality kernel renders, if anything
+    const gpu::quality_desc& q = build.desc.quality;
+    const auto has = [&q](gpu::microfacet_kind kind) {
+        return std::ranges::any_of(q.microfacets, [kind](const gpu::microfacet_desc& m) { return m.kind == kind; });
+    };
+    const std::string_view reason = q.environment                          ? "an environment map"
+                                    : has(gpu::microfacet_kind::conductor) ? "a rough metal"
+                                    : has(gpu::microfacet_kind::gloss)     ? "a glossy coat"
+                                                                           : "";
+    // What asked for the quality kernel: the option, a strategy of its own given with -p, or the scene
+    const std::string what = kernel == kernel_choice::quality ? std::string("--quality-kernel")
+                             : build.sampling_given && !entry_of(build.requested).books
+                                 ? std::format("-p {}", strategy_name(build.requested))
+                             : reason.empty() ? std::format("'{}'", scene)
+                                              : std::format("'{}' ({})", scene, reason);
+    if (fp64)
+    {
+        return std::unexpected(
+            std::format("{} renders with the quality kernel, which computes in float only: drop --fp64", what));
+    }
+    if (kernel == kernel_choice::all_books)
+    {
+        return std::unexpected(std::format(
+            "--all-books-kernel picks the books' kernel for all three books; {} needs the quality kernel", what));
+    }
+    // Its bounces sample as the material scatters. The strategy -p gave is checked as given (a books' strategy but the
+    // material's is refused, even where a scene without lamps would fall back to it); a scene's own as it renders.
+    const strategy checked = build.sampling_given ? build.requested : build.sampling;
+    if (entry_of(checked).books.value_or(sampling_strategy::material) != sampling_strategy::material)
+    {
+        // The strategies it renders: material, and every one of its own (those that aren't the books')
+        std::string strategies = "material";
+        const auto own = strategy_list | std::views::filter([](const strategy_entry& e) { return !e.books; }) |
+                         std::ranges::to<std::vector>();
+        for (std::size_t i = 0; i < own.size(); ++i)
+        {
+            strategies += std::format("{}{}", i + 1 == own.size() ? " or " : ", ", own[i].name);
+        }
+        if (!reason.empty() && kernel != kernel_choice::quality)
+        {
+            return std::unexpected(std::format("'{}' has {}, which the books' kernels can't render: use -p {}", scene,
+                                               reason, strategies));
+        }
+        return std::unexpected(std::format("the quality kernel samples the materials: use -p {}", strategies));
+    }
+    return {};
 }
 
 // The renderer's pixels (rows from the top, then r, g, b) in the CPU's image class, so the mean radiance and the saved

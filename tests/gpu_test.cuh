@@ -55,14 +55,21 @@ public:
         {
             throw std::runtime_error("a test asked for more than 1 GB of GPU memory at once");
         }
+        if (count == 0)
+        {
+            return; // an empty array: no memory, data() is nullptr
+        }
         cuda_check(cudaMalloc(reinterpret_cast<void**>(&data_), count * sizeof(T)), "cudaMalloc");
         note_device_bytes(static_cast<std::int64_t>(count * sizeof(T)));
         cuda_check(cudaMemset(data_, 0, count * sizeof(T)), "cudaMemset");
     }
     explicit device_buffer(const std::vector<T>& values) : device_buffer(values.size())
     {
-        cuda_check(cudaMemcpy(data_, values.data(), values.size() * sizeof(T), cudaMemcpyHostToDevice),
-                   "copying to the GPU");
+        if (!values.empty())
+        {
+            cuda_check(cudaMemcpy(data_, values.data(), values.size() * sizeof(T), cudaMemcpyHostToDevice),
+                       "copying to the GPU");
+        }
     }
     ~device_buffer()
     {
@@ -77,7 +84,10 @@ public:
     std::vector<T> download() const
     {
         std::vector<T> values(count_);
-        cuda_check(cudaMemcpy(values.data(), data_, count_ * sizeof(T), cudaMemcpyDeviceToHost), "copying back");
+        if (count_ > 0)
+        {
+            cuda_check(cudaMemcpy(values.data(), data_, count_ * sizeof(T), cudaMemcpyDeviceToHost), "copying back");
+        }
         return values;
     }
 

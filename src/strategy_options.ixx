@@ -1,7 +1,8 @@
-// Module strategy_options: the sampling strategies of the GPU programs' -p option. They begin with the books' four,
-// which the CPU's camera knows (sampling_list in camera.ixx), and the GPU's third kernel adds its own later: the CPU's
-// list stays as it is, so RayTracing never parses a strategy it can't render. The window's scripts use these names
-// too, so the module knows nothing of the GPU renderer (no renderer.h): only the names and what they stand for.
+// Module strategy_options: the sampling strategies of the GPU programs' -p option, and the choice of kernel. The
+// strategies begin with the books' four, which the CPU's camera knows (sampling_list in camera.ixx), and the GPU's third
+// kernel adds its own later: the CPU's list stays as it is, so RayTracing never parses a strategy it can't render. The
+// window's scripts use these names too, so the module knows nothing of the GPU renderer (no renderer.h): only the names
+// and what they stand for.
 export module strategy_options;
 
 import std;
@@ -66,6 +67,21 @@ export constexpr std::string_view strategy_name(strategy value) { return entry_o
 export constexpr strategy from_books(sampling_strategy books)
 {
     return std::ranges::find(strategy_list, std::optional{books}, &strategy_entry::books)->value;
+}
+
+// Which kernel renders: the one the scene needs, the books' kernel for all three books even where the first book's
+// would do (--all-books-kernel), or the quality kernel even for the books' scenes (--quality-kernel)
+export enum class kernel_choice
+{
+    automatic,
+    all_books,
+    quality,
+};
+
+// Its name in the window's scripts (kernel auto|all-books|quality)
+export constexpr std::string_view kernel_choice_name(kernel_choice kernel)
+{
+    return kernel == kernel_choice::all_books ? "all-books" : kernel == kernel_choice::quality ? "quality" : "auto";
 }
 
 // The list for the programs' help, a line per strategy: as RayTracing prints it, the camera's default marked
