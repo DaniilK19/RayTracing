@@ -4,7 +4,7 @@ A Monte Carlo path tracer in modern C++23, and a CUDA renderer for the same scen
 
 The CPU renderer implements the algorithms and scenes of the book series by Peter Shirley, Trevor David Black and Steve Hollasch: ["Ray Tracing in One Weekend"](https://raytracing.github.io/books/RayTracingInOneWeekend.html), ["Ray Tracing: The Next Week"](https://raytracing.github.io/books/RayTracingTheNextWeek.html) and ["Ray Tracing: The Rest of Your Life"](https://raytracing.github.io/books/RayTracingTheRestOfYourLife.html). It renders all 13 of their scenes, and its classes follow the books' C++ code (`hittable`, `material`, `bvh_node`, the shapes, materials and textures), rewritten in C++23 with modules, `import std;`, concepts and `std::variant`.
 
-The rest is the project's own engineering. `RayTracingGPU` builds every scene with the same scene code and renders it on an NVIDIA graphics card with CUDA, [60 to 190 times faster](#performance) than the CPU renderer on the same desktop machine. `ImageCompare`, a statistical test, shows that the GPU renders the books' scenes as the CPU renderer does, up to Monte Carlo noise ([the verification](#verified-against-the-cpu)). `RayTracingViewer` puts the GPU renderer in [a window](#the-window) with a moving camera, and every frame it shows can be rendered again offline, bit for bit. The CPU renderer runs on all cores, rendering is seeded and deterministic on both renderers, renders can be saved as linear PFM images, and five mistakes of the third book are fixed rather than repeated.
+The rest is the project's own engineering. `RayTracingGPU` builds every scene with the same scene code and renders it on an NVIDIA graphics card with CUDA, [60 to 190 times faster](#performance) than the CPU renderer on the same desktop machine. `ImageCompare`, a statistical test, shows that the GPU renders the books' scenes as the CPU renderer does, up to Monte Carlo noise ([the verification](#verified-against-the-cpu)). `RayTracingViewer` puts the GPU renderer in [a window](#the-window) with a moving camera, and every frame it shows can be rendered again offline, bit for bit. The CPU renderer runs on all cores, rendering is seeded and deterministic on both renderers, renders can be saved as linear PFM images, and five mistakes of the third book are fixed rather than repeated. A third CUDA kernel then goes past the books: shadow rays toward the lights weighted by multiple importance sampling, rough metals and glossy coats, and HDR photographs of the surroundings as the sky, with a kernel of its own that tone-maps their light ([light and materials](#light-and-materials-beyond-the-books)).
 
 | ![The second book's final scene: the Earth, spheres of glass, fuzzy metal and marble, a glass sphere filled with blue fog, a cube of small white spheres and a motion-blurred orange sphere above a floor of green boxes, under a rectangular lamp](docs/final.png) | ![The third book's final scene: the Cornell box with a green and a red wall, a tall white box, and a glass sphere that focuses the ceiling lamp's light into a bright spot on the floor](docs/glass.png) |
 |---|---|
@@ -17,6 +17,7 @@ The rest is the project's own engineering. `RayTracingGPU` builds every scene wi
 - **The three books on the CPU.** All 13 scenes and the books' techniques: moving spheres, quads, instances, smoke and fog, textures, depth of field, a BVH, and importance sampling. A diffuse bounce is sampled in one of [four ways](docs/sampling.md#four-strategies) (`-p`): uniformly, by the material's own density, toward the lamps, or, by default, with a half-and-half mixture of the last two. [Features and code](docs/architecture.md)
 - **A CUDA renderer for every scene.** `RayTracingGPU` builds each scene with the CPU renderer's own code and renders it with all four sampling strategies, from one templated source for `float` and `double`. [The CUDA renderer](docs/gpu.md)
 - **A window with a moving camera.** `RayTracingViewer` keeps a scene on the GPU in a rendering session and refines its image pass by pass, in rounds of stratified samples, at 90 to 99% of `RayTracingGPU`'s speed. Its input can be scripted and its frames recorded: a recording, replayed without a window, gives the same frames, byte for byte, which is how the window is tested. [The viewer](docs/viewer.md)
+- **Light and materials beyond the books.** A third CUDA kernel adds next-event estimation, combined with the materials' own samples by multiple importance sampling, rough metals and glossy coats with the GGX microfacet model, and image-based lighting from HDR environment maps with importance sampling; a kernel of its own tone-maps any scene's light with AgX or PBR Neutral. On the Cornell box, the `light` scene and the second book's final scene it converges to the books' images (ImageCompare, two seeds each, 1024 rays per pixel), and with the materials' own sampling it converges to the books' kernels' images on all 13 scenes; the books' own kernels stay unchanged, instruction for instruction. [Light and materials](docs/quality.md)
 - **Statistically verified.** `ImageCompare` tests whether two renders differ by more than Monte Carlo noise. The GPU's renders of the books' scenes were consistent with the CPU's in every comparison, and 64 scenes built to provoke a difference agreed in all but two. [The verification](docs/gpu.md#verification)
 - **Robust in `float`.** Seven single-precision pitfalls are handled, six of them measured by comparing renders, from self-intersection on a ground sphere of radius 1000 to hit points on the wrong side of a quad. [What float costs](docs/gpu.md#what-float-costs)
 - **Deterministic and measurable.** On each renderer, a seed fixes the image bit for bit, in Debug as in Release. Renders are saved as PNG or as linear PFM, and every run prints its time, the rays it traced and the image's mean radiance. [Options and output](docs/building.md#raytracing-options)
@@ -31,7 +32,7 @@ The rest is the project's own engineering. `RayTracingGPU` builds every scene wi
 
 *Replayed by `RayTracingViewer` from a camera script ([docs/viewer-tour.txt](docs/viewer-tour.txt)), not captured from the screen. While the camera moves, each frame holds the samples the window renders live in a frame of 1/60 s at this size; while it stands still, each frame adds those it renders in the GIF's 80 ms. So the noise of every frame and the pace of the refining are the live window's, on the machine the timings below come from.*
 
-`RayTracingViewer` shows any of the 13 scenes in a window and refines the image while the camera stands still: orbit, look, pan, dolly, fly and zoom with the mouse and the keys, open the lens and double-click to focus, Tab to the next scene. Its waits for the GPU sleep, so the CPU stays nearly idle. Every view it shows can be rendered again by `RayTracingGPU`, bit for bit: P saves the image and prints the command. [The viewer](docs/viewer.md)
+`RayTracingViewer` shows any of the 13 scenes, and the four [beyond the books](#light-and-materials-beyond-the-books), in a window and refines the image while the camera stands still: orbit, look, pan, dolly, fly and zoom with the mouse and the keys, open the lens and double-click to focus, Tab to the next scene, M to the next sampling strategy, T to the next tone map. Its waits for the GPU sleep, so the CPU stays nearly idle. Every view it shows can be rendered again by `RayTracingGPU`, bit for bit: P saves the image and prints the command. [The viewer](docs/viewer.md)
 
 ```
 out\build\x64-release\RayTracingViewer.exe final
@@ -50,6 +51,36 @@ The 13 scenes, rendered by the CUDA renderer in `float` at each scene's default 
 | ![The Cornell box with its tall box made of black smoke and its short box made of white smoke](docs/gpu/scenes/smoke.png) **smoke**: blocks of smoke | ![The second book's final scene: the Earth, spheres of glass, fuzzy metal and marble, a glass sphere filled with blue fog, a cube of small white spheres and a motion-blurred orange sphere above green boxes](docs/gpu/scenes/final.png) **final**: the second book's final scene, everything together |
 | ![The Cornell box with a tall mirror block beside a short white box: the mirror is black where it reflects the room's open front, with the short box and the floor reflected in its lower half](docs/gpu/scenes/aluminum.png) **aluminum**: a mirror block; the light it throws onto the ceiling stays noisy | ![The Cornell box with a tall white box and a glass sphere that focuses the lamp's light into a bright spot on the floor](docs/gpu/scenes/glass.png) **glass**: the third book's final scene, a glass sphere sampled like a light |
 | ![A marble sphere on a marble ground in the dark, lit by a spherical lamp above it and a rectangular lamp beside it](docs/gpu/scenes/light.png) **light**: light sources | |
+
+## Light and materials beyond the books
+
+A third CUDA kernel renders what the books stop short of. In a scene with lamps or an environment map, it sends a shadow ray toward one of them at every bounce (next-event estimation) and weighs that sample against the material's own sample of the same light by multiple importance sampling. It adds rough metals and glossy coats with the GGX microfacet model, and HDR photographs of the surroundings as the sky, sampled by their brightness; a tone-mapping kernel of its own shows their light, far brighter than 1, for any scene. The third kernel computes in `float` and renders whenever a scene or an option needs it (`-p nee` or `-p mis` in a scene with a lamp or a map, `--quality-kernel`, or a scene of the new materials); the books' two kernels are unchanged, instruction for instruction, and still render the books' scenes by default. [How it works and how it was verified](docs/quality.md)
+
+| ![The Cornell box rendered with the books' mixture: grainy walls and ceiling](docs/quality/cornell-mixture.png) | ![The Cornell box rendered with multiple importance sampling: the same picture with visibly finer grain](docs/quality/cornell-mis.png) |
+|---|---|
+| *`RayTracingGPU cornell -p mixture`: the books' best strategy, half of the bounces aimed at the lamp.* | *`RayTracingGPU cornell -p mis`: a shadow ray to the lamp at every bounce, weighed against the material's own sample.* |
+| ![ImageCompare's map of mixture against multiple importance sampling: the Cornell box in gray under faint red and blue tiles](docs/quality/cornell-zmap.png) | ![ImageCompare's map of multiple importance sampling against itself with another seed: the same faint tiles](docs/quality/cornell-zmap-control.png) |
+| ***ImageCompare:** the mixture against `mis`* | ***ImageCompare:** `mis` against `mis` with another seed (the noise alone)* |
+
+*Top row, 540×540 with 64 rays per pixel each: equal samples, not equal time. Each sample of `mis` traces 6.6 rays and 4.0 shadow rays, against the mixture's 2.4 rays, and leaves 2.5 times less noise (the trimmed standard deviation of one render, 0.00125 against 0.00315, measured at 480×270 with 1024 rays per pixel). Bottom row, the test that the two strategies converge to the same picture, at 480×270 with 1024 rays per pixel, enlarged 2×: each map shows the first render in gray, tinted red where the second is brighter and blue where it is darker, in tiles of 32×32 pixels. The maps look alike: the difference of the means is within one standard error in both (+0.58 and −0.67), and none of the 81 tested tiles differs by more than 3, where noise alone gives 0.2 on average. The same test passed on `light` and on the second book's final scene.*
+
+| ![Veach's four plates under four lamps rendered with the materials' own samples: the rough plates and the room speckled with bright dots](docs/quality/veach-material.png) | ![Veach's four plates rendered with multiple importance sampling: smooth highlights on every plate](docs/quality/veach-mis.png) |
+|---|---|
+| *`RayTracingGPU veach -p material`: the materials' own samples. The sharp plates find the lamps, the rough plates and the room are speckled.* | *`RayTracingGPU veach -p mis`: shadow rays and the materials' samples weighed, each where it does well.* |
+
+*Veach's four plates (1997), the classic picture of multiple importance sampling: one metal from sharp (top) to rough (bottom) under four lamps of one power and four sizes. 960×540, 256 rays per pixel each. Shadow rays alone (`-p nee`) fail the other way, on the sharp plates under the large lamps: [the three side by side](docs/quality.md#next-event-estimation-and-multiple-importance-sampling).*
+
+| ![Gold, silver, copper and glossy colored spheres on a gray floor in a photo studio, lit by its softboxes](docs/quality/studio.png) | ![A matte white sphere, a rough copper one, an aluminum one reflecting the sky and a small green glossy one on a checkered ground under a cloudy sky with the sun](docs/quality/sunlit.png) |
+|---|---|
+| *`RayTracingGPU studio`: gold under five roughnesses in front; silver, copper and glossy coats behind.* | *`RayTracingGPU sunlit`: spheres in the sunlight of an HDR sky.* |
+
+*Two HDR photographs from [Poly Haven](https://polyhaven.com) (CC0) as the sky, sampled by their brightness, so that the sun, a few texels that hold a large share of the sky's light, is found by shadow rays rather than by chance. 960×540, 4096 rays per pixel, each scene's defaults: `-p mis` and AgX tone mapping.*
+
+| ![The books' aluminum scene: the Cornell box with a mirror block, the light it throws onto the ceiling grainy](docs/quality/aluminum.png) | ![The Cornell box with a block of rough aluminum reflecting the walls in a blur and a short block under a glossy coat, pale gray in AgX's light](docs/quality/cornell-ggx.png) |
+|---|---|
+| *`RayTracingGPU aluminum`: the books' mirror block, which no shadow ray can use (`-p mixture`, the books' display).* | *`RayTracingGPU cornell-ggx`: a block of rough aluminum and a glossy white one, both sampled toward the lamp (`-p mis`, AgX).* |
+
+*540×540, 1024 rays per pixel each. These pictures illustrate; the verdicts come from the protocols at 480×270 in [the verification](docs/quality.md#how-it-was-verified). Every picture's command is in [Light and materials](docs/quality.md); each gives its PNG byte for byte.*
 
 ## Performance
 
@@ -106,9 +137,10 @@ The same test covered 22 configurations of the second and third books' 11 scenes
 |---|---|
 | [The CUDA renderer](docs/gpu.md) | how the GPU renders, the full verification against the CPU, what `float` costs and how each pitfall is handled, the known differences, building and running `RayTracingGPU` |
 | [The viewer](docs/viewer.md) | `RayTracingViewer`: its controls, how it renders progressively and paces its frames, its speed, rendering a view again, scripts and recordings, how it is verified |
-| [ImageCompare](docs/image-compare.md) | the statistical test: usage, sample output, its four checks, how it was validated and how to use it correctly |
-| [Sampling](docs/sampling.md) | the four sampling strategies with pictures and errors, where the mixture can't help and why smoke and fog don't mix the lamps in, the fixes to the third book, the `MonteCarlo` program |
-| [Building and running](docs/building.md) | requirements, presets, `RayTracing`'s options and output, render times, the 13 scenes as the CPU renders them |
+| [Light and materials](docs/quality.md) | the third kernel: next-event estimation and multiple importance sampling, shadow rays through smoke, GGX rough metals and glossy coats, HDR environment maps, tone mapping, how each was verified, and the known limits |
+| [ImageCompare](docs/image-compare.md) | the statistical test: usage, sample output, its four checks, how it was validated, how to use it correctly, how to compare two sampling strategies, and `PfmStats` |
+| [Sampling](docs/sampling.md) | the four sampling strategies with pictures and errors and the GPU's `nee` and `mis`, where the mixture can't help and what next-event estimation changes, why smoke and fog don't mix the lamps in, the fixes to the third book, the `MonteCarlo` program |
+| [Building and running](docs/building.md) | requirements, presets, `RayTracing`'s options and output, render times, the 13 scenes as the CPU renders them, the scenes beyond the books and `RayTracingGPU`'s options for them, the tests and the verification scripts |
 | [Architecture](docs/architecture.md) | the full feature list, the library and its programs, the modules, the CUDA renderer's files, modern C++ in the project, third-party code and credits |
 
 ## Quick start
@@ -123,9 +155,10 @@ cmake --build --preset x64-release
 out\build\x64-release\RayTracing.exe cornell -s 100
 out\build\x64-release\RayTracingGPU.exe final
 out\build\x64-release\RayTracingViewer.exe final
+out\build\x64-release\RayTracingViewer.exe studio
 ```
 
-In Visual Studio, open the project folder, select the `x64 Release` preset and the `RayTracing.exe` startup item, and press Ctrl+F5: the program renders the `final` scene, its default, and prints the path to the finished image. `MonteCarlo.exe`, `ImageCompare.exe` and, with the CUDA Toolkit, `RayTracingGPU.exe` and `RayTracingViewer.exe` are startup items too.
+In Visual Studio, open the project folder, select the `x64 Release` preset and the `RayTracing.exe` startup item, and press Ctrl+F5: the program renders the `final` scene, its default, and prints the path to the finished image. `MonteCarlo.exe`, `ImageCompare.exe`, `PfmStats.exe` and, with the CUDA Toolkit, `RayTracingGPU.exe`, `RayTracingViewer.exe` and `GpuTests.exe` are startup items too.
 
 After installing the CUDA Toolkit, restart Visual Studio (or the terminal) and delete CMake's cache, which remembers that CUDA was missing: **Project → Delete Cache and Reconfigure**, or `cmake --fresh --preset x64-release`. Presets, options and render times are in [Building and running](docs/building.md).
 
@@ -133,14 +166,16 @@ After installing the CUDA Toolkit, restart Visual Studio (or the terminal) and d
 
 | Path | Contents |
 |---|---|
-| `src/*.ixx` | 24 C++ modules. Twenty, compiled once into the static library `raytracer`, are the renderer (vectors, shapes, BVH, materials, textures, densities, camera, images, scenes) and the programs' shared command-line helpers; the other four belong to the GPU programs (below) |
+| `src/*.ixx` | 30 C++ module files (three of them partitions of `gpu_scenes`). Twenty, compiled once into the static library `raytracer`, are the renderer (vectors, shapes, BVH, materials, textures, densities, camera, images, scenes) and the programs' shared command-line helpers; the other ten belong to the GPU programs (below) |
 | `src/main.cpp` | `RayTracing`: renders a scene on the CPU |
-| `src/main_gpu.cpp`, `src/gpu/` | `RayTracingGPU`: renders a scene with the CUDA renderer, whose C++20 headers and two `.cu` files mirror the modules they port |
-| `src/gpu_scene.ixx`, `src/view_options.ixx` | shared by the GPU programs: a scene built with the same modules and turned into plain numbers, and the camera's options |
+| `src/main_gpu.cpp`, `src/gpu/` | `RayTracingGPU`: renders a scene with the CUDA renderer. Its C++20 headers mirror the modules they port; `renderer.cu` holds the books' two kernels, `quality.cu` the third (its path in `quality_path.cuh`, with the lamps, the shadow rays, the weights, GGX and the environment map in headers of their own), `display.cu` and `tonemap.cu` turn the image into bytes, and `lamp_table.cu` and `environment_table.cu` build the light set's tables on the CPU |
+| `src/gpu_scene.ixx`, `src/gpu_scene_parts.ixx`, `src/gpu_scenes*.ixx`, `src/strategy_options.ixx`, `src/view_options.ixx`, `src/tone_options.ixx` | shared by the GPU programs: a scene built with the same modules and turned into plain numbers, the programs' own lists of scenes (the books' 13, the four beyond them and the test scenes) and of sampling strategies, and the camera's and the display's options |
 | `src/main_viewer.cpp`, `src/viewer_*.ixx` | `RayTracingViewer`: the window, its camera moves and its scripts |
 | `src/image_compare.cpp` | `ImageCompare`: are two renders the same picture up to noise? |
 | `src/monte_carlo.cpp` | `MonteCarlo`: the third book's numerical experiments, and a test of the light sampling |
-| `external/stb`, `assets` | stb_image and stb_image_write; the Earth texture |
+| `tests` | `GpuTests`, numerical tests of the GPU's own functions (densities, samplers, weights, tables) run on the GPU with fixed seeds; `PfmStats`, statistics of renders; the window's regression scripts and scripted input |
+| `scripts/verify` | the gates that prove the books' kernels unchanged without rendering them, and the protocols that compare renders, each run through a queue that logs its GPU time |
+| `external/stb`, `assets` | stb_image and stb_image_write; the Earth texture and two HDR environment maps |
 | `cmake/sdl3.cmake` | downloads SDL3 and builds it as a static library, for the window |
 | `scripts/make-gif.ps1` | remakes the GIF of the window from its camera script |
 | `docs` | these pages, the renders and the GIF |
@@ -149,7 +184,7 @@ The module and file tables are in [Architecture](docs/architecture.md#modules).
 
 ## Development history
 
-The project was built in 70 incremental steps, one commit each, with a message that records what was done and why. The three books came first, on the CPU. Then came the first book's `materials` scene and the tools that make renders comparable: seeds, PFM files, ray counters and `ImageCompare`. The CUDA port followed: the first book, then the other two a feature at a time, each verified against the CPU. A last round of the second GPU milestone (`gpu-2`) won back the speed the first book's kernel had lost and measured the kernels' occupancy and determinism. The third GPU milestone (`gpu-3`) put the GPU renderer in a window: a session keeps the scene on the GPU and refines the image pass by pass in rounds of strata, and every frame the window shows can be rendered again offline, bit for bit. The milestones are tagged:
+The project was built in 85 incremental steps, one commit each, with a message that records what was done and why. The three books came first, on the CPU. Then came the first book's `materials` scene and the tools that make renders comparable: seeds, PFM files, ray counters and `ImageCompare`. The CUDA port followed: the first book, then the other two a feature at a time, each verified against the CPU. A last round of the second GPU milestone (`gpu-2`) won back the speed the first book's kernel had lost and measured the kernels' occupancy and determinism. The third GPU milestone (`gpu-3`) put the GPU renderer in a window: a session keeps the scene on the GPU and refines the image pass by pass in rounds of strata, and every frame the window shows can be rendered again offline, bit for bit. The fourth (`gpu-4`) went past the books in a third kernel, a feature at a time, each checked by numerical tests on the GPU and by `ImageCompare` against the strategies it improves on. It began with the tools that let the books' kernels stay as they are: a gate on their source and a comparison of their compiled machine code with the previous milestone's, which show them unchanged without rendering them, and small renders and replays of the window for the programs around them. The milestones are tagged:
 
 | Tag | Milestone |
 |---|---|
@@ -159,6 +194,7 @@ The project was built in 70 incremental steps, one commit each, with a message t
 | `gpu-1` | the `materials` scene, the tools that compare renders, and the first book on CUDA, verified against the CPU |
 | `gpu-2` | the second and third books on CUDA, each feature verified against the CPU |
 | `gpu-3` | an SDL3 window with progressive rendering and camera control |
+| `gpu-4` | light and materials beyond the books in a third kernel: next-event estimation with multiple importance sampling, GGX rough metals and glossy coats, HDR environment maps; and tone mapping |
 
 `git log --reverse` lists the steps in order; `git switch --detach gpu-1` (or any other tag above) checks out a milestone, and `git switch main` comes back.
 
@@ -166,9 +202,8 @@ The project was built in 70 incremental steps, one commit each, with a message t
 
 - **The GPU:** OptiX, NVIDIA's ray tracing framework, with the RT cores, triangle meshes and a denoiser.
 - **CPU performance:** `float` instead of `double`, SIMD, a BVH built with the surface area heuristic, rendering in tiles instead of rows.
-- **Multiple importance sampling:** weighting the material's and the lamps' samples by the power heuristic instead of a fixed half-and-half mixture.
-- **Materials and lighting:** a glossy material between matte and mirror (the third book's parting advice), and environment lighting from an HDR image.
+- **Materials:** rough glass, the GGX microfacet model for refraction.
 
 ## Credits and license
 
-The CPU renderer implements the algorithms and scenes of the books by Peter Shirley, Trevor David Black and Steve Hollasch, listed at the top, and its classes follow the books' C++ code; the project's own additions are listed under [Beyond the books](docs/architecture.md#beyond-the-books). The project's code is under the [MIT license](LICENSE). The third-party libraries are [stb_image and stb_image_write](https://github.com/nothings/stb) in `external/stb`, which keep their own license (public domain or MIT, as their files say), and [SDL3](https://libsdl.org) (zlib license), which CMake downloads when it configures. The CUDA renderer's random number generator is PCG32 by Melissa O'Neill ([pcg-random.org](https://www.pcg-random.org)), ported from her minimal C implementation. The Earth map `assets/earthmap.jpg` comes from the [books' repository](https://github.com/RayTracing/raytracing.github.io) and is CC0, like that repository.
+The CPU renderer implements the algorithms and scenes of the books by Peter Shirley, Trevor David Black and Steve Hollasch, listed at the top, and its classes follow the books' C++ code; the project's own additions are listed under [Beyond the books](docs/architecture.md#beyond-the-books). The project's code is under the [MIT license](LICENSE). The third-party libraries are [stb_image and stb_image_write](https://github.com/nothings/stb) in `external/stb`, which keep their own license (public domain or MIT, as their files say), and [SDL3](https://libsdl.org) (zlib license), which CMake downloads when it configures. The CUDA renderer's random number generator is PCG32 by Melissa O'Neill ([pcg-random.org](https://www.pcg-random.org)), ported from her minimal C implementation. The Earth map `assets/earthmap.jpg` comes from the [books' repository](https://github.com/RayTracing/raytracing.github.io) and is CC0, like that repository. The two HDR maps in `assets`, `studio_small_09` and `kloofendal_48d_partly_cloudy_puresky`, are [Poly Haven](https://polyhaven.com)'s, CC0. The AgX tone map follows Troy Sobotka's [AgX](https://github.com/sobotka/AgX), in the forms of iolite's Minimal AgX (© 2024 Missing Deadlines) and of [linlin's closed-form curve](https://github.com/bWFuanVzYWth/AgX) (© 2024 linlin), both under the MIT license, whose notice is in `src/gpu/tone_curves.cuh`; PBR Neutral is written from [Khronos's](https://github.com/KhronosGroup/ToneMapping) equations. The third kernel's methods come from the papers [Light and materials](docs/quality.md) cites: Veach (1997), Walter et al. (2007), Heitz (2014, 2018), Dupuy and Benyoub (2023), Turquin (2019), Ashikhmin and Shirley (2000), Vose (1991) and Jimenez (2014), with ideas, not code, from pbrt-v4.

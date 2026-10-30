@@ -40,7 +40,7 @@ The CPU renderer implements the techniques of [the three books](#third-party-cod
 - **A test of the light sampling:** `MonteCarlo light-pdfs` checks that each light's `pdf_value()` is the density of the directions its `random()` draws, for quads, spheres, lists and instances, since a mismatch would bias the image ([the experiments](sampling.md#the-montecarlo-program)).
 - **Error bars for the third book's Monte Carlo experiments,** whose listings print no standard errors: `MonteCarlo` prints every estimate, the halfway point included, next to the exact value, its standard error and its error in standard errors, and compares the RMS error of repeated runs with σ/√N, or with an exact standard error for stratified samples. It also lists the largest x each density draws, a check that catches the book's inverse CDF for the quadratic density, which draws x up to 8 ([an example](sampling.md#the-montecarlo-program)).
 - **No heap allocation per bounce:** the book creates its densities with `make_shared` at every bounce; here they are small values on the stack.
-- **Smoke and fog sample with their own density** under the default mixture, because mixing the lamps in multiplies the weights along paths that scatter many times ([why, and the price](sampling.md#where-the-mixture-cant-help)).
+- **Smoke and fog sample with their own density** under the default mixture, because mixing the lamps in multiplies the weights along paths that scatter many times ([why, and the price](sampling.md#where-the-mixture-cant-help)); under the GPU's `-p nee` and `-p mis` they take light samples of their own ([what that changes](sampling.md#what-next-event-estimation-changes)).
 - **The third book's mistakes, fixed** rather than repeated, each explained in a comment next to the fix ([the list](sampling.md#fixes-to-the-third-book)).
 - **The CUDA renderer** ([details](gpu.md)):
   - every scene of the three books on an NVIDIA graphics card, with all four sampling strategies, built by the same scene code and camera as on the CPU, [60 to 190 times faster](../README.md#performance) than the CPU renderer on the same machine, and shown by `ImageCompare` to render the books' scenes as the CPU renderer does, up to Monte Carlo noise;
@@ -55,10 +55,21 @@ The CPU renderer implements the techniques of [the three books](#third-party-cod
   - every frame it shows can be rendered again, bit for bit: by `RayTracingGPU` from the command P prints, or by the viewer itself without a window from a recording;
   - frames paced to the display while the camera moves and 50 ms of GPU work each while it stands still; waits for the GPU that sleep, so the CPU stays nearly idle;
   - camera scripts and scripted input, which make the window's behavior testable: a recording of a live window driven by scripted events, replayed without a window, gives the same frames.
+- **Light and materials beyond the books,** in a third CUDA kernel, in `float`, beside the books' two, which stay unchanged, instruction for instruction ([details](quality.md)):
+  - next-event estimation, a shadow ray toward a lamp or the environment map at every bounce (`-p nee`), and multiple importance sampling, which weighs that light sample against the material's own sample of the same light by Veach's power heuristic (`-p mis`) ([how](quality.md#next-event-estimation-and-multiple-importance-sampling));
+  - shadow rays through smoke and fog: an any-hit search of the same BVH, and the transmittance of the media along the ray in closed form, the expected value of the books' own test of a volume, with no random number drawn; particles of smoke take light samples too ([how](quality.md#shadow-rays-through-smoke-and-fog));
+  - rough metals with the GGX microfacet model, sampled among the facets the viewer can see, with Turquin's compensation for the light that leaves after bouncing between facets, which the model alone loses; and glossy coats, a GGX coat over a matte base ([how](quality.md#rough-metals-and-glossy-coats));
+  - HDR photographs of the surroundings as the sky, sampled by their brightness with an alias table over cells of exact solid angle, so that a sun of a few texels is found by shadow rays rather than by chance ([how](quality.md#the-environment-map));
+  - tone mapping on the GPU, in a kernel of its own that serves every scene: AgX, Khronos PBR Neutral or the plain sRGB curve, with an exposure and a dither, for the PNGs and the window; the books' scenes keep the books' bytes by default, and PFM files stay linear ([how](quality.md#tone-mapping));
+  - four scenes of its own, `cornell-ggx`, `veach`, `studio` and `sunlit`, and test scenes: white furnaces, where every pixel must come out exactly 1, or as much light as a material keeps, and `sun-test`, matte spheres in the sun, where `-p nee` and `-p mis` must agree.
+- **A verification toolkit,** committed with the code ([how it was used](quality.md#how-it-was-verified)):
+  - `GpuTests` runs numerical tests of the GPU renderer's own device functions on the GPU, with fixed seeds: Pearson's χ² of the samplers' draws against their densities, Monte Carlo means against closed forms, Veach's conditions on the weights, the tables against their definitions, and planted faults that the same checks must reject. `ctest` runs every test kernel on a few samples, and skips them on a computer without an NVIDIA GPU;
+  - `PfmStats` gives the numbers about renders that `ImageCompare` doesn't: the noise of one render from two seeds, the RMS rule for two strategies of unequal noise, a patch's mean against a value, how many values are exactly 1, and whether two renders are the same bytes;
+  - the scripts in `scripts/verify` prove the books' kernels unchanged by their sources and their machine code (disassembled by `cuobjdump`), without rendering them, and the programs' host behavior by small renders and replays of the window ([the gates](gpu.md#the-books-kernels-unchanged)); they also run `ImageCompare`'s protocol for two strategies and compute-sanitizer's memory checks, every GPU run through one queue that logs it.
 
 ## Library and programs
 
-Each `.ixx` file in `src/` is a C++20 module (`export module ...`). Twenty of them are compiled once into a static library, `raytracer`, and every program links it. The CUDA renderer is a separate static library, `gpu_renderer`, compiled by `nvcc`, and `gpu_scene` is a library of two modules shared by the GPU programs: `gpu_scene`, which translates a scene for the renderer, and `view_options`, the camera's options. These, `RayTracingGPU` and `RayTracingViewer` are built only when CMake finds the CUDA Toolkit; the viewer also needs SDL3, which CMake downloads ([building](building.md#sdl3-for-the-window)).
+Each `.ixx` file in `src/` is a C++20 module (`export module ...`) or a [partition](#modern-c) of one. Twenty of them are compiled once into a static library, `raytracer`, and every program links it. The CUDA renderer is a separate static library, `gpu_renderer`, compiled by `nvcc`, and `gpu_scene` is a library of eight module files shared by the GPU programs: `gpu_scene`, which translates a scene for the renderer; `gpu_scenes` with its three partitions, the programs' own list of scenes; `strategy_options`, their sampling strategies; and `view_options` and `tone_options`, the camera's and the display's options. These, `RayTracingGPU`, `RayTracingViewer` and `GpuTests` are built only when CMake finds the CUDA Toolkit; the viewer also needs SDL3, which CMake downloads ([building](building.md#sdl3-for-the-window)).
 
 ```mermaid
 flowchart LR
@@ -66,11 +77,14 @@ flowchart LR
     lib --> rt["RayTracing: renders on the CPU"]
     lib --> mc["MonteCarlo: the numerical experiments"]
     lib --> ic["ImageCompare: the statistical test"]
-    lib --> gs["gpu_scene: a scene translated into plain numbers, the camera's options"]
+    lib --> ps["PfmStats: numbers about renders"]
+    lib --> gs["gpu_scene: a scene translated into plain numbers, the GPU's lists of scenes and strategies, the camera's and the display's options"]
     gs --> gp["RayTracingGPU: renders a scene on the GPU"]
     gs --> vw["RayTracingViewer: the window, its camera moves and scripts"]
+    gs --> gt["GpuTests: numerical tests on the GPU"]
     cu["gpu_renderer: src/gpu, CUDA C++20 compiled by nvcc"] --> gp
     cu --> vw
+    cu --> gt
     sdl["SDL3, downloaded and built as a static library"] --> vw
 ```
 
@@ -81,6 +95,8 @@ flowchart LR
 | `RayTracingViewer` | `main_viewer.cpp` | shows a scene in a window and refines it on the GPU while the camera stands still; the window's events, frames, keys, scripts and recordings |
 | `ImageCompare` | `image_compare.cpp` | are two renders the same picture up to noise? |
 | `MonteCarlo` | `monte_carlo.cpp` | the third book's numerical experiments, with the renderer's own random numbers, directions and densities, and a test of the light sampling |
+| `GpuTests` | `tests/gpu_tests.cpp`, `tests/*_tests.cu` | numerical tests of the GPU renderer's own device functions, run on the GPU with fixed seeds, in 12 suites |
+| `PfmStats` | `tests/pfm_stats.cpp` | the numbers about renders that `ImageCompare` doesn't give: the noise of one render, the RMS rule, exact values, identical bytes |
 
 ## Modules
 
@@ -111,19 +127,26 @@ The GPU programs' own modules:
 
 | Module | Contents |
 |---|---|
-| `gpu_scene` | a scene built with the CPU's modules and translated into the renderer's plain structures; the camera's frame for the GPU |
+| `gpu_scene` | a scene built with the CPU's modules and translated into the renderer's plain structures, with its GGX side entries and its environment map; the camera's frame for the GPU; which kernel renders it, and what that kernel refuses |
+| `gpu_scenes` | the GPU programs' list of scenes: the books' 13 in their order, built by the CPU's own code, then the GPU's own, each with its role (the books', beyond the books, a test), its strategy and its display; the white furnace; the help's lists of scenes |
+| `gpu_scenes:parts` (`gpu_scene_parts.ixx`) | the list's types: a scene as the CPU's objects and camera, plus what the CPU's classes can't describe (GGX side entries found by their placeholder material's address, an environment map with its turn and scale) |
+| `gpu_scenes:materials` (`gpu_scenes_materials.ixx`) | the scenes of rough metals and glossy coats: `ggx-furnace`, `gloss-furnace`, `cornell-ggx`, `veach` |
+| `gpu_scenes:environments` (`gpu_scenes_environments.ixx`) | the scenes lit by an environment map: `env-furnace`, `studio`, `sunlit`, `sun-test` |
+| `strategy_options` | the GPU programs' sampling strategies (`-p`): the books' four, named and described as in `RayTracing`'s list, then `nee` and `mis`; the choice of kernel (`--all-books-kernel`, `--quality-kernel`) |
+| `tone_options` | `--tonemap` and `--exposure`: the tone maps' names for the options, the window's keys and the scripts, and what a scene shows (what the options choose, the scene's own display for the rest) |
 | `view_options` | the camera's options (`--height`, `--lookfrom`, `--lookat`, `--vfov`, `--defocus-angle`, `--focus-dist`), the checks a view must pass, and the `View:` line that prints a view as options |
 | `viewer_camera` | the window's camera moves as pure functions of the camera's settings: orbit, look, pan, dolly, zoom, fly, the lens and the focus, shared by the mouse, the keys and the scripts |
 | `viewer_script` | the window's camera scripts, recordings and input files, as text: parsing them and writing them |
 
 ## The CUDA renderer's files
 
-The CUDA renderer in `src/gpu` is ordinary C++20 headers and two `.cu` files, compiled by `nvcc`, which can't import modules. Its files mirror the modules they port:
+The CUDA renderer in `src/gpu` is ordinary C++20 headers and six `.cu` files, compiled by `nvcc`, which can't import modules. The books' files mirror the modules they port. The files beyond the books, the third kernel's and the tone maps' from `quality.cu` down, have nothing on the CPU to port, and they stay apart from the books' kernels: `renderer.cu` includes none of their device code, and each of the new `.cu` files is a translation unit of its own, so `nvcc` compiles the books' kernels as before.
 
 | File | Contents | Ports |
 |---|---|---|
-| `renderer.h` | the interface between the GPU programs (`gpu_scene.ixx`) and the renderer: the scene as plain numbers in (shapes, materials, textures, volumes, the lights list), the image out; a rendering session | |
-| `renderer.cu` | the two kernels and the host code around them: the scene checked and copied to the GPU, the session (views, rounds of strata, launches in passes, the image's bytes for the screen, waits that sleep), timing | `camera::render` |
+| `renderer.h` | the interface between the GPU programs (`gpu_scene.ixx`) and the renderer: the scene as plain numbers in (shapes, materials, textures, volumes, the lights list, and for the third kernel GGX side entries, an environment map and how light samples are weighed), the image out; a rendering session; the display transforms | |
+| `renderer.cu` | the books' two kernels and the host code around them: the scene checked and copied to the GPU, the choice of kernel, the session (views, rounds of strata, launches in passes, the image's bytes for the screen, waits that sleep), timing | `camera::render` |
+| `device_memory.h` | CUDA's errors as exceptions, and an array in the GPU's memory that owns it: host code, shared by `renderer.cu`, `quality.cu` and `GpuTests` | |
 | `display.cu`, `display.cuh` | the image's bytes for the screen, computed on the GPU as `image::save_png` computes a PNG's (compiled without fused multiply-adds, and apart from the kernels, so it can't change how they compile) | `image` |
 | `scene.cuh` | the scene as each of the two kernels sees it | |
 | `camera.cuh` | camera rays, the sky, one step of a path, the four sampling strategies | `camera` |
@@ -138,21 +161,39 @@ The CUDA renderer in `src/gpu` is ordinary C++20 headers and two `.cu` files, co
 | `pdf.cuh` | densities of directions | `pdf` |
 | `random.cuh` | a PCG32 generator for every sample, random directions without loops | `random`, `vec3` |
 | `vec3.cuh` | `vec3` and the math functions in both `float` and `double` | `vec3`, `ray` |
+| `quality.cu`, `quality.cuh` | the third kernel, the quality kernel, with the host code that uploads its own arrays and launches it; `renderer.cu` sees only `quality.cuh`'s host functions and an opaque handle | |
+| `quality_view.cuh` | the scene as the quality kernel sees it: the books' tables, read as the kernel for all three books reads them, and its own beside them | |
+| `quality_path.cuh` | its integrator: a path as the books trace it, plus a light sample at every vertex with a density, a running sum of the light found, and the density each ray was drawn with | |
+| `tracer.cuh` | how the integrator finds what a ray meets: the `tracer` concept and the BVH's tracer, so that the shading code never names the BVH | |
+| `shadow.cuh` | the shadow ray: an any-hit search of the BVH up to the light, and the transmittance of the smoke and fog along it | |
+| `bsdf.cuh` | the materials as one interface: draw a direction with its density and weight, evaluate f·cos θ and the density of a direction drawn otherwise, or say there is no density (a mirror, glass) | |
+| `ggx.cuh` | the GGX microfacet model of rough metals and glossy coats, as pure functions: the lobe, its sampling by visible normals with spherical caps, the energy compensation | |
+| `ggx_energy.cuh` | a 32×32 table of the light a white GGX metal keeps after one bounce off its facets, by roughness and angle, written by `GpuTests ggx-energy --write` | |
+| `lamps.cuh`, `lamp_table.cu` | the lamps the quality kernel samples, the world's glowing quads and spheres that stand still: a direction toward each with its density; the set built on the host | |
+| `light_sampler.cuh` | the lamps and the environment map as one set of lights, one picked uniformly per light sample | |
+| `mis.cuh` | the weights of multiple importance sampling: Veach's power heuristic, and those of `-p nee` | |
+| `environment.cuh` | the environment map: from a direction to its texel and back, and its radiance | |
+| `environment_data.h`, `environment_table.cu` | the map's tables, built on the host in `double`: cells of exact solid angle, each texel's density, the alias table | |
+| `background.cuh` | what a ray that hits nothing sees, the camera's sky or the map (its nearest texel, or four blended for camera rays and rays off mirrors and glass), and the map as a light | |
+| `lamps_on_device.cuh`, `microfacets_on_device.cuh`, `environment_on_device.cuh` | the quality kernel's own arrays on the GPU, a class for each part | |
+| `tonemap.cu`, `tonemap.cuh` | the image's bytes through a tone map, a kernel of its own compiled without fused multiply-adds, and `renderer.cu`'s view of it | |
+| `tone_curves.cuh` | the tone curves (the sRGB curve, AgX, PBR Neutral), the rounding to bytes and its dither | |
 
-How these pieces render a scene, and why they are built this way: [the CUDA renderer](gpu.md#how-it-renders).
+How these pieces render a scene, and why they are built this way: [the CUDA renderer](gpu.md#how-it-renders), and for the third kernel's, [light and materials](quality.md).
 
 ## Modern C++
 
 | Standard | Used for |
 |---|---|
 | C++23 | `import std;`; `std::expected` for errors; deducing this and a multidimensional `operator[]` (`img[x, y]`); `std::views::cartesian_product` and `std::views::zip`; `std::ranges::fold_left`, `contains`, `iota` and `to`; `std::unreachable`; `std::byteswap` and `std::print` for PFM files |
-| C++20 | modules; concepts (`direction_pdf`, `real_number`); ranges with projections and `std::views::split`; designated initializers; `std::jthread` and `std::atomic::wait`/`notify`; `std::bit_cast`; a defaulted `operator==`; a generic lambda with a constrained `auto` parameter |
+| C++20 | modules and module partitions; concepts (`direction_pdf`, `real_number`); ranges with projections and `std::views::split`; designated initializers; `std::jthread` and `std::atomic::wait`/`notify`; `std::bit_cast`; a defaulted `operator==`; a generic lambda with a constrained `auto` parameter; `consteval` |
 | C++17 | `std::variant` with `std::visit` and `std::get_if`; `std::optional`; class template argument deduction; `if constexpr` |
-| CUDA, C++20 | device code written once as templates on the number type, constrained by a concept; RAII classes for GPU memory and CUDA events |
+| CUDA, C++20 | device code written once as templates on the number type, constrained by a concept; the third kernel's integrator as a template on a `tracer` concept; RAII classes for GPU memory and CUDA events |
 
 Where each one is used, and why:
 
 - **Modules and `import std;`** (C++20/23) instead of headers. The `std` module is built from `std.ixx`, which ships with MSVC (see `CMakeLists.txt`). The stb libraries are included in the global module fragment of the `image` module and are not visible outside it. An `import` isn't passed on (only `export import` is): `image` imports `vec3`, but a file that imports `image` still has to import `vec3` to use `color`, so every file imports what it uses.
+- **Module partitions** (C++20): parts of one module, each in a file of its own. The GPU programs' list of scenes, the module `gpu_scenes`, has three: `gpu_scenes:parts` holds the list's types, `gpu_scenes:materials` the scenes of rough metals and glossy coats, and `gpu_scenes:environments` those lit by an environment map, so each kind of scene beyond the books was written in a file of its own, and adding one edits no other. The primary interface, `gpu_scenes.ixx`, holds the list and re-exports the partitions (`export import :materials;`), as the standard requires of an interface partition. The two partitions of scenes export nothing themselves: their scenes' functions have module linkage, visible to the module's other units, where the list takes their addresses, and to no file that imports the module. An internal partition (`module gpu_scenes:materials;`, without `export`) would say so in its first line, but MSVC compiles a `.ixx` file only as an interface. Each partition keeps its helpers in an unnamed namespace, so two of them can have helpers of the same name.
 - **`constexpr` and `inline` in modules.** In a named module, unlike in a header, a function defined inside a class doesn't become `inline` by itself. So every function of the `vec3` module is declared `constexpr` (which implies `inline`) or `inline`; otherwise the compiler couldn't inline `vec3` calls into other modules' code, and a ray tracer makes billions of them (`vec3.ixx`).
 - **Static and dynamic polymorphism side by side.** Objects and materials are open families of long-lived objects, so they keep the books' virtual functions. Densities of directions, derived from an abstract base class in the book, are a closed set of short-lived values on the hottest path, so here they do without virtual functions: a **concept** (`direction_pdf`, C++20) instead of a base class, a class template `mixture_pdf` whose template arguments are deduced from the constructor's arguments (**CTAD**, C++17), a generic lambda with a constrained `auto` parameter (C++20), and **`std::variant` with `std::visit`** (C++17) for the density a material returns (`pdf.ixx`, `camera.ixx`).
 - **`std::variant` and `std::get_if`** for what a material does with a ray: a diffuse scatter (with a density) or a specular one (with a ready ray), wrapped in `std::optional` for absorption. The viewer's camera scripts are lists of `std::variant`s too, one alternative per command, from lines cut with `std::views::split` (`viewer_script.ixx`).
@@ -162,12 +203,12 @@ Where each one is used, and why:
 - **`std::expected`** (C++23) for errors, and **`std::optional`** instead of a "`bool` + out parameter" pair; `std::optional` and `value_or` for options the scene sets itself unless they are given.
 - **Designated initializers** (C++20) for camera settings: `{.aspect_ratio = 1.0, .vfov = 40}`.
 - **`std::jthread` and `std::atomic::wait`/`notify`** (C++20) in the multithreaded renderer (`camera.ixx`).
-- **Tables of scenes, sampling strategies and experiments** are `constexpr std::array`s. A scene's entry holds a pointer to the function that builds it, so only the chosen scene gets built; an experiment's entry holds the function that runs it.
+- **Tables of scenes, sampling strategies and experiments** are `constexpr std::array`s. A scene's entry holds a pointer to the function that builds it, so only the chosen scene gets built; an experiment's entry holds the function that runs it. The GPU programs' tables are made by **`consteval`** functions (C++20), which run only at compile time: their strategies take the books' four names and descriptions from the CPU's table, where a missing one is a compile error, so their help prints `RayTracing`'s lines exactly (`strategy_options.ixx`); their list of scenes begins with a function template's instantiations, one per index of the CPU's list (`std::index_sequence`), each a function of its own whose address the list holds beside the GPU's own scenes' (`gpu_scenes.ixx`).
 - **`std::unique_ptr` with a custom deleter** frees memory allocated by a C library (`image::load`).
 - **Delegating constructors:** a stationary sphere is a special case of a moving one, and a color is a special case of a texture.
 - **Ref-qualifier `&&`** on a member function: `std::move(list).release_objects()`.
 - **Ownership:** objects via `std::unique_ptr` (wrappers nest: `translate(rotate_y(box))`), shared materials and textures via `std::shared_ptr<const ...>`, and a non-owning `const material*` in the hot loop.
-- **C++ on the GPU** (CUDA, C++20): device code written once as templates on the number type, constrained by a concept (`real_number`: `float` or `double`), with `if constexpr` for what differs; RAII classes for GPU memory and CUDA events; designated initializers for the plain structures that cross from the CPU to the GPU (`src/gpu`).
+- **C++ on the GPU** (CUDA, C++20): device code written once as templates on the number type, constrained by a concept (`real_number`: `float` or `double`), with `if constexpr` for what differs; RAII classes for GPU memory and CUDA events; designated initializers for the plain structures that cross from the CPU to the GPU (`src/gpu`). The third kernel's integrator is a template on the way it finds what a ray meets, constrained by a concept, `tracer` (the closest hit, the surface at it, and how much of a light gets through to a point), so the shading code never names the BVH and another tracer can take its place (`tracer.cuh`, `quality_path.cuh`).
 - **`std::bit_cast` and `std::byteswap`** (C++20, C++23) for the byte order of a PFM file, and **`std::print` into a stream** (C++23) for its header (`image.ixx`).
 - **`dynamic_cast`** asks the CPU's objects what they really are when the GPU programs translate them into plain numbers, walking lists, BVHs and instances (`gpu_scene.ixx`), and when the viewer's click-to-focus looks through smoke (`main_viewer.cpp`). `std::conditional_t` gives each of the GPU's two kernels its own scene type, and a defaulted `operator==` (C++20) compares the lights list's shapes with the world's (`src/gpu`).
 - **UTF-8 everywhere:** `/utf-8` for sources and strings, and the `src/utf8.manifest` manifest switches the process to UTF-8 (Windows 10 1903+), so paths with Cyrillic characters work in arguments too.
@@ -176,6 +217,6 @@ Where each one is used, and why:
 
 The CPU renderer implements the algorithms and scenes of the book series by Peter Shirley, Trevor David Black and Steve Hollasch: ["Ray Tracing in One Weekend"](https://raytracing.github.io/books/RayTracingInOneWeekend.html), ["Ray Tracing: The Next Week"](https://raytracing.github.io/books/RayTracingTheNextWeek.html) and ["Ray Tracing: The Rest of Your Life"](https://raytracing.github.io/books/RayTracingTheRestOfYourLife.html). Its classes follow the books' C++ code; the project's own additions are listed above under [Beyond the books](#beyond-the-books).
 
-The third-party libraries are [stb_image and stb_image_write](https://github.com/nothings/stb) in `external/stb`, which keep their own license (public domain or MIT, as their files say), and [SDL3](https://libsdl.org) (zlib license), which CMake downloads and builds for the viewer's window. The README's GIF of the viewer is made with [gifski](https://gif.ski), run as a separate program by `scripts/make-gif.ps1`. The CUDA renderer's random number generator is PCG32 by Melissa O'Neill ([pcg-random.org](https://www.pcg-random.org)), ported from her minimal C implementation. The Earth map `assets/earthmap.jpg` comes from the [books' repository](https://github.com/RayTracing/raytracing.github.io) and is CC0, like that repository. The project's own code is under the [MIT license](../LICENSE).
+The third-party libraries are [stb_image and stb_image_write](https://github.com/nothings/stb) in `external/stb`, which keep their own license (public domain or MIT, as their files say), and [SDL3](https://libsdl.org) (zlib license), which CMake downloads and builds for the viewer's window. The README's GIF of the viewer is made with [gifski](https://gif.ski), run as a separate program by `scripts/make-gif.ps1`. The CUDA renderer's random number generator is PCG32 by Melissa O'Neill ([pcg-random.org](https://www.pcg-random.org)), ported from her minimal C implementation. The Earth map `assets/earthmap.jpg` comes from the [books' repository](https://github.com/RayTracing/raytracing.github.io) and is CC0, like that repository. The two HDR environment maps in `assets`, `studio_small_09_1k.hdr` (a photographer's studio lit by softboxes) and `kloofendal_48d_partly_cloudy_puresky_1k.hdr` (a partly cloudy sky with the sun 48° up), are [Poly Haven](https://polyhaven.com)'s, CC0, committed as published so that the programs and the tests need no download. The AgX tone map follows Troy Sobotka's [AgX](https://github.com/sobotka/AgX): its matrices and structure come from iolite's Minimal AgX by Benjamin Wrensch (© 2024 Missing Deadlines), and the closed form of its curve from [linlin's AgX](https://github.com/bWFuanVzYWth/AgX) (© 2024 linlin), both under the MIT license, whose notice `src/gpu/tone_curves.cuh` carries. Khronos PBR Neutral is written from the equations of [Khronos's description](https://github.com/KhronosGroup/ToneMapping). The project's own code is under the [MIT license](../LICENSE).
 
-Published methods are credited in the comments where the code uses them. Among them, the CUDA renderer uses the SplitMix64 finalizer (Steele, Lea and Flood, 2014) to hash the seed, the pixel and the pass into each sample's generator, the ray-sphere discriminant of Haines et al. (*Ray Tracing Gems*, 2019, chapter 7), Aila and Laine's guard against zero direction components in the slab test, and the orthonormal basis of Duff et al. (JCGT, 2017); `ImageCompare` computes Student's t distribution through the incomplete beta function as in *Numerical Recipes* (section 6.4).
+Published methods are credited in the comments where the code uses them. Among them, the CUDA renderer uses the SplitMix64 finalizer (Steele, Lea and Flood, 2014) to hash the seed, the pixel and the pass into each sample's generator, the ray-sphere discriminant of Haines et al. (*Ray Tracing Gems*, 2019, chapter 7), Aila and Laine's guard against zero direction components in the slab test, and the orthonormal basis of Duff et al. (JCGT, 2017); `ImageCompare` computes Student's t distribution through the incomplete beta function as in *Numerical Recipes* (section 6.4). The third kernel is written from Veach's thesis (1997, chapter 9) for multiple importance sampling and the power heuristic; Walter et al. (2007) for the GGX microfacet model, with Heitz's height-correlated masking and shadowing (2014) and sampling of visible normals (2018), drawn by the spherical caps of Dupuy and Benyoub (2023); Schlick (1994) for the facets' reflectance and Burley (2012) for the roughness scale α = r²; Turquin (2019) for the energy compensation; Ashikhmin and Shirley (2000) for the coupled diffuse term under a glossy coat; Vose (1991) for the alias table; and Jimenez (2014) for the interleaved gradient noise of the tone maps' dither. Its code is re-derived from the papers' equations, with ideas but no code from pbrt-v4. The colors of gold, silver, copper and aluminum are the measured base colors of the Unreal Engine's documentation (Physically Based Materials), taken as linear colors.
