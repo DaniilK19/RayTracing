@@ -93,6 +93,12 @@ consteval auto make_scene_list(std::index_sequence<I...>)
                         "photo studio (OptiX)", scene_role::test, &pbr_test, strategy::mis},
         gpu_scene_entry{"pbr-reference", "the same spheres, glTF's materials mapped to GGX: the reference of "
                         "pbr-test (OptiX)", scene_role::test, &pbr_reference, strategy::mis},
+        gpu_scene_entry{"still-life", "a marble bust and a brass vase in a photo studio (glTF models, OptiX)",
+                        scene_role::showcase, &still_life, strategy::mis, still_life_display},
+        gpu_scene_entry{"busts", "three marble busts in the sun on a checkered ground: one mesh, three instances "
+                        "(OptiX)", scene_role::showcase, &busts, strategy::mis, busts_display},
+        gpu_scene_entry{"cornell-bust", "the Cornell box with the marble bust in place of the tall block (OptiX)",
+                        scene_role::showcase, &cornell_bust, strategy::mis, cornell_bust_display},
     };
 }
 
@@ -132,7 +138,7 @@ export std::string scenes_usage(std::string_view default_scene)
         return text;
     };
     constexpr std::array headings{
-        std::pair{scene_role::showcase, "Scenes beyond the books (the quality kernel, float):"},
+        std::pair{scene_role::showcase, "Scenes beyond the books (the quality kernel or OptiX, float):"},
         std::pair{scene_role::test, "Test scenes (checks of the renderers):"},
     };
     std::string text = group(scene_role::book) + std::format("  Default: {}.\n", default_scene);

@@ -131,3 +131,18 @@ V --headless --script scripts\verify\cli-scripts\quality-mixture.txt
 V --headless --script scripts\verify\cli-scripts\unknown-tonemap.txt
 V --headless --script scripts\verify\cli-scripts\bad-exposure.txt
 V --headless --script scripts\verify\cli-scripts\fp64-tonemap.txt
+
+# glTF models and the scenes with triangle meshes, which OptiX alone renders (Step 93): refused before CUDA starts.
+# tests\data\cut-short.glb is committed: the 12-byte header of a .glb whose length says 256 bytes (67 6C 54 46 02 00 00
+# 00 00 01 00 00: "glTF", version 2, length 256), the bytes MeshTests' refusals.glb-cut-short refuses (it checks the
+# file against them). tests\data\lines-only.gltf is a model of one LINES primitive: refused for having no triangle,
+# with the loader's warning that says why.
+G nosuch.glb
+G x.obj
+G tests\data\cut-short.glb -w 16 -s 1 -o out\m5\runs\cli-case.png
+G tests\data\lines-only.gltf -w 16 -s 1 -o out\m5\runs\cli-case.png
+G assets\models\brass_vase_01\brass_vase_01_1k.gltf --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G still-life --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G still-life --quality-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
+G still-life --all-books-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
+G mesh-furnace -p mixture -w 16 -s 1 -o out\m5\runs\cli-case.png

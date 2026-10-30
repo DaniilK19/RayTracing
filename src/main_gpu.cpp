@@ -31,7 +31,7 @@ constexpr int max_launch_ms = static_cast<int>(gpu::max_launch_seconds * 1000);
 // "not given: take it from the scene" apart from any given value.
 struct options
 {
-    std::string_view scene = default_gpu_scene;
+    std::string_view scene = default_gpu_scene; // a scene's name, or a glTF model's file (is_model_path)
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
     std::optional<int> strata; // rounds of strata × strata: -s is then exact (see gpu::session)
@@ -54,6 +54,8 @@ void print_usage()
                  "Renders RayTracing's scenes on an NVIDIA graphics card with CUDA.\n\n"
                  "Scenes:");
     std::print("{}", scenes_usage(default_gpu_scene));
+    std::println("\nOr a glTF 2.0 model, FILE.glb or FILE.gltf, in a photo studio (OptiX renders it; the image is\n"
+                 "saved in the current folder as NAME-gpu.png, NAME the file's name without its extension).");
     std::println(R"(
 Options:
   -w, --width N        image width in pixels (each scene has its own default); the height follows
@@ -127,10 +129,19 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             continue;
         }
 
-        // An argument without a dash is the scene name: any of the GPU programs' scenes (gpu_scenes.ixx)
+        // An argument without a dash is the scene name: any of the GPU programs' scenes (gpu_scenes.ixx), or a glTF 2.0
+        // model's file (it ends in .glb or .gltf, which no scene's name does), which must exist
         if (!arg.starts_with('-'))
         {
-            if (!find_gpu_scene(arg))
+            if (is_model_path(arg))
+            {
+                std::error_code error;
+                if (!std::filesystem::is_regular_file(std::filesystem::path(arg), error))
+                {
+                    return std::unexpected(std::format("there is no file '{}'", arg));
+                }
+            }
+            else if (!find_gpu_scene(arg))
             {
                 return std::unexpected(std::format("unknown scene '{}'", arg));
             }
@@ -264,8 +275,11 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
     }
     if (opts.outputs.empty())
     {
-        // -gpu: a GPU render never replaces the CPU's <scene>.png, so the two can be compared
-        opts.outputs.emplace_back(std::format("{}-gpu.png", opts.scene));
+        // -gpu: a GPU render never replaces the CPU's <scene>.png, so the two can be compared. A model's image is named
+        // after its file, in the current folder: bust.glb gives bust-gpu.png
+        const std::string stem =
+            is_model_path(opts.scene) ? to_utf8(std::filesystem::path(opts.scene).stem()) : std::string(opts.scene);
+        opts.outputs.emplace_back(std::format("{}-gpu.png", stem));
     }
     return opts;
 }
@@ -328,6 +342,14 @@ int main(int argc, char* argv[])
                                  : opts->quality_kernel   ? kernel_choice::quality
                                  : opts->all_books_kernel ? kernel_choice::all_books
                                                           : kernel_choice::automatic;
+    // A scene with triangle meshes (a model's file among them) renders with OptiX, which alone traces them, without
+    // --optix: what it can't be rendered with is said first, in its own words (see check_meshes in gpu_scene.ixx)
+    const bool meshes = !built->desc.meshes.instances.empty();
+    if (const auto checked = check_meshes(*built, opts->scene, chosen, opts->fp64); !checked)
+    {
+        std::println("Error: {}", checked.error());
+        return 1;
+    }
     if (const auto checked = check_kernel(*built, opts->scene, chosen, opts->fp64); !checked)
     {
         std::println("Error: {}", checked.error());
@@ -340,12 +362,14 @@ int main(int argc, char* argv[])
         std::println("Error: {}", checked.error());
         return 1;
     }
-    // OptiX, only for --optix: nothing of it starts otherwise, so every other run is as before. It runs on the CUDA
-    // device query_device() starts, so it starts after that, below; a build without OptiX's headers refuses --optix
-    // here instead, before CUDA starts (start_optix() then says why, and starts nothing). The runtime lives until main
-    // returns, after every session that used it (never a static: CUDA's own exit comes first).
+    // OptiX, only for --optix and for a scene with triangle meshes: nothing of it starts otherwise, so every other run
+    // is as before. It runs on the CUDA device query_device() starts, so it starts after that, below; a build without
+    // OptiX's headers refuses both here instead, before CUDA starts (start_optix() then says why, and starts nothing).
+    // The runtime lives until main returns, after every session that used it (never a static: CUDA's own exit comes
+    // first).
+    const bool use_optix = opts->optix || meshes;
     std::shared_ptr<gpu::optix_runtime> optix;
-    const auto open_optix = [&optix] {
+    const auto open_optix = [&optix, &opts] {
         try
         {
             optix = gpu::start_optix();
@@ -353,11 +377,20 @@ int main(int argc, char* argv[])
         }
         catch (const std::exception& error)
         {
-            std::println("Error: --optix: {}", error.what()); // why: no headers, the driver, OptiX's version
+            // Why: no headers, the driver, OptiX's version
+            if (opts->optix)
+            {
+                std::println("Error: --optix: {}", error.what());
+            }
+            else
+            {
+                std::println("Error: '{}' has triangle meshes, which only OptiX renders: {}", opts->scene,
+                             error.what());
+            }
             return false;
         }
     };
-    if (opts->optix && !gpu::optix_built() && !open_optix())
+    if (use_optix && !gpu::optix_built() && !open_optix())
     {
         return 1;
     }
@@ -374,6 +407,14 @@ int main(int argc, char* argv[])
     {
         std::println("Display: {}, {}", tone_map_name(display.op), format_exposure(display.exposure));
     }
+    // What the renderer can't show of the glTF models it read (gltf.ixx), one line each, before it renders
+    for (const model_load& model : built->models)
+    {
+        for (const std::string& warning : model.warnings)
+        {
+            std::println("Warning: {}", warning);
+        }
+    }
 
     const int width = frame.image_width;
     const int height = frame.image_height;
@@ -387,7 +428,7 @@ int main(int argc, char* argv[])
                      device.name, device.multiprocessors, device.compute_capability_major,
                      device.compute_capability_minor, device.memory_gib, cuda_version(device.runtime_version),
                      cuda_version(device.driver_version), opts->fp64 ? "float64" : "float32");
-        if (opts->optix && !open_optix())
+        if (use_optix && !open_optix())
         {
             return 1;
         }
@@ -416,7 +457,7 @@ int main(int argc, char* argv[])
             .launch_seconds = opts->launch_ms / 1000.0,
             .passes = rays_per_pixel,
             .display = display,
-            .optix_tracer = opts->optix,
+            .optix_tracer = use_optix,
             .optix = optix};
         result = gpu::render(built->desc, gpu_options);
     }

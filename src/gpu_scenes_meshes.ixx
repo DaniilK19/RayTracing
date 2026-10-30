@@ -1,15 +1,16 @@
 // Partition gpu_scenes:meshes: the GPU's own scenes with triangle meshes, which only OptiX renders (the CPU ray tracer
 // builds no triangle). A scene's meshes ride beside its CPU objects as mesh_refs (gpu_scene_parts::meshes): a mesh made
-// in code by a function of this file, wearing one of the scene's CPU materials, placed by a row-major 3×4 matrix.
-// gpu_scene.ixx translates them, each distinct source once (one acceleration structure) and every mesh_ref as an
-// instance of it. The ground, the Cornell box's lamp and the camera stay the books' own objects.
+// in code by a function of this file, or a glTF model under assets/models, wearing its materials, placed by a row-major
+// 3×4 matrix. gpu_scene.ixx translates them, each distinct source once (one acceleration structure) and every mesh_ref
+// as an instance of it. The ground, the Cornell box's walls and lamp and the camera stay the books' own objects.
 //
 // The test scenes check the triangles against what the quads and spheres already render: the Cornell box with its
 // walls and blocks made of triangles, white furnaces of icospheres, one mesh under four instances against the same
 // four baked into the world on the CPU, and glTF's materials on spheres of triangles against the scene materials
-// their mapping promises. An interface partition that exports only what gpu_scene.ixx's translation needs
-// (to_mesh_desc, gltf_material): the scenes' functions have module linkage, seen by the module's other units and by no
-// importer (as in the other partitions).
+// their mapping promises. The showcases place two models of Poly Haven's in a studio, in the sun and in the Cornell
+// box. An interface partition that exports only what gpu_scene.ixx's translation needs (to_mesh_desc, gltf_material)
+// and what the window asks (has_triangle_meshes): the scenes' functions have module linkage, seen by the module's
+// other units and by no importer (as in the other partitions).
 module;
 
 // The renderer's types (a mesh, a GGX side entry), before `import std;` (see gpu_scene.ixx)
@@ -27,6 +28,7 @@ import meshes;
 import quad;
 import ray;
 import scenes;
+import texture;
 import vec3;
 
 // A mesh of the module meshes as the renderer's: the same five arrays, moved (a generated mesh is made per build and
@@ -522,4 +524,134 @@ gpu_scene_parts pbr_reference()
                             .material = conductor(texel, pbr_textured_roughness),
                             .placement = pbr_place(pbr_spheres.size())});
     return parts;
+}
+
+// --- The showcases: two models of Poly Haven's -----------------------------------------------------------------------
+
+namespace
+{
+// The models are Poly Haven's (polyhaven.com/a/marble_bust_01, polyhaven.com/a/brass_vase_01), CC0, which allows
+// committing them: their 1k glTF packages exactly as published, under assets/models, the normal maps the renderer
+// ignores included, so that every file can be checked against the download (MeshTests holds each one's SHA-256). A
+// marble bust, a textured dielectric (metallic 0 and a roughness map), and a brass vase, a textured metal, which shows
+// a base color on a metal. A scene places a model after unit_placement has made it 1 in radius and stood it on y = 0
+// over the origin (gpu_scene.ixx): the bust is then 1.57 tall and 0.83 wide, the vase 1.81 tall and 0.6 wide, each
+// facing +z ("the front of a glTF asset faces +Z", glTF 2.0, 3.4).
+constexpr std::string_view marble_bust = "marble_bust_01/marble_bust_01_1k.gltf";
+constexpr std::string_view brass_vase = "brass_vase_01/brass_vase_01_1k.gltf";
+// The bust's height once unit-placed: twice its height over the diagonal of its box, from the .gltf's POSITION min and
+// max and its node's translation, 2 · 0.514943 / 0.654861
+constexpr double bust_unit_height = 1.57268;
+
+// A ground of side `size`, centered under the origin at height y, facing up (u × v = +y), as gpu_scenes:environments'
+std::unique_ptr<quad> ground(double size, double y, std::shared_ptr<const material> mat)
+{
+    return std::make_unique<quad>(point3{-size / 2, y, -size / 2}, vec3{0, 0, size}, vec3{size, 0, 0}, std::move(mat));
+}
+
+// The showcases' camera: 16:9, 1920 wide, 1024 samples, at most 10 rays a path, a field of 30° (the books' part of the
+// strategy only: the list gives them -p mis)
+camera_settings showcase_camera(const point3& lookfrom, const point3& lookat)
+{
+    return {.aspect_ratio = 16.0 / 9.0,
+            .image_width = 1920,
+            .samples_per_pixel = 1024,
+            .max_depth = 10,
+            .sampling = sampling_strategy::material,
+            .vfov = 30,
+            .lookfrom = lookfrom,
+            .lookat = lookat};
+}
+
+// sunlit's sky: the sun 48° above the horizon in a partly cloudy sky, the ground replaced by sky
+constexpr environment_choice sunlight{.source = env_source::asset,
+                                      .asset = "kloofendal_48d_partly_cloudy_puresky_1k.hdr",
+                                      .yaw_degrees = 0,
+                                      .scale = 1};
+
+// A books' quad of the Cornell box's data above
+std::unique_ptr<quad> cornell_quad(const quad_sides& q, std::shared_ptr<const material> mat)
+{
+    return std::make_unique<quad>(point3{q[0], q[1], q[2]}, vec3{q[3], q[4], q[5]}, vec3{q[6], q[7], q[8]},
+                                  std::move(mat));
+}
+}
+
+// The displays the showcases open with (their entries in gpu_scenes.ixx): AgX, as for studio and sunlit
+inline constexpr gpu::display_options still_life_display{.op = gpu::tone_map::agx, .exposure = 0};
+inline constexpr gpu::display_options busts_display{.op = gpu::tone_map::agx, .exposure = -0.5};
+inline constexpr gpu::display_options cornell_bust_display{.op = gpu::tone_map::agx, .exposure = 0};
+
+// The marble bust and the brass vase side by side on a matte grey ground in the photo studio's light, both facing the
+// camera: a dielectric whose roughness varies texel by texel beside a metal whose color does. Two models, so the
+// vase's materials follow the bust's in the mesh set (gpu_scene.ixx's meshes_at).
+gpu_scene_parts still_life()
+{
+    gpu_scene_parts parts{.cpu = scene{hittable_list{}, showcase_camera({0, 1.5, 4.6}, {0, 1.0, 0})},
+                          .environment = studio_light};
+    parts.cpu.world.add(ground(40, 0, std::make_shared<lambertian>(color{0.5, 0.5, 0.5})));
+    parts.meshes = {
+        mesh_ref{.model = marble_bust, .placement = shift(-0.55, 0, 0)},
+        mesh_ref{.model = brass_vase, .placement = shift(0.6, 0, 0)},
+    };
+    return parts;
+}
+
+// Three busts in the sun on sunlit's checkered ground, the middle one facing the camera and the outer two turned by 40°
+// toward it: one model, so one acceleration structure under three instances. The ground is sunlit's, 1 mm below y = 0,
+// where the busts stand (see sunlit: the solid checker would speckle a floor at y = 0).
+gpu_scene_parts busts()
+{
+    gpu_scene_parts parts{.cpu = scene{hittable_list{}, showcase_camera({0, 1.5, 5.2}, {0, 0.8, 0})},
+                          .environment = sunlight};
+    const auto checker = std::make_shared<checker_texture>(0.5, color{0.2, 0.2, 0.2}, color{0.7, 0.7, 0.7});
+    parts.cpu.world.add(ground(200, -0.001, std::make_shared<lambertian>(checker)));
+    constexpr std::array<std::pair<double, double>, 3> placed{{{-1.4, 40}, {0, 0}, {1.4, -40}}}; // x and the turn
+    for (const auto& [x, degrees] : placed)
+    {
+        parts.meshes.push_back({.model = marble_bust, .placement = compose(shift(x, 0, 0), turn_y(degrees))});
+    }
+    return parts;
+}
+
+// The books' Cornell box with the bust in place of the tall block: 330 units tall like the block, standing where the
+// block's middle stands (the block's own turn of 15° applied to its center (82.5, 82.5), then its offset), turned
+// 15° from facing the camera (180° + 15°: the bust faces +z, the camera looks along +z), as the block is turned. The
+// short block, the walls and the lamp are the books' quads (the lamp in the light set).
+gpu_scene_parts cornell_bust()
+{
+    hittable_list world;
+    const auto white = std::make_shared<lambertian>(cornell_white);
+    world.add(cornell_quad(cornell_left, std::make_shared<lambertian>(cornell_green)));
+    world.add(cornell_quad(cornell_right, std::make_shared<lambertian>(cornell_red)));
+    for (const quad_sides& wall : cornell_white_walls)
+    {
+        world.add(cornell_quad(wall, white));
+    }
+    world.add(cornell_lamp(std::make_shared<diffuse_light>(color{15, 15, 15})));
+    std::unique_ptr<hittable> block = box(point3{0, 0, 0}, point3{165, 165, 165}, white);
+    block = std::make_unique<rotate_y>(std::move(block), -18);
+    world.add(std::make_unique<translate>(std::move(block), vec3{130, 0, 65}));
+    hittable_list lights;
+    lights.add(cornell_lamp(nullptr));
+    gpu_scene_parts parts{.cpu = scene{std::move(world), cornell_camera, std::move(lights)}};
+    const rotate_y tall(box(point3{0, 0, 0}, point3{165, 330, 165}, nullptr), 15);
+    const double c = tall.cos_theta();
+    const double s = tall.sin_theta();
+    const double size = 330 / bust_unit_height;
+    parts.meshes = {mesh_ref{.model = marble_bust,
+                             .placement = compose(shift(c * 82.5 + s * 82.5 + 265, 0, -s * 82.5 + c * 82.5 + 295),
+                                                  compose(turn_y(195), stretch(size, size, size)))}};
+    return parts;
+}
+
+// Whether a scene of the list holds triangle meshes, which only OptiX renders, without building it (and so without
+// reading a model's file): the window's Tab leaves these out of a session that doesn't use OptiX, so that Tab without
+// OptiX goes through the same scenes as before them
+export bool has_triangle_meshes(const gpu_scene_entry& entry)
+{
+    constexpr std::array scenes{&cornell_triangles, &mesh_furnace,  &mesh_furnace_smooth, &instances,
+                                &instances_baked,   &pbr_test,      &pbr_reference,       &still_life,
+                                &busts,             &cornell_bust};
+    return std::ranges::contains(scenes, entry.build);
 }

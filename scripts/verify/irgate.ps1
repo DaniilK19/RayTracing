@@ -197,9 +197,11 @@ try {
         # library's object is linked into an exe only when the exe uses it, so an exe that calls no OptiX yet (before
         # its step in $embedsFrom) holds none: a note. From its step on, an exe that holds none is one left from an
         # earlier step, and another module's hash where this one's should be is a stale exe: both are failures (a
-        # partial build).
+        # partial build). A run of 64 decimal digits isn't a hash (a SHA-256 in hex without a letter has odds of
+        # 10^-13), but it is in an exe: the C++ library's table of two-digit pairs "0001...99" for std::format ends
+        # in 64 digits and a NUL.
         $held = @([regex]::Matches($bytes, '[0-9a-f]{64}\x00') | ForEach-Object { $_.Value.Substring(0, 64) } |
-            Select-Object -Unique)
+            Where-Object { $_ -match '[a-f]' } | Select-Object -Unique)
         $from = $embedsFrom[$exeName]
         foreach ($m in @($modules | Where-Object { $_.exes -contains $exeName })) {
             $hash = $written[$m.name]
@@ -215,8 +217,8 @@ try {
                     "from an earlier step (a partial build?)")
             }
             else {
-                Fail ("$exeName doesn't hold $($m.name)'s SHA-256 ${hash}, but {0}: it embeds other PTX (a partial " +
-                    "build?)" -f ($held -join ", "))
+                Fail (("$exeName doesn't hold $($m.name)'s SHA-256 ${hash}, but {0}: it embeds other PTX (a " +
+                    "partial build?)") -f ($held -join ", "))
             }
         }
         $bytes = $null

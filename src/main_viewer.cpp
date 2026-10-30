@@ -1098,11 +1098,12 @@ void viewer::print_settings() const
 // but the material's, beyond the books) renders with its own instead and says so, and the next scene is asked for the
 // named one again. A scene the window can't show here is skipped, the console saying why: the scenes beyond the books
 // in float64 and under --all-books-kernel (only the quality kernel renders them, in float32), and, under
-// --quality-kernel with no strategy named, a scene whose own strategy is a books' one but the material's.
+// --quality-kernel with no strategy named, a scene whose own strategy is a books' one but the material's. The scenes
+// with triangle meshes aren't in the cycle: only OptiX renders them, which the window doesn't start.
 SDL_AppResult viewer::switch_scene(int step)
 {
     const auto in_cycle = [](const gpu_scene_entry& e) {
-        return e.role == scene_role::book || e.role == scene_role::showcase;
+        return (e.role == scene_role::book || e.role == scene_role::showcase) && !has_triangle_meshes(e);
     };
     const std::vector<const gpu_scene_entry*> cycle = gpu_scene_list() | std::views::filter(in_cycle) |
                                                       std::views::transform([](const auto& e) { return &e; }) |

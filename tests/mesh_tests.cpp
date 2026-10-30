@@ -7,15 +7,19 @@
 //     interleaved view), strips and fans, primitives sharing their vertices; the node walk (T·R·S, a parent and its
 //     child, a matrix, a mirror whose face normals stay outside, a mesh shared by two nodes, the world bounds, a file
 //     without scenes, one without nodes); the triangles it drops with a warning (a non-finite corner, zero area); what
-//     it refuses (required compression and unknown extensions, an index past the vertices, node cycles through and off
-//     the scene, sizes that wrap modulo 2^64 in cgltf's own checks, URIs that aren't UTF-8, missing files, and every
-//     limit with tiny caps on both sides of its boundary: the file, a .bin and a .png beside it, the buffer files
-//     together, cgltf's memory, the nodes, counts near 2^63); materials and images (the factors, glTF's default
-//     material, a 2×2 PNG decoded to its exact bytes, the samplers' wrap and filter, an image used twice decoded once,
-//     a material nobody wears not decoded) and a warning for each feature the renderer ignores (a texture it can't
-//     read where it is worn: the factor alone);
+//     it refuses (a .glb cut short, required compression and unknown extensions, an index past the vertices, node
+//     cycles through and off the scene, sizes that wrap modulo 2^64 in cgltf's own checks, URIs that aren't UTF-8,
+//     missing files, and every limit with tiny caps on both sides of its boundary: the file, a .bin and a .png beside
+//     it, the buffer files together, cgltf's memory, the nodes, counts near 2^63); materials and images (the factors,
+//     glTF's default material, a 2×2 PNG decoded to its exact bytes, the samplers' wrap and filter, an image used twice
+//     decoded once, a material nobody wears not decoded) and a warning for each feature the renderer ignores (a texture
+//     it can't read where it is worn: the factor alone);
 //   - the meshes made in code: icosphere, torus, triangulate_quads, unit_placement and bake (its mirror rule).
-// The committed models join in Step 93 (the TODO section near the end). Nothing here is random: no seeds.
+// And the committed files (Step 93, the section near the end), found in the repository from the current folder or
+// the executable's: the models' counts, bounds, warnings and every file's SHA-256; and the two files of RayTracingGPU's
+// command-line checks under tests/data, cut-short.glb, which must hold the bytes of the refusal above and be refused
+// alike, and lines-only.gltf, which must load without a triangle and with the warning that says why.
+// Nothing here is random: no seeds.
 // Each check prints one line, as GpuTests does, then a summary:
 //   <group>.<check>: <what was found>, expected <what the specification says>, PASS|FAIL
 // Run: `ctest -R mesh_tests` in the build folder (CTest's mesh_tests), or MeshTests itself. Exit code: 0 every check
@@ -1731,12 +1735,25 @@ void gltf_dropped(report& r, const std::filesystem::path& folder)
 
 // --- glTF: what the loader refuses ----------------------------------------------------------------------------------
 
+// A .glb cut short: its 12-byte header alone ("glTF", version 2), whose length says 256 bytes. Written here into the
+// temporary folder, as every file of these cases is; the repository holds the same bytes as tests/data/cut-short.glb
+// for RayTracingGPU's command-line checks (scripts/verify/cli-cases.txt), checked against these (committed_fixtures).
+constexpr std::array<std::uint8_t, 12> cut_short_glb{0x67, 0x6C, 0x54, 0x46, 2, 0, 0, 0, 0, 1, 0, 0};
+
 void gltf_refusals(report& r, const std::filesystem::path& folder)
 {
     // No such file
     {
         const std::filesystem::path file = folder / "nowhere.gltf";
         refused(r, "refusals.no-such-file", load(r, "refusals.no-such-file", file), file);
+    }
+
+    // A .glb cut short (cut_short_glb)
+    {
+        const std::filesystem::path file = folder / "cut-short.glb";
+        write_bytes(file, std::as_bytes(std::span(cut_short_glb)));
+        refused(r, "refusals.glb-cut-short", load(r, "refusals.glb-cut-short", file), file,
+                {"the file is shorter than it says"});
     }
 
     // An index past the vertices (3 with 3 vertices): cgltf_validate's "data too short", or the loader's own check
@@ -2748,21 +2765,362 @@ void bake_checks(report& r)
 }
 
 // --- The committed models (Step 93) ---------------------------------------------------------------------------------
-// TODO(Step 93): assets/models/marble_bust_01/ and assets/models/brass_vase_01/ (Poly Haven, CC0, committed as
-// published): each .gltf loaded with the default limits; its triangle count (17,456 and 21,440), image count, world
-// bounds and warnings (the unused normal-map JPEGs) as the files say; and every file's SHA-256 (a FIPS 180-4
-// implementation here, with its "abc" vector as a self-check) against the table in docs/architecture.md's credits, so
-// that a changed download is noticed. The files are found as GpuTests finds its assets: from the current folder or the
-// executable's, upward.
+// assets/models/marble_bust_01/ and assets/models/brass_vase_01/ (Poly Haven, CC0, committed as published): each
+// .gltf loaded with the default limits, well formed; its triangles (17,456 and 21,440, the files' 52,368 and 64,320
+// indices); its images as the files use them: two decoded, 1024×1024 (the base color in sRGB, the metallic-roughness
+// map linear, both bilinear and repeating: the files' one sampler), the normal map not; the material's factors as the
+// files say (the bust a dielectric, metallicFactor 0; the vase glTF's default metal); the world bounds, against the box
+// of the placed triangles and against POSITION's min and max moved by the node's translation; a warning for the normal
+// maps the renderer ignores (every warning printed, INFO); and every file's SHA-256 (FIPS 180-4, computed here and
+// checked on the standard's own vectors) against the table below, so that a changed download is noticed. The files are
+// found from the current folder upward (ctest runs MeshTests in the build folder, under the repository).
+
+// SHA-256 (FIPS 180-4 §6.2): the message padded with 1, zeros and its length in bits to whole 512-bit blocks, each
+// block's 64 rounds over eight 32-bit words
+std::string sha256(std::span<const std::uint8_t> message)
+{
+    static constexpr std::array<std::uint32_t, 64> k{
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+    std::array<std::uint32_t, 8> h{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                                   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+    std::vector<std::uint8_t> m(message.begin(), message.end());
+    const std::uint64_t bits = static_cast<std::uint64_t>(message.size()) * 8;
+    m.push_back(0x80);
+    while (m.size() % 64 != 56)
+    {
+        m.push_back(0);
+    }
+    for (int i = 7; i >= 0; --i)
+    {
+        m.push_back(static_cast<std::uint8_t>(bits >> (8 * i)));
+    }
+    for (std::size_t block = 0; block < m.size(); block += 64)
+    {
+        std::array<std::uint32_t, 64> w{};
+        for (std::size_t t = 0; t < 16; ++t)
+        {
+            const std::uint8_t* const b = m.data() + block + 4 * t;
+            w[t] = static_cast<std::uint32_t>(b[0]) << 24 | static_cast<std::uint32_t>(b[1]) << 16 |
+                   static_cast<std::uint32_t>(b[2]) << 8 | b[3];
+        }
+        for (std::size_t t = 16; t < 64; ++t)
+        {
+            const std::uint32_t s0 = std::rotr(w[t - 15], 7) ^ std::rotr(w[t - 15], 18) ^ (w[t - 15] >> 3);
+            const std::uint32_t s1 = std::rotr(w[t - 2], 17) ^ std::rotr(w[t - 2], 19) ^ (w[t - 2] >> 10);
+            w[t] = w[t - 16] + s0 + w[t - 7] + s1;
+        }
+        std::array<std::uint32_t, 8> v = h; // a, b, c, d, e, f, g, h
+        for (std::size_t t = 0; t < 64; ++t)
+        {
+            const std::uint32_t e1 = std::rotr(v[4], 6) ^ std::rotr(v[4], 11) ^ std::rotr(v[4], 25);
+            const std::uint32_t choose = (v[4] & v[5]) ^ (~v[4] & v[6]);
+            const std::uint32_t t1 = v[7] + e1 + choose + k[t] + w[t];
+            const std::uint32_t a0 = std::rotr(v[0], 2) ^ std::rotr(v[0], 13) ^ std::rotr(v[0], 22);
+            const std::uint32_t majority = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            v = {t1 + a0 + majority, v[0], v[1], v[2], v[3] + t1, v[4], v[5], v[6]};
+        }
+        for (std::size_t i = 0; i < 8; ++i)
+        {
+            h[i] += v[i];
+        }
+    }
+    std::string hex;
+    for (const std::uint32_t word : h)
+    {
+        hex += std::format("{:08x}", word);
+    }
+    return hex;
+}
+
+// A file's bytes as they are: .gitattributes keeps a .gltf byte for byte in every checkout (-text: its line ends never
+// converted), as it does the binary files, so every file is hashed as published
+std::vector<std::uint8_t> bytes_of(const std::filesystem::path& file)
+{
+    std::ifstream in(file, std::ios::binary);
+    return std::vector<std::uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+// Every file of the two packages under assets/models and its SHA-256, computed from the files committed in Step 93
+// (git show <commit>:<path> | sha256sum). A file added, removed or changed fails models.sha256-*.
+const std::vector<std::pair<std::string_view, std::string_view>> committed_sha256{
+    {"brass_vase_01/brass_vase_01.bin", "acc32719ee7c42c5b5fd07507a3dd7779e95445754759876bdbc133cebefa8ff"},
+    {"brass_vase_01/brass_vase_01_1k.gltf", "becf6d52678c63d7321c8ab51fb1a03a80d8dd61feb183977867069cdd470f9d"},
+    {"brass_vase_01/textures/brass_vase_01_arm_1k.jpg",
+     "b17e947af6e5d2b1f62a3e4953f075ddd6a48f1c11596811fb55ff6b3aab2855"},
+    {"brass_vase_01/textures/brass_vase_01_diff_1k.jpg",
+     "346bb95aeb7aaac89ff368c050e511f2e444d7636d1e135f8433a012423474dd"},
+    {"brass_vase_01/textures/brass_vase_01_nor_gl_1k.jpg",
+     "dac5267183a708234e2640f89cde45df76c3927bbd5d2b280cb61fd7a4bd63ea"},
+    {"marble_bust_01/marble_bust_01.bin", "0bb757c1bd00bfe42005c84e7f76df98ce04a532e595a2ddda8a0335cd959e33"},
+    {"marble_bust_01/marble_bust_01_1k.gltf", "b6f192fc01be4349470b66f6f6948bd37620267bdbc86f4568e4d078f97ff09b"},
+    {"marble_bust_01/textures/marble_bust_01_diff_1k.jpg",
+     "cbb7dccdc62d7eaa240eef7b4956969bf6e73c7338b64f1378629838ea22383c"},
+    {"marble_bust_01/textures/marble_bust_01_nor_gl_1k.jpg",
+     "3d355904cd54c2de90d5d4310b80d43816fa2dd509f0a3445d654eab8e237c5f"},
+    {"marble_bust_01/textures/marble_bust_01_rough_1k.jpg",
+     "1c4502352dc936dd1f1c1a81b418706df1ce0445949874215015325f9b8921fb"}};
+
+// What each model's file says (its JSON, read when it was committed): the triangles, the material's factors, and
+// POSITION's min and max moved by the node's translation (the bust's node lifts it by 0.028335653245449066)
+struct committed_model
+{
+    std::string_view folder; // under assets/models
+    std::string_view file;
+    std::size_t triangles;
+    double metallic;
+    double roughness;
+    vec lower;
+    vec upper;
+};
+
+const std::array<committed_model, 2> committed_models_list{
+    {{"marble_bust_01",
+      "marble_bust_01_1k.gltf",
+      17456,
+      0,
+      1,
+      {-0.12288019061088562, -0.028259359300136566 + 0.028335653245449066, -0.1445964276790619},
+      {0.14886942505836487, 0.48668384552001953 + 0.028335653245449066, 0.1551172435283661}},
+     {"brass_vase_01",
+      "brass_vase_01_1k.gltf",
+      21440,
+      1,
+      1,
+      {-0.11365963518619537, 0.0014527724124491215, -0.11365959048271179},
+      {0.11365952342748642, 0.6939247250556946, 0.11365959048271179}}}};
+
+// The executable's folder, from argv[0] (main): where repo_path looks when the current folder isn't in the repository
+std::filesystem::path executable_folder;
+
+// A file or folder of the repository, `relative` to its root: in the current folder or the nearest one above it that
+// has it, else in the executable's folder or above it, as GpuTests' find_repo_file looks (ctest runs MeshTests in the
+// build folder, out\build\x64-release, inside the repository; a run from elsewhere finds it from the executable)
+std::optional<std::filesystem::path> repo_path(std::string_view relative)
+{
+    const std::filesystem::path wanted = std::filesystem::path(relative).make_preferred();
+    for (const std::filesystem::path& start : {std::filesystem::current_path(), executable_folder})
+    {
+        for (std::filesystem::path folder = start; !folder.empty(); folder = folder.parent_path())
+        {
+            std::error_code unreadable;
+            if (std::filesystem::exists(folder / wanted, unreadable))
+            {
+                return folder / wanted;
+            }
+            if (folder == folder.parent_path())
+            {
+                break; // the root
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+// An image of the model, said in a few words (not its megabytes)
+std::string image_summary(const meshes::model& m, int index)
+{
+    const meshes::image* const i = image_at(m, index);
+    return i ? std::format("images[{}]: {}x{}, {} bytes, {}, {}, wrap {} {}", index, i->width, i->height,
+                           i->rgba.size(), i->srgb ? "sRGB" : "linear", i->nearest ? "nearest" : "bilinear",
+                           wrap_name(i->wrap_s), wrap_name(i->wrap_t))
+             : std::format("images[{}]: none", index);
+}
+
+bool is_1k(const meshes::image* i, bool srgb)
+{
+    return i && i->width == 1024 && i->height == 1024 && i->rgba.size() == 4u * 1024 * 1024 && i->srgb == srgb &&
+           !i->nearest && i->wrap_s == meshes::wrap::repeat && i->wrap_t == meshes::wrap::repeat;
+}
+
+void committed_model_checks(report& r, const std::filesystem::path& folder, const committed_model& c)
+{
+    const std::string name = std::format("models.{}", c.folder);
+    const load_result result = load(r, name, folder / c.folder / c.file);
+    const meshes::model* const m = loaded(r, name, result);
+    if (!m)
+    {
+        return;
+    }
+    std::size_t triangles = 0;
+    for (const meshes::placement& p : m->placements)
+    {
+        triangles += triangle_count(m->meshes[static_cast<std::size_t>(p.mesh)]);
+    }
+    r.equal(name + "-triangles", triangles, c.triangles);
+    const auto decoded = std::ranges::count_if(m->images, [](const meshes::image& i) { return !i.rgba.empty(); });
+    r.equal(name + "-images-decoded", decoded, 2);
+    // The material the triangles wear (one, in both files)
+    std::set<std::uint32_t> worn;
+    for (const meshes::mesh& mesh : m->meshes)
+    {
+        worn.insert(mesh.material_of.begin(), mesh.material_of.end());
+    }
+    const meshes::pbr_material* const material =
+        worn.size() == 1 && *worn.begin() < m->materials.size() ? &m->materials[*worn.begin()] : nullptr;
+    r.check(name + "-material", material && material->metallic == c.metallic && material->roughness == c.roughness,
+            material ? describe(*material) : std::format("{} materials worn", worn.size()),
+            std::format("one material, metallic {}, roughness {}", c.metallic, c.roughness));
+    if (material)
+    {
+        r.check(name + "-base-color-image", is_1k(image_at(*m, material->base_color_image), true),
+                image_summary(*m, material->base_color_image), "1024x1024, sRGB, bilinear, repeat");
+        r.check(name + "-metal-rough-image", is_1k(image_at(*m, material->metal_rough_image), false),
+                image_summary(*m, material->metal_rough_image), "1024x1024, linear, bilinear, repeat");
+    }
+    compare_bounds(r, name + "-bounds", *m, world_geometry(*m), 1e-9);
+    double off = 0;
+    for (std::size_t k = 0; k < 3; ++k)
+    {
+        off = worse(off, worse(std::abs(m->lower[k] - c.lower[k]), std::abs(m->upper[k] - c.upper[k])));
+    }
+    r.check(name + "-bounds-file", off <= 1e-6,
+            std::format("lower ({}, {}, {}), upper ({}, {}, {})", m->lower[0], m->lower[1], m->lower[2], m->upper[0],
+                        m->upper[1], m->upper[2]),
+            std::format("POSITION's min and max moved by the node, within 1e-6 (off by {:.3g})", off));
+    const bool normal_warned = std::ranges::any_of(
+        m->warnings, [](const std::string& w) { return w.contains("normal") || w.contains("Normal"); });
+    r.check(name + "-warnings", normal_warned, describe(m->warnings), "a warning for the ignored normal map");
+    for (const std::string& w : m->warnings)
+    {
+        r.info(name + "-warning", w);
+    }
+}
+
 void committed_models(report& r)
 {
-    r.info("models", "the committed models are checked from Step 93 on (TODO)");
+    group(r, "models", [&] {
+        const std::optional<std::filesystem::path> folder = repo_path("assets/models");
+        if (!folder)
+        {
+            r.check("models.found", false, "no assets/models in the current folder, the executable's or above them",
+                    "the repository's assets (run MeshTests in the repository or its build folder, as ctest does)");
+            return;
+        }
+        // FIPS 180-4's own examples (and the empty message), so that a wrong hash is the file's, not the test's
+        const auto text = [](std::string_view s) { return text_bytes(s); };
+        r.check("models.sha256-self",
+                sha256(text("abc")) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" &&
+                    sha256(text("")) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" &&
+                    sha256(text("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")) ==
+                        "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1",
+                std::format("SHA-256('abc') {}", sha256(text("abc"))),
+                "FIPS 180-4's values for 'abc', '' and the 448-bit message");
+        for (const committed_model& c : committed_models_list)
+        {
+            committed_model_checks(r, *folder, c);
+        }
+        // Every file against the table, and the table against the files
+        std::vector<std::string> unlisted;
+        std::vector<std::string> changed;
+        std::size_t files = 0;
+        for (const std::filesystem::directory_entry& e : std::filesystem::recursive_directory_iterator(*folder))
+        {
+            if (!e.is_regular_file())
+            {
+                continue;
+            }
+            ++files;
+            const std::string relative = e.path().lexically_relative(*folder).generic_string();
+            const std::string hash = sha256(bytes_of(e.path()));
+            r.info("models.sha256", std::format("{} {}", hash, relative));
+            const auto listed = std::ranges::find(committed_sha256, std::string_view(relative),
+                                                  &std::pair<std::string_view, std::string_view>::first);
+            if (listed == committed_sha256.end())
+            {
+                unlisted.push_back(relative);
+            }
+            else if (listed->second != hash)
+            {
+                changed.push_back(relative);
+            }
+        }
+        std::vector<std::string_view> missing;
+        for (const auto& [path, hash] : committed_sha256)
+        {
+            if (!std::filesystem::is_regular_file(*folder / std::filesystem::path(path))) // ASCII names
+            {
+                missing.push_back(path);
+            }
+        }
+        const auto list = [](const auto& names) {
+            std::string out;
+            for (const auto& n : names)
+            {
+                out += std::format("{}{}", out.empty() ? "" : ", ", n);
+            }
+            return out.empty() ? std::string("none") : out;
+        };
+        r.check("models.sha256-files", changed.empty(), std::format("{} files, changed: {}", files, list(changed)),
+                "every file's SHA-256 as committed");
+        r.check("models.sha256-unlisted", unlisted.empty(), std::format("not in the table: {}", list(unlisted)),
+                "no file the table doesn't list");
+        r.check("models.sha256-missing", missing.empty(), std::format("missing: {}", list(missing)),
+                "every listed file present");
+    });
+}
+
+// The files of RayTracingGPU's command-line cases of models it refuses (scripts/verify/cli-cases.txt), under
+// tests/data: cut-short.glb holds the bytes of refusals.glb-cut-short (cut_short_glb) and is refused with the same
+// message; lines-only.gltf, one LINES primitive of two vertices, loads as a model without a triangle, its warning
+// saying why (which RayTracingGPU's refusal of it repeats)
+void committed_fixtures(report& r)
+{
+    group(r, "fixtures", [&] {
+        const auto found = [&r](std::string_view relative, std::string_view name) {
+            const std::optional<std::filesystem::path> file = repo_path(relative);
+            if (!file)
+            {
+                r.check(name, false,
+                        std::format("no {} in the current folder, the executable's or above them", relative),
+                        "the repository's file (run MeshTests in the repository or its build folder, as ctest does)");
+            }
+            return file;
+        };
+        const std::optional<std::filesystem::path> lines = found("tests/data/lines-only.gltf", "fixtures.lines-found");
+        if (lines)
+        {
+            const load_result result = load(r, "fixtures.lines-only", *lines);
+            const bool warned = result && std::ranges::any_of(result->warnings, [](const std::string& w) {
+                return w.contains("points and lines skipped");
+            });
+            r.check("fixtures.lines-only", result && result->placements.empty() && warned,
+                    result ? std::format("{} placements; {}", result->placements.size(), describe(result->warnings))
+                           : std::format("error '{}'", result.error()),
+                    "a model without placements, warned that points and lines are skipped");
+        }
+        const std::optional<std::filesystem::path> file = found("tests/data/cut-short.glb", "fixtures.cut-short-found");
+        if (!file)
+        {
+            return;
+        }
+        const std::vector<std::uint8_t> bytes = bytes_of(*file);
+        std::string shown; // the first 16 bytes, in hex
+        for (const std::uint8_t b : bytes | std::views::take(16))
+        {
+            shown += std::format("{}{:02X}", shown.empty() ? "" : " ", b);
+        }
+        r.check("fixtures.cut-short-bytes", std::ranges::equal(bytes, cut_short_glb),
+                std::format("{} bytes: {}{}", bytes.size(), shown, bytes.size() > 16 ? " ..." : ""),
+                "the 12 bytes 67 6C 54 46 02 00 00 00 00 01 00 00 of refusals.glb-cut-short");
+        refused(r, "fixtures.cut-short-refused", load(r, "fixtures.cut-short-refused", *file), *file,
+                {"the file is shorter than it says"});
+    });
 }
 
 // --- main -----------------------------------------------------------------------------------------------------------
 
-int main()
+int main(int, char* argv[])
 {
+    std::error_code no_folder;
+    executable_folder = std::filesystem::absolute(argv[0], no_folder).parent_path(); // for repo_path
+
     const std::filesystem::path folder =
         std::filesystem::temp_directory_path() /
         std::format("mesh-tests-{}", std::chrono::steady_clock::now().time_since_epoch().count());
@@ -2802,6 +3160,7 @@ int main()
         group(r, "placement", [&] { placement_checks(r); });
         group(r, "bake", [&] { bake_checks(r); });
         committed_models(r);
+        committed_fixtures(r);
         r.error_summary();
     }
     catch (const setup_error& error)

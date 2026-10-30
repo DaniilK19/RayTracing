@@ -487,6 +487,14 @@ private:
                                                        "limit (twice the file limit, plus 1 MiB)",
                                                        budget_.limit)
                                          : std::string("out of memory while reading its JSON"));
+        case cgltf_result_data_too_short:
+            // A .glb (its first 4 bytes "glTF") whose header or chunks claim more bytes than the file has: a file cut
+            // short. Any other file under the 12 bytes of a .glb's header gets the result too: the default's message
+            if (bytes_.size() >= 4 && std::string_view(bytes_.data(), 4) == "glTF")
+            {
+                return fail("the file is shorter than it says");
+            }
+            [[fallthrough]];
         default:
             return fail(std::format("not a glTF 2.0 file (cgltf_parse: {})", describe(result)));
         }

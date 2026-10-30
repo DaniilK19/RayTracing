@@ -16,11 +16,13 @@ import std;
 import bvh;
 import camera;
 import constant_medium;
+import gltf;
 import hittable;
 import image;
 import instance;
 import gpu_scenes;
 import material;
+import meshes;
 import perlin;
 import quad;
 import random;
@@ -165,6 +167,55 @@ std::expected<void, std::string> for_each_shape(const hittable& object, const pl
     return on_shape(object, where);
 }
 
+// glTF models as the translation meets them (their cache and their conversion: "glTF models" below). A model is
+// loaded once per file and shared by every build that places it.
+struct loaded_model;
+std::filesystem::path find_asset(std::string_view name); // "The environment map" below
+
+// Where a mesh_ref's model is: a file under assets/models (the scene list's), or the path as given (a model file from
+// the command line)
+enum class model_paths
+{
+    assets,
+    as_given,
+};
+
+// A model a build read from its file (one the cache already held isn't read again, and isn't listed): what the
+// programs say of it, its warnings once per model before rendering, its counts and the time its reading took
+export struct model_load
+{
+    std::string file;                  // as the scene or the command line names it
+    std::size_t triangles = 0;         // placed: each placement's mesh counted once per placement
+    std::size_t images = 0;            // decoded
+    double seconds = 0;                // reading and decoding it on the CPU
+    std::vector<std::string> warnings; // what the renderer can't show, one line each (gltf.ixx)
+};
+
+// The models of one build: each file is asked of the cache once per build, by the path the build finds it at, so that
+// every mesh_ref of a file (busts' three) and the model file's scene (framed by model_scene_parts, then translated)
+// place one model and list its reading once, whatever the cache does meanwhile (another thread's build, a file written
+// during the build, a scene of more models than the cache keeps)
+class build_models
+{
+public:
+    // loads: where the models read from their files are listed (nullptr: not listed)
+    explicit build_models(std::vector<model_load>* loads) : loads_(loads) {}
+
+    // The model in `file`, from the build's own, else from the cache; `named` is the file as the scene or the command
+    // line names it, for the list
+    std::expected<std::shared_ptr<const loaded_model>, std::string> get(const std::filesystem::path& file,
+                                                                        std::string_view named);
+
+private:
+    struct held
+    {
+        std::filesystem::path file;
+        std::shared_ptr<const loaded_model> model;
+    };
+    std::vector<model_load>* loads_;
+    std::vector<held> held_;
+};
+
 // Translates the CPU's scene into the GPU renderer's tables (renderer.h), or says why the GPU can't render it. It
 // reads the CPU's objects where they are, through dynamic_cast and their accessors, and changes nothing.
 class scene_translator
@@ -197,8 +248,10 @@ public:
         });
     }
 
-    // The scene's triangle meshes (gpu_scene_parts::meshes), after the world: see "Triangle meshes" below
-    std::expected<void, std::string> add_meshes(std::span<const mesh_ref> refs);
+    // The scene's triangle meshes (gpu_scene_parts::meshes), after the world: see "Triangle meshes" below. Their models
+    // come from the build's `models`.
+    std::expected<void, std::string> add_meshes(std::span<const mesh_ref> refs, model_paths paths,
+                                                build_models& models);
 
     // The tables. Every GGX side entry must have met its placeholder in the world: one that didn't would leave its
     // material rendered as the placeholder (a mirror, a matte surface), with no error, as two entries on one address
@@ -229,6 +282,14 @@ private:
     std::unordered_map<int, std::uint32_t> mesh_material_slots_;
     std::unordered_map<const material*, std::uint32_t> gltf_slots_;
     std::unordered_map<const gpu::mesh_texture_desc*, int> mesh_texture_slots_;
+    // The models placed so far, each with the index of its first mesh in mesh_set::meshes: a model placed by several
+    // mesh_refs (busts) is one source, its meshes and materials added once
+    struct model_source
+    {
+        std::shared_ptr<const loaded_model> model;
+        int first_mesh;
+    };
+    std::vector<model_source> model_sources_;
 
     std::expected<void, std::string> add_shape(const hittable& shape, const placement& where);
     std::expected<void, std::string> add_medium(const constant_medium& volume, const placement& where);
@@ -238,6 +299,8 @@ private:
     std::uint32_t add_gltf_material(const gpu::mesh_material_desc& factors,
                                     std::span<const std::shared_ptr<const gpu::mesh_texture_desc>> images);
     int mesh_texture_slot(const std::shared_ptr<const gpu::mesh_texture_desc>& image);
+    std::expected<void, std::string> add_model(const mesh_ref& ref, const std::filesystem::path& file,
+                                               build_models& models);
 };
 
 std::expected<void, std::string> scene_translator::add_shape(const hittable& shape, const placement& where)
@@ -547,7 +610,8 @@ std::expected<std::uint32_t, std::string> scene_translator::mesh_material_slot(c
     return found->second;
 }
 
-std::expected<void, std::string> scene_translator::add_meshes(std::span<const mesh_ref> refs)
+std::expected<void, std::string> scene_translator::add_meshes(std::span<const mesh_ref> refs, model_paths paths,
+                                                              build_models& models)
 {
     // The meshes made in code so far, by their function and material, and their index in mesh_set::meshes
     struct generated_source
@@ -559,11 +623,21 @@ std::expected<void, std::string> scene_translator::add_meshes(std::span<const me
     std::vector<generated_source> generated;
     for (const mesh_ref& ref : refs)
     {
+        if (!ref.model.empty())
+        {
+            // With the system's separators throughout, as the loader's messages name the file
+            const std::filesystem::path file = paths == model_paths::assets
+                                                   ? find_asset(std::format("models/{}", ref.model)).make_preferred()
+                                                   : std::filesystem::path(ref.model);
+            if (auto added = add_model(ref, file, models); !added)
+            {
+                return added;
+            }
+            continue;
+        }
         if (!ref.generated)
         {
-            return std::unexpected(ref.model.empty()
-                                       ? "a mesh of its list has neither a model nor a function that makes it"
-                                       : "glTF models in the scene list come in Step 93");
+            return std::unexpected("a mesh of its list has neither a model nor a function that makes it");
         }
         if (!ref.material)
         {
@@ -674,17 +748,19 @@ std::expected<std::vector<gpu::light_desc>, std::string> lights_to_gpu(const hit
 // in lists, BVHs, translate and rotate_y, with matte surfaces of solid, checker, image or marble textures, metal, glass
 // and lamps, and volumes of smoke or fog: every scene of the books. sampling is the strategy the CPU would render with
 // (effective_sampling). microfacets: the GGX side entries of its materials (gpu_scene_parts::microfacets); meshes: its
-// triangle meshes (gpu_scene_parts::meshes), which only OptiX renders.
+// triangle meshes (gpu_scene_parts::meshes), which only OptiX renders, their models found as `paths` says, through the
+// build's `models`.
 std::expected<gpu::scene_desc, std::string> to_gpu(
     const scene& s, const camera_frame& frame, sampling_strategy sampling,
-    std::span<const std::pair<const material*, gpu::microfacet_desc>> microfacets, std::span<const mesh_ref> meshes)
+    std::span<const std::pair<const material*, gpu::microfacet_desc>> microfacets, std::span<const mesh_ref> meshes,
+    model_paths paths, build_models& models)
 {
     scene_translator translator(frame, sampling, microfacets);
     if (const auto added = translator.add_world(s.world); !added)
     {
         return std::unexpected(added.error());
     }
-    if (const auto added = translator.add_meshes(meshes); !added)
+    if (const auto added = translator.add_meshes(meshes, paths, models); !added)
     {
         return std::unexpected(added.error());
     }
@@ -692,12 +768,13 @@ std::expected<gpu::scene_desc, std::string> to_gpu(
 }
 
 // A scene's parts as the renderer's tables, at their camera's own frame, without the programs' options, a lights list
-// or an environment: the translation of the world, of its GGX side entries and of its meshes alone, which
-// GpuTests checks
+// or an environment: the translation of the world, of its GGX side entries and of its meshes alone (models from
+// assets/models), which GpuTests checks
 export std::expected<gpu::scene_desc, std::string> translate_parts(const gpu_scene_parts& parts)
 {
+    build_models models(nullptr);
     return to_gpu(parts.cpu, camera(parts.cpu.camera).frame(), sampling_strategy::material, parts.microfacets,
-                  parts.meshes);
+                  parts.meshes, model_paths::assets, models);
 }
 
 // --- The environment map ---------------------------------------------------------------------------------------
@@ -788,9 +865,9 @@ std::expected<std::optional<gpu::environment_desc>, std::string> load_environmen
 
 // --- glTF models: a file in place of a scene's name ------------------------------------------------------------
 
-// A loaded model as every build reuses it (not exported; filled in Step 93): meshes::model from load_gltf is converted
-// once per load into these shared pieces and dropped; a build copies the shared_ptrs into scene_desc::meshes, never
-// the meshes themselves
+// A loaded model as every build reuses it (not exported): meshes::model from load_gltf is converted once per load into
+// these shared pieces and dropped; a build copies the shared_ptrs into scene_desc::meshes. Its materials
+// are glTF's (scene_material -1), their texture indices into `textures`; its meshes' material_of index `materials`.
 struct loaded_model
 {
     std::vector<std::shared_ptr<const gpu::mesh_desc>> meshes;
@@ -800,7 +877,314 @@ struct loaded_model
     std::array<double, 3> lower{};
     std::array<double, 3> upper{};
     std::vector<std::string> warnings;
+    std::size_t triangles = 0; // placed: each placement's mesh once per placement
+    // The meshes again with every material_of raised by an offset, for a scene whose mesh materials don't start with
+    // this model's (still-life's second model: renderer.h's material_of indexes the whole set's materials). Made at the
+    // first build that needs an offset and kept with the model, so the later builds share them as they share `meshes`.
+    // A cache inside a model that is otherwise never changed: its own mutex guards it.
+    mutable std::mutex shifted_mutex;
+    mutable std::map<std::uint32_t, std::vector<std::shared_ptr<const gpu::mesh_desc>>> shifted;
 };
+
+namespace
+{
+gpu::texture_wrap to_texture_wrap(meshes::wrap wrap)
+{
+    switch (wrap)
+    {
+    case meshes::wrap::repeat:
+        return gpu::texture_wrap::repeat;
+    case meshes::wrap::mirrored_repeat:
+        return gpu::texture_wrap::mirrored_repeat;
+    case meshes::wrap::clamp:
+        return gpu::texture_wrap::clamp;
+    }
+    std::unreachable();
+}
+
+// A model as the renderer's pieces, once per load: its vectors moved into shared meshes and images
+std::shared_ptr<const loaded_model> to_loaded_model(meshes::model m)
+{
+    auto loaded = std::make_shared<loaded_model>();
+    for (meshes::mesh& mesh : m.meshes)
+    {
+        loaded->meshes.push_back(std::make_shared<const gpu::mesh_desc>(to_mesh_desc(std::move(mesh))));
+    }
+    for (const meshes::placement& p : m.placements)
+    {
+        loaded->placements.push_back({.mesh = p.mesh, .object_to_world = p.object_to_world});
+        loaded->triangles += loaded->meshes[static_cast<std::size_t>(p.mesh)]->indices.size() / 3;
+    }
+    for (const meshes::pbr_material& pbr : m.materials)
+    {
+        loaded->materials.push_back({.scene_material = -1,
+                                     .base_color = pbr.base_color,
+                                     .metallic = pbr.metallic,
+                                     .roughness = pbr.roughness,
+                                     .base_color_texture = pbr.base_color_image,
+                                     .metal_rough_texture = pbr.metal_rough_image});
+    }
+    for (meshes::image& image : m.images)
+    {
+        loaded->textures.push_back(std::make_shared<const gpu::mesh_texture_desc>(
+            gpu::mesh_texture_desc{.width = image.width,
+                                   .height = image.height,
+                                   .rgba = std::move(image.rgba),
+                                   .srgb = image.srgb,
+                                   .wrap_s = to_texture_wrap(image.wrap_s),
+                                   .wrap_t = to_texture_wrap(image.wrap_t),
+                                   .nearest = image.nearest}));
+    }
+    loaded->lower = m.lower;
+    loaded->upper = m.upper;
+    loaded->warnings = std::move(m.warnings);
+    return loaded;
+}
+
+// The model's meshes for a scene whose mesh materials start with this model's at `offset`
+std::vector<std::shared_ptr<const gpu::mesh_desc>> meshes_at(const loaded_model& model, std::uint32_t offset)
+{
+    if (offset == 0)
+    {
+        return model.meshes;
+    }
+    const std::lock_guard lock(model.shifted_mutex);
+    if (const auto found = model.shifted.find(offset); found != model.shifted.end())
+    {
+        return found->second;
+    }
+    // Made whole before the map holds them: a copy that throws (out of memory) leaves no part of a set behind, which
+    // every later build would take for the whole and place past
+    std::vector<std::shared_ptr<const gpu::mesh_desc>> shifted;
+    shifted.reserve(model.meshes.size());
+    for (const auto& mesh : model.meshes)
+    {
+        gpu::mesh_desc copy = *mesh;
+        for (std::uint32_t& material : copy.material_of)
+        {
+            material += offset;
+        }
+        shifted.push_back(std::make_shared<const gpu::mesh_desc>(std::move(copy)));
+    }
+    return model.shifted.emplace(offset, std::move(shifted)).first->second;
+}
+
+// The models used last: two, by their file's canonical path, size and time of its last write, so a scene built again
+// (the window's Tab and M, a second render) reads no file again, and a file written since is read again. Only the
+// model's own file (the .gltf or .glb) is watched: a .bin or a texture beside a .gltf, written since, is not seen until
+// the .gltf changes too (or the program starts again). Two, so that still-life's bust and vase both stay; a hit makes
+// its model the most recent, so a new model pushes out the one least recently used, never one a build just used. Host
+// memory only (no GPU object), so a static is safe at exit. One build at a time reads (its mutex).
+class model_cache
+{
+public:
+    struct found
+    {
+        std::shared_ptr<const loaded_model> model;
+        bool read = false; // from its file just now (else the cache's)
+        double seconds = 0;
+    };
+
+    std::expected<found, std::string> get(const std::filesystem::path& file)
+    {
+        const std::lock_guard lock(mutex_);
+        // The canonical path, so that two names of one file (relative and absolute, with ..\ in it) are one model.
+        // Where the system can't give it (canonical fails on some network and virtual drives), the absolute path with
+        // its . and .. taken out by hand (lexically_normal): the same key each time the file is named the same way, so
+        // that later builds still find it.
+        std::error_code error;
+        key k{.path = std::filesystem::canonical(file, error)};
+        if (error)
+        {
+            error.clear();
+            k.path = std::filesystem::absolute(file, error).lexically_normal();
+        }
+        if (!error)
+        {
+            k.size = std::filesystem::file_size(k.path, error);
+        }
+        if (!error)
+        {
+            k.written = std::filesystem::last_write_time(k.path, error);
+        }
+        if (!error)
+        {
+            if (const auto known = std::ranges::find(recent_, k, &entry::first); known != recent_.end())
+            {
+                std::rotate(known, std::next(known), recent_.end()); // now the most recent
+                return found{.model = recent_.back().second};
+            }
+        }
+        // Read (also when the file couldn't be found: the loader says why, in its words)
+        const auto start = std::chrono::steady_clock::now();
+        auto model = load_gltf(file);
+        if (!model)
+        {
+            return std::unexpected(std::move(model.error()));
+        }
+        found result{.model = to_loaded_model(std::move(*model)), .read = true};
+        result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (!error)
+        {
+            // A file read again because it was written since replaces its old entry, which no key finds any more: kept,
+            // it would push out the other model and hold the old one's memory
+            std::erase_if(recent_, [&k](const entry& e) { return e.first.path == k.path; });
+            recent_.emplace_back(std::move(k), result.model);
+            if (recent_.size() > kept)
+            {
+                recent_.erase(recent_.begin());
+            }
+        }
+        return result;
+    }
+
+private:
+    struct key
+    {
+        std::filesystem::path path;
+        std::uintmax_t size = 0;
+        std::filesystem::file_time_type written{};
+        bool operator==(const key&) const = default;
+    };
+    using entry = std::pair<key, std::shared_ptr<const loaded_model>>;
+    static constexpr std::size_t kept = 2;
+    std::mutex mutex_;
+    std::vector<entry> recent_; // the least recently used first, at most one entry per path
+};
+
+model_cache& the_model_cache()
+{
+    static model_cache cache;
+    return cache;
+}
+
+// What a build says of a model it read: its file as named, its counts, its warnings
+model_load load_of(std::string_view file, const loaded_model& model, double seconds)
+{
+    return {.file = std::string(file),
+            .triangles = model.triangles,
+            .images = model.textures.size(),
+            .seconds = seconds,
+            .warnings = model.warnings};
+}
+
+// The refusal of a model without a triangle, with the loader's warnings, which say why (every primitive dropped, points
+// and lines alone), each without the file's name that starts the message once: "lines.glb: it has no triangles to
+// render: points and lines skipped, only triangles are rendered (2): meshes[0].primitives[0], meshes[1].primitives[0]"
+std::string no_triangles(std::string_view named, const loaded_model& model)
+{
+    // The loader's lines all start with its name for the file and ": ", and the last of such a model's is that start
+    // and "no triangles to render" (gltf.ixx's finish), which the refusal says itself: it gives the start to take off
+    constexpr std::string_view none = "no triangles to render";
+    std::span<const std::string> lines = model.warnings;
+    std::string_view start;
+    if (!lines.empty() && lines.back().ends_with(none))
+    {
+        start = std::string_view(lines.back()).substr(0, lines.back().size() - none.size());
+        lines = lines.first(lines.size() - 1);
+    }
+    std::string why;
+    for (std::string_view line : lines)
+    {
+        if (!start.empty() && line.starts_with(start))
+        {
+            line.remove_prefix(start.size());
+        }
+        why += std::format("{}{}", why.empty() ? "" : "; ", line);
+    }
+    return std::format("{}: it has no triangles to render{}{}", named, why.empty() ? "" : ": ", why);
+}
+
+// a·b of row-major 3×4 matrices: b first, then a
+std::array<double, 12> compose(const std::array<double, 12>& a, const std::array<double, 12>& b)
+{
+    std::array<double, 12> c{};
+    for (int r = 0; r < 3; ++r)
+    {
+        for (int k = 0; k < 4; ++k)
+        {
+            double sum = k == 3 ? a[4 * r + 3] : 0.0;
+            for (int j = 0; j < 3; ++j)
+            {
+                sum += a[4 * r + j] * b[4 * j + k];
+            }
+            c[4 * r + k] = sum;
+        }
+    }
+    return c;
+}
+}
+
+// The cache's model of a file, once per build (see build_models)
+std::expected<std::shared_ptr<const loaded_model>, std::string> build_models::get(const std::filesystem::path& file,
+                                                                                  std::string_view named)
+{
+    if (const auto known = std::ranges::find(held_, file, &held::file); known != held_.end())
+    {
+        return known->model;
+    }
+    auto got = the_model_cache().get(file);
+    if (!got)
+    {
+        return std::unexpected(std::move(got.error()));
+    }
+    if (got->read && loads_)
+    {
+        loads_->push_back(load_of(named, *got->model, got->seconds));
+    }
+    held_.push_back({.file = file, .model = got->model});
+    return std::move(got->model);
+}
+
+// A model in the scene (a mesh_ref naming a file): its meshes, materials and images added once per build however
+// many mesh_refs place it (one acceleration structure each), and every placement of the file's own nodes an instance
+// at ref.placement · unit_placement · the node's transform. unit_placement (meshes.ixx) makes any model the same size
+// first: its bounding sphere of radius 1, centered over the origin, its lowest point on y = 0, so a scene places it in
+// the units of its own world. The model's materials go after those already in the set: its meshes' material_of are
+// shifted to match where that offset isn't 0 (meshes_at).
+std::expected<void, std::string> scene_translator::add_model(const mesh_ref& ref, const std::filesystem::path& file,
+                                                             build_models& models)
+{
+    const auto got = models.get(file, ref.model);
+    if (!got)
+    {
+        return std::unexpected(got.error());
+    }
+    const loaded_model& model = **got;
+    if (model.placements.empty())
+    {
+        return std::unexpected(no_triangles(ref.model, model));
+    }
+    auto source = std::ranges::find(model_sources_, *got, &model_source::model);
+    if (source == model_sources_.end())
+    {
+        const auto offset = static_cast<std::uint32_t>(desc_.meshes.materials.size());
+        for (const gpu::mesh_material_desc& m : model.materials)
+        {
+            add_gltf_material(m, model.textures);
+        }
+        const auto first_mesh = static_cast<int>(desc_.meshes.meshes.size());
+        std::ranges::copy(meshes_at(model, offset), std::back_inserter(desc_.meshes.meshes));
+        model_sources_.push_back({.model = *got, .first_mesh = first_mesh});
+        source = std::prev(model_sources_.end());
+    }
+    std::array<double, 12> unit;
+    try
+    {
+        unit = meshes::unit_placement(model.lower, model.upper);
+    }
+    catch (const std::invalid_argument&)
+    {
+        return std::unexpected(std::format("{}: its triangles have no size to place", ref.model));
+    }
+    const std::array<double, 12> placed = compose(ref.placement, unit);
+    for (const gpu::mesh_instance_desc& p : model.placements)
+    {
+        desc_.meshes.instances.push_back(
+            {.mesh = source->first_mesh + p.mesh, .object_to_world = compose(placed, p.object_to_world)});
+    }
+    return {};
+}
 
 // Whether a scene argument names a glTF 2.0 file: it ends in .glb or .gltf, in any case (no scene's name has a dot)
 export bool is_model_path(std::string_view argument)
@@ -814,11 +1198,75 @@ export bool is_model_path(std::string_view argument)
     return ends_with(".glb") || ends_with(".gltf");
 }
 
-// A model file's scene is built from the file (build_gpu_scene, Step 93), never by an entry's function: this one only
-// says so
+// A model file's scene is built from the file (build_gpu_scene: model_scene_parts), never by an entry's function: this
+// one only says so
 gpu_scene_parts model_scene()
 {
-    throw std::logic_error("a glTF model's scene comes in Step 93");
+    throw std::logic_error("a glTF model's scene is built from its file, by build_gpu_scene");
+}
+
+// A model file's scene: the model unit-placed (radius 1, standing on y = 0 over the origin) on a matte grey ground 40
+// wide, in the photo studio's light (studio's map), seen with a field of 30° from 4.24 away from its middle, the
+// center of its bounding sphere, which then fills 2·asin(1/4.24) = 27° of the 30° whatever the model, from 8.1° above
+// (0.6 up, 4.2 in front) or higher for a flat model (below). Its middle is (0, h/2, 0) for its height h once placed,
+// which only the model knows, so the file is read here (the build's models hold it for the translation). A model
+// without a triangle (all of them dropped, or points and lines alone) or without size is refused here, by the file's
+// name, before anything divides by its size.
+std::expected<gpu_scene_parts, std::string> model_scene_parts(std::string_view file, build_models& models)
+{
+    const auto got = models.get(std::filesystem::path(file), file);
+    if (!got)
+    {
+        return std::unexpected(got.error());
+    }
+    const loaded_model& model = **got;
+    if (model.placements.empty())
+    {
+        return std::unexpected(no_triangles(file, model));
+    }
+    std::array<double, 12> unit;
+    try
+    {
+        unit = meshes::unit_placement(model.lower, model.upper);
+    }
+    catch (const std::invalid_argument&)
+    {
+        return std::unexpected(std::format("{}: its triangles have no size to place", file));
+    }
+    const double height = unit[5] * (model.upper[1] - model.lower[1]); // the scale times the box's height
+    gpu_scene_parts parts;
+    // The ground 1 mm below the model's lowest point, as busts' is: a model's flat bottom, its own floor or a model
+    // flat as a rug would otherwise lie in the ground's plane, the quad hit by the books' test in the world and the
+    // triangles by the hardware in their instance's space, and the closest hit would flip from pixel to pixel. Every
+    // model is 1 in radius, so one gap fits all: under half a row of the 1080 at the camera's distance (the frame is
+    // 2.27 tall there), and far above float's rounding of the hit distances (about 5·10⁻⁷ at 4.24)
+    parts.cpu.world.add(std::make_unique<quad>(point3{-20, -0.001, -20}, vec3{0, 0, 40}, vec3{40, 0, 0},
+                                               std::make_shared<lambertian>(color{0.5, 0.5, 0.5})));
+    const point3 lookat{0, height / 2, 0};
+    // A model at least 1 tall, its sphere's radius (its box then at most 1.73 across), is seen from 8.1° above: the
+    // bust (1.57) and the vase (1.81) are. A flatter one is seen from higher, at the same distance, 8.1° at h = 1
+    // rising linearly to 45° at h = 0: a rug, a coin or a sword lying down would show only its edge from 8.1° (a
+    // square rug, 1.41 deep, a sliver 0.2 tall) and shows its face from 45° (1 tall); a car (h ≈ 0.55) is seen from
+    // about 25°.
+    vec3 from{0, 0.6, 4.2};
+    if (height < 1)
+    {
+        const double low = std::atan2(0.6, 4.2);
+        const double elevation = low + (std::numbers::pi / 4 - low) * (1 - height);
+        const double distance = std::hypot(0.6, 4.2);
+        from = vec3{0, distance * std::sin(elevation), distance * std::cos(elevation)};
+    }
+    parts.cpu.camera = {.aspect_ratio = 16.0 / 9.0,
+                        .image_width = 1920,
+                        .samples_per_pixel = 1024,
+                        .max_depth = 10,
+                        .sampling = sampling_strategy::material,
+                        .vfov = 30,
+                        .lookfrom = lookat + from,
+                        .lookat = lookat};
+    parts.environment = {.source = env_source::asset, .asset = "studio_small_09_1k.hdr", .yaw_degrees = 0, .scale = 1};
+    parts.meshes = {mesh_ref{.model = file}};
+    return parts;
 }
 
 // The entry of a model file's scene, outside the list (neither the help nor Tab shows it): a showcase, rendered with
@@ -844,8 +1292,6 @@ export const gpu_scene_entry* scene_entry(std::string_view scene_or_path)
     }
     return is_model_path(scene_or_path) ? &model_entry() : nullptr;
 }
-// build_gpu_scene(name, …) also takes a model path from Step 93: the model through the cache (the last two, by
-// canonical path, size and write time, as std::shared_ptr<const loaded_model>), unit_placement, the ground and camera
 
 // --- A scene ready for the GPU ---------------------------------------------------------------------------------
 
@@ -878,17 +1324,20 @@ export struct gpu_build
     strategy sampling;     // the strategy rendered with: as the CPU would (effective_sampling: without lamps, material)
     gpu::scene_desc desc;  // the renderer's data, with the lights list for the strategies that aim at it
     std::int64_t passes;   // how many to render: frame.sqrt_spp², or with strata the samples asked for
+    std::vector<model_load> models; // the glTF models this build read from their files (not those the cache held)
 };
 
 // Builds the scene called `name` with the CPU's code, applies the overrides and translates it, or says why the GPU
-// can't render it: the whole message, as the programs print it after "Error: ".
+// can't render it: the whole message, as the programs print it after "Error: ". `name` may also be a glTF model's file
+// (is_model_path): its scene is the model in the studio (model_scene_parts).
 export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view name, const scene_overrides& overrides)
 {
-    const gpu_scene_entry* entry = find_gpu_scene(name);
+    const gpu_scene_entry* entry = scene_entry(name);
     if (!entry)
     {
         return std::unexpected(std::format("unknown scene '{}'", name));
     }
+    const bool model_file = entry == &model_entry();
     // The camera divides by the width and takes the square root of the samples (see camera), so it needs both
     // positive: the programs' options check that, and so does this function, for callers without options
     if (overrides.image_width.value_or(1) < 1 || overrides.samples_per_pixel.value_or(1) < 1)
@@ -904,7 +1353,22 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
     // random, a marble texture shuffles its Perlin tables), so a second build in the same process would make another
     // scene. Starting the generator over gives every build the scene of a fresh process, the scene RayTracing renders.
     seed_random(std::mt19937_64::default_seed);
-    gpu_scene_parts parts = entry->build();
+    std::vector<model_load> models_read;
+    build_models models(&models_read);
+    gpu_scene_parts parts;
+    if (model_file)
+    {
+        auto made = model_scene_parts(name, models);
+        if (!made)
+        {
+            return std::unexpected(made.error()); // the loader's message: the file, then what is wrong with it
+        }
+        parts = std::move(*made);
+    }
+    else
+    {
+        parts = entry->build();
+    }
     scene& s = parts.cpu;
     s.camera.image_width = overrides.image_width.value_or(s.camera.image_width);
     s.camera.samples_per_pixel = overrides.samples_per_pixel.value_or(s.camera.samples_per_pixel);
@@ -930,7 +1394,8 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
     // without lamps
     const sampling_strategy sampling = effective_sampling(s.camera.sampling, s.lights);
 
-    auto desc = to_gpu(s, frame, sampling, parts.microfacets, parts.meshes);
+    auto desc = to_gpu(s, frame, sampling, parts.microfacets, parts.meshes,
+                       model_file ? model_paths::as_given : model_paths::assets, models);
     if (!desc)
     {
         return std::unexpected(std::format("the GPU can't render '{}': {}.", name, desc.error()));
@@ -975,7 +1440,8 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
                      .sampling_given = overrides.sampling.has_value(),
                      .sampling = rendered,
                      .desc = std::move(*desc),
-                     .passes = passes};
+                     .passes = passes,
+                     .models = std::move(models_read)};
 }
 
 // Whether the quality kernel renders the scene (see the kernels in renderer.cu): asked for, or needed by what the scene
@@ -994,6 +1460,34 @@ export bool renders_with_quality_kernel(const gpu_build& build, kernel_choice ke
 strategy checked_strategy(const gpu_build& build)
 {
     return build.sampling_given ? build.requested : build.sampling;
+}
+
+// What a scene with triangle meshes can't be rendered with, as the programs say it after "Error: ", before CUDA or
+// OptiX starts: only OptiX traces triangles, in float, with the quality kernel's integrator, which samples the
+// materials. So a scene with meshes renders with OptiX whatever the options ask (no --optix needed), and refuses the
+// options that pick another renderer or float64, and the books' strategies but the material's. `scene` is the scene's
+// name, or the model's file, for the message.
+export std::expected<void, std::string> check_meshes(const gpu_build& build, std::string_view scene,
+                                                     kernel_choice kernel, bool fp64)
+{
+    if (build.desc.meshes.instances.empty())
+    {
+        return {};
+    }
+    const std::string_view option = fp64                                ? "--fp64"
+                                    : kernel == kernel_choice::quality   ? "--quality-kernel"
+                                    : kernel == kernel_choice::all_books ? "--all-books-kernel"
+                                                                         : "";
+    if (!option.empty())
+    {
+        return std::unexpected(
+            std::format("'{}' has triangle meshes, which only OptiX renders (in float): drop {}", scene, option));
+    }
+    if (!integrator_renders(checked_strategy(build)))
+    {
+        return std::unexpected(std::format("OptiX samples the materials: use -p {}", integrator_strategies()));
+    }
+    return {};
 }
 
 // What the quality kernel can't render, as the programs say it after "Error: ", before anything is rendered (the

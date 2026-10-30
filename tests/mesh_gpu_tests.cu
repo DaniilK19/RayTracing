@@ -72,6 +72,15 @@
 //                   metallic-roughness one that is; a texture missing, 0 texels wide, past the GPU's width, with a
 //                   wrap mode glTF doesn't have, or with 12 bytes for 2×2 texels; and the scene they come from,
 //                   accepted.
+// Suite mesh-cache (Step 93), host only (GpuTests links gpu_scene; tests/mesh_services.cpp holds the modules' side):
+//   still-life      two builds of still-life share their mesh_desc and texture pointers and read nothing (each model
+//                   converted once per load); after the vase's file gets a new write time (put back afterwards) the
+//                   vase alone reads it again, and still-life then reads nothing, the bust's pointers the first
+//                   build's and the vase's the reload's (the stale entry gone, not the bust); with the time put back
+//                   still-life reads the vase alone;
+//   second-model    still-life's material offset: every triangle of the bust and of the vase (told apart by where
+//                   they stand) wears one of its own model's materials as load_gltf reads them from the file, the
+//                   factors and the textures' texels, base color sRGB and metallic-roughness linear.
 // The OptiX checks reach the GPU through the fixture's runtime (optix_fixture.h): an upload of a scene_desc the test
 // makes (a gpu::mesh_set of meshes from module meshes, through tests/mesh_services.h), and launch_test of the check
 // module's __raygen__probe_mesh. Its creation and first compiles are left out of the 10 s budget. closed-block and
@@ -186,13 +195,15 @@
 // Seeds: 9101-9111, 9113, 9114, 9120, 9122.
 //
 // Step criteria: $GT optix-triangles --require-optix and $GT optix-pbr --require-optix exit 0 (≈ 3 s and ≈ 1 s, the
-// check module's cold compile apart).
+// check module's cold compile apart); $GT mesh-cache exits 0 (a fraction of a second of CPU: at most six reads of a
+// model, the first build's two, the touched vase's two and second-model's two, and six builds' studio map).
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <format>
 #include <limits>
@@ -3682,5 +3693,82 @@ GPU_TEST(optix_pbr, refusals)
     {
         ctx.info("refused-texture-past-the-gpu", std::format("not tried: the GPU's widest texture is {}", widest));
     }
+}
+
+// =====================================================================================================================
+// Suite mesh-cache (Step 93): gpu_scene's model cache, on the host alone
+// =====================================================================================================================
+
+// Two builds of still-life share their meshes and textures (the same shared_ptrs: each model converted once per
+// load); after the vase's file gets a new write time, the vase alone reads it again (new pointers), and still-life
+// then reads nothing: the bust stayed beside the reloaded vase, the vase's stale entry gone instead of pushing the bust
+// out; with the time put back, still-life reads the vase alone again (see check_model_cache). No GPU work and no OptiX
+// (the translation is the host's), so it runs in a build without OptiX too, and stays in every GpuTests run (it isn't
+// one of --exclude's OptiX suites).
+GPU_TEST(mesh_cache, still_life)
+{
+    const gpu_test::mesh_host::model_cache_check c = gpu_test::mesh_host::check_model_cache();
+    ctx.count("write-time-restored", c.restored ? 0 : 1, 0, 1);
+    if (!c.problem.empty())
+    {
+        ctx.fail("model-cache", c.problem);
+        return;
+    }
+    const auto n = [](std::size_t value) { return static_cast<std::int64_t>(value); };
+    const std::int64_t meshes = n(c.meshes);
+    const std::int64_t textures = n(c.textures);
+    // The bust's part of still-life: its meshes and textures but the vase's, which the third build holds alone
+    const std::int64_t bust_meshes = meshes - n(c.third_meshes);
+    const std::int64_t bust_textures = textures - n(c.third_textures);
+    ctx.count("meshes-built", c.meshes > 0 && c.null_meshes == 0 && bust_meshes > 0 && bust_textures > 0 ? 0 : 1, 0,
+              1);
+    ctx.count("second-build-shares-meshes", meshes - n(c.shared) + std::abs(n(c.second_meshes) - meshes), 0, meshes);
+    ctx.count("second-build-shares-textures",
+              textures - n(c.shared_textures) + std::abs(n(c.second_textures) - textures), 0, textures);
+    ctx.count("second-build-reads-nothing", n(c.second_read), 0, 2);
+    ctx.count("touched-file-loads-again", c.third_read == 1 && c.third_textures > 0 ? 0 : 1, 0, 1);
+    ctx.count("touched-model-new-textures", n(c.third_old_textures), 0, n(c.third_textures));
+    ctx.count("fourth-build-reads-nothing", n(c.fourth_read), 0, 2);
+    ctx.count("other-model-stays-cached",
+              std::abs(n(c.kept_meshes) - bust_meshes) + std::abs(n(c.kept_textures) - bust_textures), 0,
+              bust_meshes + bust_textures);
+    ctx.count("reloaded-model-stays-cached",
+              n(c.third_textures) - n(c.reloaded_textures) + std::abs(n(c.fourth_textures) - textures) +
+                  std::abs(n(c.fourth_meshes) - meshes),
+              0, n(c.third_textures));
+    ctx.count("stale-entry-gone",
+              c.fifth_read_count == 1 && c.fifth_read.find("brass_vase_01") != std::string::npos ? 0 : 1, 0, 1);
+    ctx.info("model-cache",
+             std::format("{} meshes and {} textures in each build of still-life, the vase {} and {} of them; after {} "
+                         "got a new write time, the vase alone read {} model(s) and still-life {}, its bust kept {} "
+                         "meshes and {} textures, its vase {} textures of the reload; with the time put back "
+                         "still-life read: {}",
+                         c.meshes, c.textures, c.third_meshes, c.third_textures, c.touched, c.third_read,
+                         c.fourth_read, c.kept_meshes, c.kept_textures, c.reloaded_textures,
+                         c.fifth_read.empty() ? "nothing" : c.fifth_read));
+}
+
+// still-life's second model, the vase, wears its own materials: its triangles' material_of are shifted past the bust's
+// materials (gpu_scene.ixx's meshes_at), and every triangle of both models is checked against the materials load_gltf
+// reads from its model's file (the factors, and the textures' texels and color spaces), the models told apart by where
+// they stand (see check_model_materials). An unshifted vase would wear the bust's marble, an index the upload accepts.
+// Host only, like still-life; it reads both models' files once more (four 1k images decoded).
+GPU_TEST(mesh_cache, second_model)
+{
+    const gpu_test::mesh_host::model_materials_check c = gpu_test::mesh_host::check_model_materials();
+    if (!c.problem.empty())
+    {
+        ctx.fail("second-model", c.problem);
+        return;
+    }
+    const auto n = [](std::size_t value) { return static_cast<std::int64_t>(value); };
+    ctx.count("both-models-placed", (c.bust_triangles > 0 ? 0 : 1) + (c.vase_triangles > 0 ? 0 : 1), 0, 2);
+    ctx.count("models-apart", n(c.both_meshes), 0, n(c.bust_meshes + c.vase_meshes));
+    ctx.count("bust-wears-its-materials", n(c.bust_wrong), 0, n(c.bust_triangles));
+    ctx.count("vase-wears-its-materials", n(c.vase_wrong), 0, n(c.vase_triangles));
+    ctx.info("second-model", std::format("{} materials and {} textures; the bust {} mesh(es) of {} triangles, the vase "
+                                         "{} mesh(es) of {} triangles",
+                                         c.materials, c.textures, c.bust_meshes, c.bust_triangles, c.vase_meshes,
+                                         c.vase_triangles));
 }
 }

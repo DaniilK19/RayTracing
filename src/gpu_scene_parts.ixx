@@ -18,7 +18,7 @@ import strategy_options;
 export enum class scene_role
 {
     book,     // the books' 13, as RayTracing renders them
-    showcase, // the GPU's own scenes of light and materials beyond the books, which only the quality kernel renders
+    showcase, // the GPU's own scenes beyond the books, which only the quality kernel (or OptiX: meshes) renders
     test,     // checks of the renderers, such as a white furnace
 };
 
@@ -42,7 +42,9 @@ export struct environment_choice
 // ground, the Cornell box's walls and lamp stay the books' shapes)
 export struct mesh_ref
 {
-    std::string_view model;                    // a file under assets/models (a glTF model), or empty
+    std::string_view model;                    // a glTF model: a file under assets/models (the list's scenes), or a
+                                               // model's path as given (build_gpu_scene's model file), or empty; a
+                                               // view of the caller's string, for the build only
     gpu::mesh_desc (*generated)() = nullptr;   // or a mesh made in code (material_of all 0), wearing `material`;
                                                // gpu_scenes_meshes.ixx passes captureless lambdas over meshes::
     std::shared_ptr<::material> material;   // the CPU material a generated mesh wears (its GGX side entry, if any,
