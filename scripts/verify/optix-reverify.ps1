@@ -97,13 +97,15 @@ try {
     }
 
     # --- 2. the suites: the runtime, the tracer ray by ray, the same-seed survey --------------------------------------
-    $run = Invoke-Queued "reverify-suites" @($tests, "optix-runtime", "optix-tracer", "optix-render", "--require-optix")
+    $run = Invoke-Queued "reverify-suites" @($tests, "optix-runtime", "optix-tracer", "optix-render", "optix-triangles",
+        "--require-optix")
     $run.lines | Where-Object { $_ -match '(: |, )(FAIL|SKIP)\b|^Error|^GpuTests: ' } | ForEach-Object { "  $_" }
     $detail = "exit code $($run.code)"
-    Write-Check "GpuTests optix-runtime optix-tracer optix-render --require-optix" ($run.code -eq 0) $detail
+    Write-Check "GpuTests optix-runtime optix-tracer optix-render optix-triangles --require-optix" ($run.code -eq 0) `
+        $detail
 
     # --- 3. the white furnaces under --optix: every value exactly 1.0 -------------------------------------------------
-    foreach ($scene in @("furnace", "env-furnace")) {
+    foreach ($scene in @("furnace", "env-furnace", "mesh-furnace")) {
         $pfm = Join-Path $work "reverify-$scene.pfm"
         $run = Invoke-Queued "reverify-$scene" @($gpu, $scene, "--optix", "-p", "material", "-w", "480", "--height",
             "270", "-s", "64", "-o", $pfm)
@@ -152,9 +154,24 @@ try {
     }
 
     # --- 5. the checks later steps add (empty until Claude integrates that step) --------------------------------------
-    # Step 91: cornell against cornell-triangles, Step 91's protocol: compare.ps1 -Scene cornell -A mis@quality:ref
-    #          -SceneB cornell-triangles -B mis@optix:3,4 (the triangles' hierarchies, the instances and the origin
-    #          offsets under the new driver).
+    # Step 91: the triangles (the suite optix-triangles in section 2, mesh-furnace in section 3), and its protocols:
+    # cornell's quads under the quality kernel against cornell-triangles under OptiX (the triangles' hierarchies and the
+    # origins moved off them under the new driver), and instances-baked against instances (the instance transforms)
+    foreach ($pair in @(@("cornell", "mis@quality:ref", "cornell-triangles", "mis@optix:3,4"),
+            @("instances-baked", "mis@optix:1,2", "instances", "mis@optix:3,4"))) {
+        $arguments = @{ Step = $Step; Scene = $pair[0]; A = $pair[1]; SceneB = $pair[2]; B = $pair[3]; State = $State;
+            Build = $Build }
+        $lines = @(& $compareScript @arguments)
+        $code = $LASTEXITCODE
+        $lines | ForEach-Object { "  $_" }
+        if ($code -eq 4) {
+            Write-Output ("optix-reverify: gpu.ps1 refused a render of compare.ps1 {0}: nothing re-verified" -f $pair[2])
+            exit 2
+        }
+        $detail = if ($code -eq 2) { "VOID or an error, exit code 2" } else { "exit code $code" }
+        Write-Check ("compare.ps1 {0} {1} against {2} {3}" -f $pair[0], $pair[1], $pair[2], $pair[3]) ($code -eq 0) `
+            $detail
+    }
 
     # Step 92: pbr-test against pbr-reference, Step 92's protocol: compare.ps1 -Scene pbr-reference -A mis@optix:1,2
     #          -SceneB pbr-test -B mis@optix:3,4 (glTF's materials texel by texel against the same materials as the

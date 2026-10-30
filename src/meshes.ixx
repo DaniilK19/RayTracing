@@ -326,8 +326,11 @@ mesh triangulate_quads(std::span<const std::array<double, 9>> q_u_v, std::span<c
     return m;
 }
 
-// A mesh moved into the world once and for all: the reference an instanced copy of it must reproduce. Positions by
-// the whole matrix, normals by M⁻ᵀ and made unit again (a zero normal stays zero). A baked triangle sits under an
+// A mesh moved into the world once and for all: the reference an instanced copy of it must reproduce. Positions by the
+// whole matrix, normals by M⁻ᵀ and left at the length that gives them: the renderer interpolates a triangle's three
+// normals and only then makes the sum unit, and an instanced copy transforms that sum by M⁻ᵀ, so the baked copy's
+// shading normal is the instanced one's, Σbᵢ·M⁻ᵀnᵢ = M⁻ᵀ·Σbᵢnᵢ, under a non-uniform scale too (made unit per vertex,
+// the interpolation would weigh the corners otherwise, and the two would differ). A baked triangle sits under an
 // identity instance, where the renderer takes its outside to be e1 × e2 of the stored corners; under a mirror that is
 // (Ma)×(Mb) = det M · M⁻ᵀ(a×b), the inside, while the instanced copy's is M⁻ᵀ(a×b): so when det M < 0 corners 1 and 2
 // of every triangle trade places (glTF's winding rule for mirrored nodes), and the baked copy's outside, front and
@@ -351,12 +354,8 @@ mesh bake(const mesh& m, const std::array<double, 12>& object_to_world)
     for (std::size_t i = 0; i < m.normals.size() / 3; ++i)
     {
         const vec a = vertex(m.normals, i);
-        vec b{n[0] * a[0] + n[1] * a[1] + n[2] * a[2], n[3] * a[0] + n[4] * a[1] + n[5] * a[2],
-              n[6] * a[0] + n[7] * a[1] + n[8] * a[2]};
-        if (const double length = std::sqrt(dot(b, b)); length > 0)
-        {
-            b = {b[0] / length, b[1] / length, b[2] / length};
-        }
+        const vec b{n[0] * a[0] + n[1] * a[1] + n[2] * a[2], n[3] * a[0] + n[4] * a[1] + n[5] * a[2],
+                    n[6] * a[0] + n[7] * a[1] + n[8] * a[2]};
         out.normals[3 * i] = static_cast<float>(b[0]);
         out.normals[3 * i + 1] = static_cast<float>(b[1]);
         out.normals[3 * i + 2] = static_cast<float>(b[2]);

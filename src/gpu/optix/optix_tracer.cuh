@@ -131,9 +131,15 @@ private:
         }
         memo.instance = static_cast<int>(optixHitObjectGetInstanceId()) - 1; // instance 0 is the books' GAS
         memo.primitive = optixHitObjectGetPrimitiveIndex();
-        const float2 b = optixHitObjectGetTriangleBarycentrics();
-        memo.b1 = b.x;
-        memo.b2 = b.y;
+        // The barycentrics are a triangle hit's attributes 0 and 1 (optix_device.h, at optixGetTriangleBarycentrics),
+        // read as such rather than by optixHitObjectGetTriangleBarycentrics. OptiX 9.0's header writes that one as an
+        // `asm` without `volatile` and without operands, which tells nvcc it depends on nothing: nvcc hoisted it out of
+        // __raygen__render's loop, ahead of the first optixTraverse, so every triangle of a render got the
+        // barycentrics of a hit object that held no hit yet, and the paths left the triangles at points that weren't
+        // where the rays met them: cornell-triangles came out a fifth as bright as cornell, and a closed block leaked
+        // light. optixHitObjectGetAttribute_0/1 are `asm volatile`, as optixTraverse is, so they stay after it.
+        memo.b1 = __uint_as_float(optixHitObjectGetAttribute_0());
+        memo.b2 = __uint_as_float(optixHitObjectGetAttribute_1());
         return {.index = p.meshes.instances[memo.instance].first_id + static_cast<int>(memo.primitive),
                 .t = optixHitObjectGetRayTmax(),
                 .entering = false}; // a triangle's side is decided by surface_of, from its transformed normal

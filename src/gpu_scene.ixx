@@ -197,6 +197,9 @@ public:
         });
     }
 
+    // The scene's triangle meshes (gpu_scene_parts::meshes), after the world: see "Triangle meshes" below
+    std::expected<void, std::string> add_meshes(std::span<const mesh_ref> refs);
+
     // The tables. Every GGX side entry must have met its placeholder in the world: one that didn't would leave its
     // material rendered as the placeholder (a mirror, a matte surface), with no error, as two entries on one address
     // would above
@@ -220,11 +223,15 @@ private:
     // The GGX side entries by the address of the CPU material they complete; empty for the books' scenes
     std::unordered_map<const material*, gpu::microfacet_desc> microfacets_;
     std::size_t microfacets_used_ = 0; // how many of them a material of the world has taken
+    // The mesh materials (mesh_set::materials) that wear a scene material, by the scene material's index: one entry
+    // however many meshes wear it
+    std::unordered_map<int, std::uint32_t> mesh_material_slots_;
 
     std::expected<void, std::string> add_shape(const hittable& shape, const placement& where);
     std::expected<void, std::string> add_medium(const constant_medium& volume, const placement& where);
     std::expected<int, std::string> material_index(const material* mat);
     std::expected<int, std::string> texture_index(const texture& tex);
+    std::expected<std::uint32_t, std::string> mesh_material_slot(const material* mat);
 };
 
 std::expected<void, std::string> scene_translator::add_shape(const hittable& shape, const placement& where)
@@ -463,6 +470,78 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
     return index;
 }
 
+// --- Triangle meshes ---------------------------------------------------------------------------------------------
+//
+// The CPU builds no triangle: a scene's meshes ride beside its world as mesh_refs (gpu_scene_parts::meshes), which
+// become the renderer's mesh_set (renderer.h), each distinct source once (one acceleration structure for OptiX) and
+// every mesh_ref an instance of it. A mesh made in code is one source per function and material: its triangles wear
+// that material, translated as the world's are (material_index, which also brings its GGX side entry), so a mesh and
+// a quad of one material share it. Which materials a triangle may wear is the upload's to check (meshes.cu): lambertian
+// and metal, also completed by a side entry.
+
+// The mesh material (an index into mesh_set::materials) that wears the CPU material `mat`
+std::expected<std::uint32_t, std::string> scene_translator::mesh_material_slot(const material* mat)
+{
+    const auto index = material_index(mat);
+    if (!index)
+    {
+        return std::unexpected(index.error());
+    }
+    const auto [found, added] =
+        mesh_material_slots_.try_emplace(*index, static_cast<std::uint32_t>(desc_.meshes.materials.size()));
+    if (added)
+    {
+        desc_.meshes.materials.push_back({.scene_material = *index});
+    }
+    return found->second;
+}
+
+std::expected<void, std::string> scene_translator::add_meshes(std::span<const mesh_ref> refs)
+{
+    // The meshes made in code so far, by their function and material, and their index in mesh_set::meshes
+    struct generated_source
+    {
+        gpu::mesh_desc (*generate)();
+        const material* worn;
+        int mesh;
+    };
+    std::vector<generated_source> generated;
+    for (const mesh_ref& ref : refs)
+    {
+        if (!ref.generated)
+        {
+            return std::unexpected(ref.model.empty()
+                                       ? "a mesh of its list has neither a model nor a function that makes it"
+                                       : "glTF models in the scene list come in Step 93");
+        }
+        if (!ref.material)
+        {
+            return std::unexpected("a mesh it makes in code wears no material");
+        }
+        const auto same = [&ref](const generated_source& g) {
+            return g.generate == ref.generated && g.worn == ref.material.get();
+        };
+        auto source = std::ranges::find_if(generated, same);
+        if (source == generated.end())
+        {
+            const auto slot = mesh_material_slot(ref.material.get());
+            if (!slot)
+            {
+                return std::unexpected(slot.error());
+            }
+            // A generated mesh's triangles all wear material 0 of their own: here, the one slot of its material
+            gpu::mesh_desc made = ref.generated();
+            made.material_of.assign(made.indices.size() / 3, *slot);
+            const auto mesh = static_cast<int>(desc_.meshes.meshes.size());
+            desc_.meshes.meshes.push_back(std::make_shared<const gpu::mesh_desc>(std::move(made)));
+            generated.push_back({.generate = ref.generated, .worn = ref.material.get(), .mesh = mesh});
+            source = std::prev(generated.end());
+        }
+        desc_.meshes.instances.push_back({.mesh = source->mesh, .object_to_world = ref.placement});
+    }
+    return {};
+}
+
 // An object of the lights list and what it holds, with `weight`, the chance of aiming at it: hittable_list::random
 // picks each of a list's n objects with the chance 1/n, so a list inside the list shares its weight among its objects.
 // Instances are baked as in the world (see placement), which keeps every density: a rigid motion maps the solid angle
@@ -543,24 +622,31 @@ std::expected<std::vector<gpu::light_desc>, std::string> lights_to_gpu(const hit
 // The whole scene, or why the GPU can't render it. The GPU renders spheres, standing still or moving, and quads, also
 // in lists, BVHs, translate and rotate_y, with matte surfaces of solid, checker, image or marble textures, metal, glass
 // and lamps, and volumes of smoke or fog: every scene of the books. sampling is the strategy the CPU would render with
-// (effective_sampling). microfacets: the GGX side entries of its materials (gpu_scene_parts::microfacets).
+// (effective_sampling). microfacets: the GGX side entries of its materials (gpu_scene_parts::microfacets); meshes: its
+// triangle meshes (gpu_scene_parts::meshes), which only OptiX renders.
 std::expected<gpu::scene_desc, std::string> to_gpu(
     const scene& s, const camera_frame& frame, sampling_strategy sampling,
-    std::span<const std::pair<const material*, gpu::microfacet_desc>> microfacets)
+    std::span<const std::pair<const material*, gpu::microfacet_desc>> microfacets, std::span<const mesh_ref> meshes)
 {
     scene_translator translator(frame, sampling, microfacets);
     if (const auto added = translator.add_world(s.world); !added)
     {
         return std::unexpected(added.error());
     }
+    if (const auto added = translator.add_meshes(meshes); !added)
+    {
+        return std::unexpected(added.error());
+    }
     return std::move(translator).finish();
 }
 
-// A scene's parts as the renderer's tables, at their camera's own frame, without the programs' options, a lights list or
-// an environment: the translation of the world and of its GGX side entries alone, which GpuTests checks
+// A scene's parts as the renderer's tables, at their camera's own frame, without the programs' options, a lights list
+// or an environment: the translation of the world, of its GGX side entries and of its meshes alone, which
+// GpuTests checks
 export std::expected<gpu::scene_desc, std::string> translate_parts(const gpu_scene_parts& parts)
 {
-    return to_gpu(parts.cpu, camera(parts.cpu.camera).frame(), sampling_strategy::material, parts.microfacets);
+    return to_gpu(parts.cpu, camera(parts.cpu.camera).frame(), sampling_strategy::material, parts.microfacets,
+                  parts.meshes);
 }
 
 // --- The environment map ---------------------------------------------------------------------------------------
@@ -793,7 +879,7 @@ export std::expected<gpu_build, std::string> build_gpu_scene(std::string_view na
     // without lamps
     const sampling_strategy sampling = effective_sampling(s.camera.sampling, s.lights);
 
-    auto desc = to_gpu(s, frame, sampling, parts.microfacets);
+    auto desc = to_gpu(s, frame, sampling, parts.microfacets, parts.meshes);
     if (!desc)
     {
         return std::unexpected(std::format("the GPU can't render '{}': {}.", name, desc.error()));

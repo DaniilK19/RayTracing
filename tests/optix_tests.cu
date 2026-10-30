@@ -682,9 +682,8 @@ GPU_TEST(optix_tracer, planted_faults)
 
 // From Step 91: the check with the books' GAS under an identity instance (optix_upload_options::force_instance_root),
 // the root of every scene with meshes, on cornell, final and studio. The instance must change nothing, so the same
-// thresholds hold (and the intersection programs read the world ray under it: track B's P7). Until build_instances
-// arrives (track B, Step 91) the upload says that it comes then, and the test skips with its words; any other error
-// is the suite's.
+// thresholds hold (and the intersection programs read the world ray under it: P7, suite optix-triangles). An upload
+// that fails is the suite's failure: no skip.
 GPU_TEST(optix_tracer, instance_root)
 {
     const std::shared_ptr<gpu::optix_runtime> runtime = gpu_test::optix::runtime(ctx, "instance-root");
@@ -697,21 +696,8 @@ GPU_TEST(optix_tracer, instance_root)
     for (const std::string_view name : std::array<std::string_view, 3>{"cornell", "final", "studio"})
     {
         const gpu::scene_desc scene = geometry_scene(name, size);
-        std::unique_ptr<uploaded_scene> uploaded;
-        try
-        {
-            uploaded = std::make_unique<uploaded_scene>(*runtime, scene,
-                                                        gpu::optix_upload_options{.force_instance_root = true});
-        }
-        catch (const std::exception& error)
-        {
-            if (std::string_view(error.what()).find("comes in Step 91") == std::string_view::npos)
-            {
-                throw;
-            }
-            ctx.skip("instance-root", std::format("the books' GAS under an instance: {}", error.what()));
-            return;
-        }
+        const auto uploaded = std::make_unique<uploaded_scene>(*runtime, scene,
+                                                               gpu::optix_upload_options{.force_instance_root = true});
         const gpu::camera<float> cam = camera_of(scene.camera);
         report_check(ctx, std::format("instance-root.{}", name),
                      run_check(*uploaded, cam, size.samples, 0, instance_seed), cam, size.samples, !ctx.quick());

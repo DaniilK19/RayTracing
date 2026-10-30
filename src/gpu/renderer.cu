@@ -1452,9 +1452,25 @@ public:
 
     // --- The pick_distance region (track B, Step 91): one thread of __raygen__pick in an OptiX session of a scene with
     // meshes (optix_scene::pick) --------------------------------------------------------------------------------------
-    double pick_distance(const std::array<double, 3>& /*origin*/, const std::array<double, 3>& /*direction*/) override
+    // The window's double-click focuses with it where the CPU's world doesn't hold the triangles: one thread of the
+    // image's own tracer, synchronous. A CUDA session has no OptiX scene to ask (its window picks on the CPU's world).
+    double pick_distance(const std::array<double, 3>& origin, const std::array<double, 3>& direction) override
     {
-        throw std::logic_error("session::pick_distance comes in Step 91");
+        const double length_squared =
+            direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2];
+        if (!std::isfinite(origin[0] + origin[1] + origin[2]) ||
+            !(length_squared > 0 && length_squared < std::numeric_limits<double>::infinity()))
+        {
+            throw std::invalid_argument("a pick needs a finite origin and a direction that isn't zero");
+        }
+        if constexpr (std::same_as<Real, float>)
+        {
+            if (optix_scene_)
+            {
+                return optix_scene_->pick(origin, direction);
+            }
+        }
+        throw std::logic_error("session::pick_distance needs a session that traces with OptiX (optix_tracer)");
     }
     // --- end of the pick_distance region ---------------------------------------------------------------------------
 

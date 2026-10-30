@@ -55,6 +55,74 @@ extern "C" __global__ void __raygen__probe_energy()
     }
 }
 
+// The meshes' probe (suites optix-triangles and optix-pbr, tests/mesh_gpu_tests.cu): optix_tracer on samples the test
+// gives, one per launch index k = y·width + x of a launch of n = width·height. In: 20 words at params.test.values[20k]
+// (floats, an int as its float's bits): the ray (origin 0-2, direction 3-5, time 6), its spawn (from 7, inward 8: 0 or
+// 1), memo.facing 9-11, and a mode (12): 0 traces the ray with closest() (generator sample_generator(test.seed, k, 0));
+// 1 traces nothing and asks surface_of() for the triangle hit of instance 13, primitive 14, b1 15, b2 16 and memo.lobe
+// 17, in scratch slot scratch_base + k. Out: 40 words at values[20n + 40k]: the hit (index 0, t 1, entering 2), the
+// side record (instance 3, primitive 4, b1 5, b2 6, lobe 7) and in mode 1 the surface (rec.p 8-10, rec.normal 11-13,
+// front_face 14, outward 15-17, texture_point 18-20, u 21, v 22, material 23, texture_index 24, from 25, memo.facing
+// 26-28, 1 at 29), then what the integrator reads at s.material: the material (kind 30, albedo 31-33, fuzz 34,
+// refraction index 35) and its side entry (kind 36, -1 without side entries; alpha 37, roughness 38).
+extern "C" __global__ void __raygen__probe_mesh()
+{
+    const uint3 index = optixGetLaunchIndex();
+    const uint3 size = optixGetLaunchDimensions();
+    const std::uint64_t n = static_cast<std::uint64_t>(size.x) * size.y;
+    const std::uint64_t k = static_cast<std::uint64_t>(index.y) * size.x + index.x;
+    const float* const in = params.test.values + 20 * k;
+    float* const out = params.test.values + 20 * n + 40 * k;
+    gpu::triangle_memo memo;
+    memo.facing = {in[9], in[10], in[11]};
+    const gpu::optix_tracer tracer{params, memo, params.meshes.scratch_base + static_cast<int>(k)};
+    const gpu::ray<float> r{.origin = {in[0], in[1], in[2]}, .direction = {in[3], in[4], in[5]}, .time = in[6]};
+    gpu::bvh_hit<float> hit{.index = -1, .t = 0.0f, .entering = false};
+    if (__float_as_int(in[12]) == 0)
+    {
+        gpu::pcg32 rng = gpu::sample_generator(params.test.seed, k, 0);
+        hit = tracer.closest(r, {.from = __float_as_int(in[7]), .inward = in[8] != 0.0f}, rng);
+    }
+    else
+    {
+        memo.instance = __float_as_int(in[13]);
+        memo.primitive = __float_as_uint(in[14]);
+        memo.b1 = in[15];
+        memo.b2 = in[16];
+        memo.lobe = in[17];
+        hit = {.index = params.meshes.instances[memo.instance].first_id + static_cast<int>(memo.primitive),
+               .t = 1.0f,
+               .entering = false};
+        const gpu::surface<float> s = tracer.surface_of(r, hit);
+        const gpu::material<float> m = params.view.base.materials[s.material];
+        const float surface[31] = {s.rec.p.x, s.rec.p.y, s.rec.p.z, s.rec.normal.x, s.rec.normal.y, s.rec.normal.z,
+                                   __int_as_float(s.rec.front_face ? 1 : 0), s.outward.x, s.outward.y, s.outward.z,
+                                   s.texture_point.x, s.texture_point.y, s.texture_point.z, s.u, s.v,
+                                   __int_as_float(s.material), __int_as_float(s.texture_index), __int_as_float(s.from),
+                                   memo.facing.x, memo.facing.y, memo.facing.z, __int_as_float(1),
+                                   __int_as_float(static_cast<int>(m.kind)), m.albedo.x, m.albedo.y, m.albedo.z,
+                                   m.fuzz, m.refraction_index, __int_as_float(-1), 0.0f, 0.0f};
+        for (int i = 0; i < 31; ++i)
+        {
+            out[8 + i] = surface[i];
+        }
+        if (params.view.microfacets != nullptr)
+        {
+            const gpu::microfacet f = params.view.microfacets[s.material];
+            out[36] = __int_as_float(static_cast<int>(f.kind));
+            out[37] = f.alpha;
+            out[38] = f.roughness;
+        }
+    }
+    const float record[8] = {__int_as_float(hit.index), hit.t, __int_as_float(hit.entering ? 1 : 0),
+                             __int_as_float(memo.instance), __uint_as_float(memo.primitive), memo.b1, memo.b2,
+                             memo.lobe};
+    for (int i = 0; i < 8; ++i)
+    {
+        out[i] = record[i];
+    }
+}
+
 // --- The tracer check (track A, Step 88): optix_tracer's closest and visibility against the BVH's, ray by ray -------
 // The quality kernel's two tracers, compiled by one compiler into this one module, so that only the traversal and the
 // intersection programs differ: bvh_tracer walks the renderer's own BVH (tests/test_scene.h's upload),
@@ -313,9 +381,46 @@ extern "C" __global__ void __raygen__check_ray()
 
 // --- The probe intersection program (track B, Step 91: P7) -----------------------------------------------------------
 // The world ray an intersection program reads under an identity instance, against the floats traced; launch_test's
-// pipelines point every custom kind's SBT record at it under optix_upload_options::probe_intersections. An empty entry
-// until then: it reports nothing.
+// pipelines point every custom kind's SBT record at it under optix_upload_options::probe_intersections. It reports
+// nothing, so a ray goes on through every box it meets, and for the ray of launch index k = y·width + x it keeps 16
+// words of params.test.counts at 16k (tests/mesh_gpu_tests.cu, world-ray): the world ray's origin and direction as
+// optixGetWorldRayOrigin/Direction give them (0-5, each float's bits), the object ray's (6-11: OptiX's transform of it,
+// which an identity matrix computes as 1·x + 0·y + 0·z + 0, where a -0 may come out +0), how many times the program ran
+// for the ray (12) and in how many of those runs the world ray differed from the first run's (13). The runs of one
+// ray's intersection programs are its own thread's, one after another: no atomics.
 extern "C" __global__ void __intersection__probe()
 {
+    unsigned long long* const words = params.test.counts;
+    if (words == nullptr)
+    {
+        return;
+    }
+    const uint3 index = optixGetLaunchIndex();
+    const uint3 size = optixGetLaunchDimensions();
+    unsigned long long* const w = words + 16 * (static_cast<std::uint64_t>(index.y) * size.x + index.x);
+    const float3 origin = optixGetWorldRayOrigin();
+    const float3 direction = optixGetWorldRayDirection();
+    const float3 object_origin = optixGetObjectRayOrigin();
+    const float3 object_direction = optixGetObjectRayDirection();
+    const float read[12] = {origin.x,           origin.y,           origin.z,          direction.x,
+                            direction.y,        direction.z,        object_origin.x,   object_origin.y,
+                            object_origin.z,    object_direction.x, object_direction.y, object_direction.z};
+    if (w[12] == 0)
+    {
+        for (int i = 0; i < 12; ++i)
+        {
+            w[i] = __float_as_uint(read[i]);
+        }
+    }
+    else
+    {
+        bool same = true;
+        for (int i = 0; i < 6; ++i)
+        {
+            same = same && w[i] == __float_as_uint(read[i]);
+        }
+        w[13] += same ? 0u : 1u;
+    }
+    w[12] += 1;
 }
 // --- end of the probe intersection program ---------------------------------------------------------------------------

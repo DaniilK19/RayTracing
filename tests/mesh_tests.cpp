@@ -2634,8 +2634,9 @@ void placement_checks(report& r)
     r.exact("placement.unit-centre-z", middle[2], 0, 1e-12);
 }
 
-// bake: world vertices M·p, normals unit(M⁻ᵀ·n); under a rotation the index order unchanged; under a mirror (det M < 0)
-// indices 1 and 2 of every triangle swapped, so each face's a × b points outward and agrees with its vertex normals
+// bake: world vertices M·p, normals M⁻ᵀ·n (not made unit: the renderer interpolates, then normalizes, as it does for an
+// instanced copy); under a rotation the index order unchanged; under a mirror (det M < 0) indices 1 and 2 of every
+// triangle swapped, so each face's a × b points outward and agrees with its vertex normals
 void bake_checks(report& r)
 {
     // The input: a smooth icosphere given texture coordinates (u = x, v = y of each vertex) and materials 0 to 4 in
@@ -2656,7 +2657,7 @@ void bake_checks(report& r)
         return;
     }
     const std::size_t vertices = sphere.positions.size() / 3;
-    // The world mesh's positions and normals against M·p and unit(M⁻ᵀ·n), vertex for vertex (bake keeps their order)
+    // The world mesh's positions and normals against M·p and M⁻ᵀ·n, vertex for vertex (bake keeps their order)
     const auto vertex_errors = [&sphere, vertices](const meshes::mesh& baked, const matrix& m) {
         if (baked.positions.size() != sphere.positions.size() || baked.normals.size() != sphere.normals.size())
         {
@@ -2667,7 +2668,7 @@ void bake_checks(report& r)
         {
             p_error = worse(p_error, gap(vertex(baked.positions, i), point(m, vertex(sphere.positions, i))));
             n_error =
-                worse(n_error, gap(vertex(baked.normals, i), unit(normal_to_world(m, vertex(sphere.normals, i)))));
+                worse(n_error, gap(vertex(baked.normals, i), normal_to_world(m, vertex(sphere.normals, i))));
         }
         return std::pair{p_error, n_error};
     };
