@@ -5,14 +5,19 @@
 # tracer check), each with the .sha256 beside it that cmake\embed.cmake writes, and the folder of OptiX's headers the
 # build used (RAYTRACING_OPTIX_INCLUDE_DIR in Build\CMakeCache.txt). It checks:
 #   1. each .sha256 is its PTX's SHA-256, and the same 64 hex digits are in every exe that embeds it: optix_programs in
-#      RayTracingGPU.exe, RayTracingViewer.exe and GpuTests.exe (all three link the render module), optix_check_ptx in
-#      GpuTests.exe. So the PTX checked here is the one every program carries, also after a build of one target only
-#      (a viewer left with older PTX fails). A build without RayTracingViewer.exe (no SDL3) is a note; a missing
-#      RayTracingGPU.exe or GpuTests.exe is an error;
+#      GpuTests.exe from Step 87, RayTracingGPU.exe from Step 89 (--optix) and RayTracingViewer.exe from Step 95 (the
+#      window's OptiX), optix_check_ptx in GpuTests.exe from Step 87. So the PTX checked here is the one every program
+#      carries, also after a build of one target only: a viewer left with older PTX fails, and so does an exe left from
+#      before it linked the module (no module's hash at all, from its step on). Before that step an exe that holds no
+#      module's hash is a note: a static library's object is linked into an exe only when the exe calls it. A build
+#      without RayTracingViewer.exe (no SDL3) is a note; a missing RayTracingGPU.exe or GpuTests.exe is an error;
 #   2. against the newest earlier record, State\ir\stepK.txt (K < NN): -Expect same fails on any change; -Expect
 #      changed writes the cleaned diff of what changed to State\ir\stepNN.diff for review (comment lines dropped: nvcc
 #      writes its version there; the two hashes of the source file's path in an unnamed namespace's mangled name,
-#      _GLOBAL__N__<8 hex>_..._cu_<8 hex>, replaced by x's as sassgate.sh does, since a worktree's path differs) and
+#      _GLOBAL__N__<8 hex>_..._cu_<8 hex>, replaced by x's as sassgate.sh does, since a worktree's path differs; so is
+#      the one hash of an internal-linkage variable's name, _INTERNAL_<8 hex>_..._cu_, which names the same path:
+#      programs.cu's copy of ggx_energy_table is _INTERNAL_c8a20deb_11_programs_cu_ here and _INTERNAL_48507533_... in
+#      a worktree, so the PTX's own SHA-256 differs from checkout to checkout while its cleaned text doesn't) and
 #      saves both PTX files in State\ir\stepNN\, which the next diff starts from. Either way State\ir\stepNN.txt then
 #      records the two hashes (a failing run records nothing; -Expect same that fails still writes the diff);
 #   3. no file under src\ or tests\ has the name of a file in OptiX's include folder (without case, as Windows opens
@@ -53,9 +58,14 @@ $modules = @(
     @{ name = "optix_check_ptx"; exes = @("GpuTests.exe"); what = "check module" })
 # The exe a build may lack: the viewer is built only with SDL3
 $optionalExes = @("RayTracingViewer.exe")
+# The step from which each exe must embed its modules: GpuTests calls OptiX from Step 87 (the probes), RayTracingGPU
+# from Step 89 (--optix), the viewer from Step 95 (OptiX in the window)
+$embedsFrom = @{ "GpuTests.exe" = 87; "RayTracingGPU.exe" = 89; "RayTracingViewer.exe" = 95 }
 # sassgate.sh's normalization of an unnamed namespace: eight x's for eight hex digits
 $globalN = '_GLOBAL__N__[0-9a-f]{8}_([0-9]+_[A-Za-z0-9_]+_cu_)[0-9a-f]{8}'
 $globalX = '_GLOBAL__N__xxxxxxxx_${1}xxxxxxxx'
+$internalN = '_INTERNAL_[0-9a-f]{8}_([0-9]+_[A-Za-z0-9_]+_cu_)'
+$internalX = '_INTERNAL_xxxxxxxx_${1}'
 $failures = 0
 $temp = $null
 
@@ -105,7 +115,7 @@ function Write-CleanPtx([string]$source, [string]$target) {
     if ($source) {
         foreach ($line in [IO.File]::ReadAllLines($source)) {
             if ($line -match '^\s*//') { continue }
-            $kept.Add(($line -creplace $globalN, $globalX))
+            $kept.Add(($line -creplace $globalN, $globalX -creplace $internalN, $internalX))
         }
     }
     New-Item -ItemType Directory -Force (Split-Path -Parent $target) | Out-Null
@@ -183,12 +193,31 @@ try {
         }
         # The exe's bytes as Latin-1 text, one character per byte: the string is ASCII wherever the linker put it
         $bytes = [Text.Encoding]::GetEncoding(28591).GetString([IO.File]::ReadAllBytes($exe))
+        # Every embedded module's hash is a 64-hex string ending in a NUL (embed.cmake's NAME_sha256[]). A static
+        # library's object is linked into an exe only when the exe uses it, so an exe that calls no OptiX yet (before
+        # its step in $embedsFrom) holds none: a note. From its step on, an exe that holds none is one left from an
+        # earlier step, and another module's hash where this one's should be is a stale exe: both are failures (a
+        # partial build).
+        $held = @([regex]::Matches($bytes, '[0-9a-f]{64}\x00') | ForEach-Object { $_.Value.Substring(0, 64) } |
+            Select-Object -Unique)
+        $from = $embedsFrom[$exeName]
         foreach ($m in @($modules | Where-Object { $_.exes -contains $exeName })) {
             $hash = $written[$m.name]
             if ($bytes.IndexOf($hash, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
                 Write-Output "$($m.name): its SHA-256 in $exeName"
             }
-            else { Fail "$exeName doesn't hold $($m.name)'s SHA-256 ${hash}: it embeds other PTX (a partial build?)" }
+            elseif ($held.Count -eq 0 -and $Step -lt $from) {
+                Write-Output ("note: $exeName embeds no OptiX module (it calls none before Step ${from}): " +
+                    "$($m.name) not linked in")
+            }
+            elseif ($held.Count -eq 0) {
+                Fail ("$exeName holds no OptiX module, though it embeds $($m.name) from Step $from on: an exe left " +
+                    "from an earlier step (a partial build?)")
+            }
+            else {
+                Fail ("$exeName doesn't hold $($m.name)'s SHA-256 ${hash}, but {0}: it embeds other PTX (a partial " +
+                    "build?)" -f ($held -join ", "))
+            }
         }
         $bytes = $null
     }

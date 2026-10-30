@@ -4,7 +4,7 @@
 #     working tree against the base; an untracked file under a frozen path fails too):
 #       5c2d048 (Step 70): the CPU modules and programs, the books' device headers, display.cu, stb (external/stb), the
 #         SDL3 module (cmake/sdl3.cmake), the CMake presets, the manifest, the README's GIF, its script and its tour;
-#       65f297b (Step 85): quality.cu (until Step 87 pins it) and every header beyond the books' that the quality and
+#       65f297b (Step 85): every header beyond the books' that the quality and
 #         tone-map kernels compile, the tone maps, the lamp and environment tables, the nine test suites of milestone 4
 #         and the headers and regression lists they share, the HDR environment maps;
 #   - the blob pins below: a file frozen by the step that wrote it (a commit can't name its own hash) is still that
@@ -60,7 +60,7 @@
 # processes build), it plants each case of the self-test table below alone, runs the checks on it as -Root would, and
 # puts the worktree back. Every fault must fail; the worktree as checked out, a file beside a frozen folder and the
 # CMake lines later steps write (a library linked into gpu_scene, a source added to GpuTests, a read of a CMAKE_CUDA_*
-# variable, the plan's OptiX lines) must pass. It prints expected and got per case and exits 0 only when every case
+# variable, OptiX's lines) must pass. It prints expected and got per case and exits 0 only when every case
 # behaved; the worktree is removed at the end, after an error too.
 param(
     [string]$Root = "",
@@ -92,8 +92,6 @@ $frozenSets = @(
     @{
         base = "65f297b"; name = "Step 85"
         paths = @(
-            # Until Step 87, which adds the OptiX path's accessor to it and pins the result
-            "src/gpu/quality.cu",
             "src/gpu/quality.cuh", "src/gpu/quality_view.cuh", "src/gpu/quality_path.cuh", "src/gpu/tracer.cuh",
             "src/gpu/shadow.cuh", "src/gpu/bsdf.cuh", "src/gpu/ggx.cuh", "src/gpu/ggx_energy.cuh", "src/gpu/mis.cuh",
             "src/gpu/light_sampler.cuh", "src/gpu/lamps.cuh", "src/gpu/background.cuh", "src/gpu/environment.cuh",
@@ -108,11 +106,13 @@ $frozenSets = @(
 
 # ---- BLOB PINS: (path, git blob SHA-1 of the file as committed) ------------------------------------------------------
 # A step that freezes its own output pins it in its own commit (`git hash-object PATH` after its last edit); this
-# script is pinned nowhere, so writing the ids changes no pinned file. Step 87 adds src/gpu/quality.cu (with its
-# accessor) and src/gpu/quality_access.cuh; Step 97 docs/viewer.gif, docs/viewer-tour.txt and scripts/make-gif.ps1
-# (taking them out of the Step 70 list above).
+# script is pinned nowhere, so writing the ids changes no pinned file. Step 97 adds docs/viewer.gif,
+# docs/viewer-tour.txt and scripts/make-gif.ps1 (taking them out of the Step 70 list above).
 $blobPins = @(
-    # @{ path = "src/gpu/quality.cu"; blob = "<40 hex digits>" }
+    # Step 87: quality.cu with the one accessor OptiX's programs and the denoiser's guides read the quality kernel's view
+    # through (host code: the SASS gate shows quality_kernel unchanged), and that accessor's header
+    @{ path = "src/gpu/quality.cu"; blob = "f759c49a631608a432d03d779459a1f699087b31" },
+    @{ path = "src/gpu/quality_access.cuh"; blob = "8b6ac3b37ca7e4d2cfa5dbd2d576e683e5713ff3" }
 )
 # ---- end of BLOB PINS ------------------------------------------------------------------------------------------------
 
@@ -142,15 +142,16 @@ $gpuTarget = "gpu_renderer"
 $cudaVariables = '^(CACHE\{)?CMAKE_CUDA(?![A-Za-z0-9])'
 
 # ---- SELF-TEST CASES: each planted alone in the worktree W, which is put back to HEAD after each ---------------------
-# A later step adds its own cases here: Step 87 "quality.cu with one more line after the accessor" and "a byte of
-# quality_access.cuh changed" (both FAIL, through its pins); Step 97 "a byte of viewer.gif changed" (FAIL).
+# A later step adds its own cases here: Step 97 "a byte of viewer.gif changed" (FAIL).
 # $selfTestPin is pinned at its HEAD blob for the self-test only, to show the pins' mechanism on a file no other rule
 # covers.
 $selfTestPin = "README.md"
 $selfTestCases = @(
     @{ name = "the worktree as checked out"; expect = "PASS"; plant = { param($w) } },
-    @{ name = "a line appended to src/gpu/quality.cu"; expect = "FAIL"
+    @{ name = "a line appended to src/gpu/quality.cu, after the accessor (its blob pin)"; expect = "FAIL"
        plant = { param($w) Add-LineTo $w "src/gpu/quality.cu" "// planted by frozen.ps1 -SelfTest" } },
+    @{ name = "one byte of src/gpu/quality_access.cuh changed (its blob pin)"; expect = "FAIL"
+       plant = { param($w) Edit-OneByte $w "src/gpu/quality_access.cuh" } },
     @{ name = "one byte of $selfTestPin changed (blob-pinned for the self-test)"; expect = "FAIL"
        plant = { param($w) Edit-OneByte $w $selfTestPin } },
     @{ name = "an untracked external/stb/x.h"; expect = "FAIL"
@@ -196,7 +197,7 @@ $cmakeCases = @(
     @{ expect = "PASS"; file = "CMakeLists.txt"
        text = 'target_include_directories(GpuTests PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})' },
     @{ expect = "PASS"; file = "cmake/x.cmake"
-       name = "cmake/x.cmake: the plan's OptiX lines (final.md A1), and nvcc's folder read from CMAKE_CUDA_COMPILER"
+       name = "cmake/x.cmake: OptiX's lines (cmake/optix.cmake's kind), and nvcc's folder read from CMAKE_CUDA_COMPILER"
        text = (@(
            'if(CMAKE_CUDA_COMPILER AND optix_include)',
            '    cmake_path(GET CMAKE_CUDA_COMPILER PARENT_PATH nvcc_folder)',

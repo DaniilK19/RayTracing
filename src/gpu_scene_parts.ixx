@@ -9,6 +9,7 @@ module;
 export module gpu_scenes:parts;
 
 import std;
+import hittable; // class material, which a mesh_ref names
 import material;
 import scenes;
 import strategy_options;
@@ -37,6 +38,20 @@ export struct environment_choice
     double scale = 1;       // multiplies its radiance
 };
 
+// A mesh in a scene of the list: the CPU builds no triangle, so a scene's meshes ride beside its CPU objects (the
+// ground, the Cornell box's walls and lamp stay the books' shapes)
+export struct mesh_ref
+{
+    std::string_view model;                    // a file under assets/models (a glTF model), or empty
+    gpu::mesh_desc (*generated)() = nullptr;   // or a mesh made in code (material_of all 0), wearing `material`;
+                                               // gpu_scenes_meshes.ixx passes captureless lambdas over meshes::
+    std::shared_ptr<::material> material;   // the CPU material a generated mesh wears (its GGX side entry, if any,
+                                            // in microfacets, keyed by this address as today); ::material: the
+                                            // member's own name hides the class inside mesh_ref
+    std::array<double, 12> placement{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0}; // after the model's own transforms
+};
+// Each distinct source is uploaded once (one GAS); every mesh_ref is an instance of it.
+
 // A scene as the GPU programs build it: the CPU's objects and camera, from which gpu_scene.ixx translates the
 // renderer's tables, and what the CPU's classes can't describe
 export struct gpu_scene_parts
@@ -46,6 +61,7 @@ export struct gpu_scene_parts
     // placeholder that carries the color (a metal's albedo is F0, a matte one's texture the coat's base)
     std::vector<std::pair<const material*, gpu::microfacet_desc>> microfacets;
     environment_choice environment;
+    std::vector<mesh_ref> meshes; // triangle meshes, which only OptiX renders; empty in the scenes without them
 };
 
 // A scene in the list: its name on the command line, a description for the help, its group and the function that

@@ -202,4 +202,7 @@ int quality_resident_blocks()
           "reading the CUDA device's properties");
     return multiprocessors * quality_blocks_per_multiprocessor();
 }
+
+// quality_access.cuh: the view quality_kernel takes, for OptiX's programs and the denoiser's guides (host code only)
+quality_view quality_view_of(const quality_scene& q, const scene_view<float>& base) { return q.view(base); }
 }

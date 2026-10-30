@@ -1605,13 +1605,13 @@ SDL_AppResult viewer::init()
         return fail(checked.error());
     }
     // The display, refused as RayTracingGPU refuses it: an exposure for the books' bytes, a tone map in float64
-    if (const auto checked = check_display(opts_.display, find_gpu_scene(settings.scene)->display, settings.fp64);
+    if (const auto checked = check_display(opts_.display, scene_entry(settings.scene)->display, settings.fp64);
         !checked)
     {
         return fail(checked.error());
     }
     // and a script's display before its first frame, in float64 (later ones: use_settings, at their frame's line)
-    if (const gpu::display_options shown = effective_display(display_, find_gpu_scene(settings.scene)->display);
+    if (const gpu::display_options shown = effective_display(display_, scene_entry(settings.scene)->display);
         opts_.script && settings.fp64 && shown.op != gpu::tone_map::books)
     {
         return fail(std::format("{}: {} works in float32 only", to_utf8(*opts_.script), tone_map_name(shown.op)));

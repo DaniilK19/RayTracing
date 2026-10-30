@@ -210,3 +210,6 @@ if(TARGET GpuTests)
     add_test(NAME gpu_tests_quick COMMAND GpuTests all --quick)
     set_tests_properties(gpu_tests_quick PROPERTIES SKIP_RETURN_CODE 77)
 endif()
+
+# NVIDIA's OptiX for --optix, triangle meshes and the denoiser: a file of its own, after the lines above, which stay
+include(cmake/optix.cmake)

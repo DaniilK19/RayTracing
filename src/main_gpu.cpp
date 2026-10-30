@@ -312,7 +312,7 @@ int main(int argc, char* argv[])
         return 1;
     }
     // The display: the options', else the scene's own (books for the books' scenes), and what it can't be
-    const gpu::display_options scene_display = find_gpu_scene(opts->scene)->display;
+    const gpu::display_options scene_display = scene_entry(opts->scene)->display;
     if (const auto checked = check_display(opts->display, scene_display, opts->fp64); !checked)
     {
         std::println("Error: {}", checked.error());

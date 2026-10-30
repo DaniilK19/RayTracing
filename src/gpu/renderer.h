@@ -17,6 +17,7 @@
 
 #include <array>
 #include <compare>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -301,6 +302,80 @@ struct display_options
 // stays a normal float with all of its precision
 inline constexpr double max_exposure = 24;
 
+// --- OptiX (optional) and triangle meshes: host types, no OptiX or CUDA type ---------------------------------------
+
+class optix_runtime; // OptiX for the whole program (optix_runtime.cuh), started by start_optix() (start_optix.h)
+
+// What OptiX's AI denoiser computed and holds after its last call (optix_runtime::last_denoise), for the programs' and
+// the tests' reports: the exposure it was given, computed over the whole image before the invoke, and its memory
+struct denoise_report
+{
+    float intensity = 0;                // hdrIntensity (optixDenoiserComputeIntensity)
+    float average_color[3] = {0, 0, 0}; // hdrAverageColor, the AOV model's (optixDenoiserComputeAverageColor)
+    std::size_t state_bytes = 0;        // the denoiser's state, set up for the largest image or tile so far
+    std::size_t scratch_bytes = 0;      // its scratch, shared by the setup, the invoke and the two computations above
+    int tile = 0;                       // the side of the tiles the image was denoised in; 0: one invoke for all of it
+    bool valid = false;                 // false until a denoise has completed
+};
+
+// How a glTF texture repeats outside [0, 1]
+enum class texture_wrap
+{
+    repeat,
+    mirrored_repeat,
+    clamp,
+};
+
+// A glTF image as the texture hardware reads it: 8-bit RGBA, rows from the top (glTF's (0, 0) is the top-left texel)
+struct mesh_texture_desc
+{
+    int width = 0;
+    int height = 0;
+    std::vector<std::uint8_t> rgba; // width × height × 4
+    bool srgb = true;               // base color: decoded from sRGB by the hardware; metallic-roughness: linear
+    texture_wrap wrap_s = texture_wrap::repeat;
+    texture_wrap wrap_t = texture_wrap::repeat;
+    bool nearest = false;           // glTF's magFilter NEAREST; otherwise bilinear
+};
+
+// What a triangle wears: one of the scene's materials, or glTF's metallic-roughness model (see docs/optix.md)
+struct mesh_material_desc
+{
+    int scene_material = -1;                   // >= 0: scene_desc::materials[i] (lambertian, metal, or one a GGX side
+                                               // entry completes); -1: the glTF fields below
+    std::array<double, 3> base_color{1, 1, 1}; // linear, times the texture's decoded color
+    double metallic = 1;                       // glTF's defaults: a rough white metal
+    double roughness = 1;
+    int base_color_texture = -1;               // indices into mesh_set::textures; -1: none
+    int metal_rough_texture = -1;              // G roughness, B metallic (glTF's channels)
+};
+
+// One mesh in its own coordinates; its triangles share these vertices
+struct mesh_desc
+{
+    std::vector<float> positions;           // 3 per vertex
+    std::vector<float> normals;             // 3 per vertex, or empty: flat shading
+    std::vector<float> uvs;                 // 2 per vertex (glTF's convention), or empty
+    std::vector<std::uint32_t> indices;     // 3 per triangle, counter-clockwise seen from the front
+    std::vector<std::uint32_t> material_of; // per triangle: an index into mesh_set::materials
+};
+
+// A placement of a mesh: object to world, row-major 3×4 (OptixInstance::transform's layout)
+struct mesh_instance_desc
+{
+    int mesh = 0;
+    std::array<double, 12> object_to_world{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0};
+};
+
+// The scene's triangles: only OptiX renders them (a session without optix_tracer refuses a scene with instances)
+struct mesh_set
+{
+    std::vector<std::shared_ptr<const mesh_desc>> meshes; // shared with gpu_scene's model cache, never copied per build
+    std::vector<mesh_instance_desc> instances;
+    std::vector<mesh_material_desc> materials;
+    std::vector<std::shared_ptr<const mesh_texture_desc>> textures;
+};
+
 // --- The scene, and how to render it --------------------------------------------------------------------------------
 
 struct scene_desc
@@ -315,6 +390,8 @@ struct scene_desc
     std::vector<medium_desc> media;
     std::vector<light_desc> lights; // the lights list's shapes: empty unless camera.sampling is lights or mixture
     quality_desc quality;           // empty for the books' scenes; a scene that needs it renders with the quality kernel
+    mesh_set meshes;                // triangle meshes, which only OptiX renders (render_options::optix_tracer); empty
+                                    // for every scene of the books and of the quality kernel
 };
 
 // How many lamps the quality kernel's light set holds in the scene (lamp_table.cu): its quads and its spheres that
@@ -368,21 +445,31 @@ struct render_options
     // session::display), the bytes RayTracingGPU saves as its PNG; books leaves it empty. The render doesn't depend on
     // it: the pixels and the rays are the same with any display.
     display_options display;
+    bool optix_tracer = false;            // trace with OptiX (needs `optix`): float, -p material, nee or mis
+    std::shared_ptr<optix_runtime> optix; // started by the program (start_optix); every session keeps it alive
+    // Also the image denoised by OptiX's AI denoiser, after the last pass, into render_result::denoised and
+    // denoised_rgba (needs `optix`; float only): biased, for the eye, while `pixels` stays the image as rendered
+    bool denoise = false;
 };
 
 // The kernel that rendered, as the CUDA runtime describes it: the numbers that decide how many of its threads a
 // multiprocessor keeps in flight (its occupancy, see blocks_per_multiprocessor in renderer.cu)
 struct kernel_info
 {
-    std::string name;                       // "first book", "all books" or "quality"
+    std::string name;                       // "first book", "all books", "quality" or "optix"
     int registers = 0;                      // per thread
     // per thread: the BVH stack, the scratch arrays of CUDA's math functions (sin's reduction of huge arguments takes
-    // 48 bytes in double), and registers spilled to memory, if any
+    // 48 bytes in double), and registers spilled to memory, if any. OptiX: its continuation stack, once the programs
+    // are compiled (what replaced the BVH's stack)
     int local_bytes = 0;
     int blocks_per_multiprocessor = 0;      // as many as fit at once
     int threads_per_block = 0;              // 128
     int max_threads_per_multiprocessor = 0; // 1536 on the test GPU
+    std::string programs;                   // OptiX: the embedded PTX's SHA-256, 8 hex digits; empty for CUDA kernels
 };
+
+// The kernels that run the quality kernel's integrator ("quality", "optix"): light strategies, float only
+bool uses_quality_integrator(const kernel_info& kernel);
 
 struct render_result
 {
@@ -394,6 +481,8 @@ struct render_result
     kernel_info kernel;
     std::uint64_t shadow_rays = 0; // the quality kernel's rays toward a light, apart from `rays` (0 in the others)
     std::vector<std::uint8_t> rgba; // the display's bytes after a tone map other than the books' (empty otherwise)
+    std::vector<std::uint8_t> denoised_rgba; // with denoise: the display's bytes of the denoised image
+    std::vector<float> denoised;             // with denoise: the denoised linear image, 3 floats per pixel
 };
 
 struct device_info
@@ -423,6 +512,8 @@ device_info query_device(wait_mode wait = wait_mode::spin);
 // Renders the scene on the first CUDA device. Throws std::runtime_error with CUDA's message if something fails, or if
 // the scene is inconsistent (an index out of range, a checker before its textures...), and std::invalid_argument for
 // options out of range (launch_seconds, passes, a display session::display refuses), before rendering anything.
+// denoise is refused before anything is rendered too: std::logic_error without `optix`, std::invalid_argument in
+// float64.
 render_result render(const scene_desc& scene, const render_options& options);
 
 // --- A render that goes on: the window's -------------------------------------------------------------------------
@@ -438,6 +529,8 @@ struct session_options
     // whatever the device's flag (see query_device), so a sleeping session needs both: without the device's, its
     // copies would still spin. The session throws std::logic_error if query_device(wait_mode::sleep) hasn't set it.
     wait_mode wait = wait_mode::spin;
+    bool optix_tracer = false;            // trace with OptiX (needs `optix`): float, -p material, nee or mis
+    std::shared_ptr<optix_runtime> optix; // started by the program (start_optix); every session keeps it alive
 };
 
 // How far a view's image has come: `passes` complete passes, and rows [0, rows) of the next one (a pass that takes
@@ -484,7 +577,9 @@ class session
 {
 public:
     // Checks the scene, builds its BVH, copies it into the GPU's memory and picks the kernel (see the kernels in
-    // renderer.cu). The view is scene.camera. Throws as render() does.
+    // renderer.cu), or with optix_tracer has OptiX build its acceleration structures. The view is scene.camera. Throws
+    // as render() does; std::logic_error for optix_tracer without a runtime, std::invalid_argument for what OptiX's
+    // tracer can't render and for triangle meshes without it.
     session(const scene_desc& scene, const session_options& options);
     ~session();
     session(session&&) noexcept;
@@ -529,6 +624,16 @@ public:
     // exposure other than 0, and for another tone map in a float64 session (what is new computes in float only);
     // std::logic_error as display() does.
     std::span<const std::uint8_t> display(const display_options& options);
+
+    // OptiX's AI denoiser on the image display() shows, the complete passes plus the rows of the pass in progress, each
+    // band divided by its own number of samples; then the display transform: 4 bytes per pixel as display(options),
+    // valid until the next display or set_camera. Float sessions with a runtime (session_options::optix) only:
+    // std::invalid_argument in float64, std::logic_error without a runtime, and as display() does.
+    std::span<const std::uint8_t> display_denoised(const display_options& options); // float; needs optix
+    std::vector<float> denoised_pixels() const;   // the last display_denoised's linear floats, 3 per pixel
+    double pick_distance(const std::array<double, 3>& origin, const std::array<double, 3>& direction);
+                                                  // an OptiX session of a scene with meshes: the nearest
+                                                  // surface's distance along the unit direction, ∞ for none
 
     std::uint64_t rays() const;        // rays traced since the view was set
     std::uint64_t shadow_rays() const; // the quality kernel's rays toward a light since then (see render_result)

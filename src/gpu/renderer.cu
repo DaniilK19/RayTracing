@@ -44,6 +44,7 @@
 #include "device_memory.h"
 #include "display.cuh"
 #include "material.cuh"
+#include "optix_runtime.cuh"
 #include "quality.cuh"
 #include "random.cuh"
 #include "scene.cuh"
@@ -1234,6 +1235,9 @@ struct session::impl
     virtual std::vector<double> pixels() const = 0;
     virtual std::span<const std::uint8_t> display() = 0;
     virtual std::span<const std::uint8_t> display(const display_options& options) = 0;
+    virtual std::span<const std::uint8_t> display_denoised(const display_options& options) = 0;
+    virtual std::vector<float> denoised_pixels() const = 0;
+    virtual double pick_distance(const std::array<double, 3>& origin, const std::array<double, 3>& direction) = 0;
     virtual std::uint64_t rays() const = 0;
     virtual std::uint64_t shadow_rays() const = 0;
     virtual bool has_view() const = 0;
@@ -1245,24 +1249,21 @@ template <real_number Real>
 class session::impl::in final : public session::impl
 {
 public:
+    // The quality kernel's arrays and the OptiX scene are uploaded before the kernel is described: OptiX's programs are
+    // compiled at the first upload, and only then is their continuation stack known
     in(const scene_desc& scene, const session_options& options)
         : options_(options),
           sampling_(scene.camera.sampling),
           device_(scene),
-          quality_(uses_quality_kernel(scene, options)),
-          first_book_(uses_first_book_kernel(scene, options)),
+          optix_(options.optix_tracer),
+          quality_(!optix_ && uses_quality_kernel(scene, options)),
+          first_book_(!optix_ && uses_first_book_kernel(scene, options)),
+          quality_scene_(upload_quality_scene(scene)),
+          optix_scene_(upload_optix_scene(scene)),
           kernel_(chosen_kernel_info()),
           resident_blocks_(chosen_resident_blocks()),
           ray_count_(2) // the rays traced, and the quality kernel's shadow rays
     {
-        // The quality kernel computes in float only (session's constructor refuses it in double)
-        if constexpr (std::same_as<Real, float>)
-        {
-            if (quality_)
-            {
-                quality_scene_ = detail::upload_quality(scene, device_.sphere_ids(), device_.quad_ids());
-            }
-        }
         start_view(scene.camera, first_view_probe_samples, std::numeric_limits<double>::infinity());
     }
 
@@ -1436,6 +1437,27 @@ public:
         }
     }
 
+    // --- The display_denoised region (track C, Step 94): guides if stale, the beauty, optix_runtime::denoise, the
+    // denoised floats widened to sums, display(options)'s kernels at scale 1 -----------------------------------------
+    std::span<const std::uint8_t> display_denoised(const display_options& /*options*/) override
+    {
+        throw std::logic_error("session::display_denoised comes in Step 94");
+    }
+
+    std::vector<float> denoised_pixels() const override
+    {
+        throw std::logic_error("session::denoised_pixels comes in Step 94");
+    }
+    // --- end of the display_denoised region ------------------------------------------------------------------------
+
+    // --- The pick_distance region (track B, Step 91): one thread of __raygen__pick in an OptiX session of a scene with
+    // meshes (optix_scene::pick) --------------------------------------------------------------------------------------
+    double pick_distance(const std::array<double, 3>& /*origin*/, const std::array<double, 3>& /*direction*/) override
+    {
+        throw std::logic_error("session::pick_distance comes in Step 91");
+    }
+    // --- end of the pick_distance region ---------------------------------------------------------------------------
+
     std::uint64_t rays() const override
     {
         check_view();
@@ -1455,12 +1477,45 @@ public:
     const kernel_info& kernel() const override { return kernel_; }
 
 private:
-    // The chosen kernel's description and blocks per wave. The quality kernel exists in float only: `if constexpr`
-    // keeps it out of the double session's code entirely.
+    // The quality kernel's own arrays, when it renders or OptiX's programs run its integrator. The quality kernel and
+    // OptiX exist in float only (session's constructor refuses them in double): `if constexpr` keeps them out of the
+    // double session's code entirely.
+    detail::quality_scene_ptr upload_quality_scene(const scene_desc& scene) const
+    {
+        if constexpr (std::same_as<Real, float>)
+        {
+            if (quality_ || optix_)
+            {
+                return detail::upload_quality(scene, device_.sphere_ids(), device_.quad_ids());
+            }
+        }
+        return nullptr;
+    }
+
+    // The scene in OptiX's acceleration structures, beside the BVH (the same global ids, the same tables), when OptiX
+    // traces: the program's runtime builds it (and compiles the programs at its first upload)
+    std::unique_ptr<detail::optix_scene> upload_optix_scene(const scene_desc& scene) const
+    {
+        if constexpr (std::same_as<Real, float>)
+        {
+            if (optix_)
+            {
+                return options_.optix->upload(scene, device_.view(), *quality_scene_, device_.sphere_ids(),
+                                              device_.quad_ids());
+            }
+        }
+        return nullptr;
+    }
+
+    // The chosen kernel's description and blocks per wave: OptiX's are its runtime's
     kernel_info chosen_kernel_info() const
     {
         if constexpr (std::same_as<Real, float>)
         {
+            if (optix_)
+            {
+                return options_.optix->kernel();
+            }
             if (quality_)
             {
                 return detail::quality_kernel_info();
@@ -1473,6 +1528,10 @@ private:
     {
         if constexpr (std::same_as<Real, float>)
         {
+            if (optix_)
+            {
+                return options_.optix->resident_blocks();
+            }
             if (quality_)
             {
                 return detail::quality_resident_blocks();
@@ -1503,9 +1562,14 @@ private:
             sums_ = device_array<double>(0); // frees the old sums before the new ones are allocated
             sums_ = device_array<double>(values);
         }
+        if (optix_scene_)
+        {
+            optix_scene_->prepare_view(camera.image_width, camera.image_height); // grows its per-pixel scratch slots
+        }
         sums_.fill_with_zeros(values);
         ray_count_.fill_with_zeros();
         kernel_seconds_ = 0;
+        ++generation_;
         camera_ = camera;
         cam_ = cam;
         planner_.emplace(camera.image_width, camera.image_height, resident_blocks_,
@@ -1566,7 +1630,11 @@ private:
     {
         const std::uint64_t seed = options_.seed + static_cast<std::uint64_t>(planner().round()) * round_seed_step;
         start_.record();
-        if (quality_)
+        if (optix_)
+        {
+            run_optix(work, seed);
+        }
+        else if (quality_)
         {
             if constexpr (std::same_as<Real, float>)
             {
@@ -1585,7 +1653,14 @@ private:
                                                         ray_count_.data());
         }
         stop_.record();
-        stop_.synchronize();
+        if (optix_)
+        {
+            synchronize_optix();
+        }
+        else
+        {
+            stop_.synchronize();
+        }
         const double seconds = event::seconds_between(start_, stop_);
         kernel_seconds_ += seconds;
         ++report.launches;
@@ -1595,12 +1670,42 @@ private:
         report.state = planner().state();
     }
 
-    session_options options_;
+    // --- The run_optix region (track A, Step 89): one launch of OptiX's render programs on the planner's work -------
+    // Queued on stream 0 between the session's two events, as a CUDA kernel is, so the planner times it the same way;
+    // optix_scene::launch splits a band of more than 2^30 pixels, and checks each optixLaunch as it is queued
+    void run_optix(const launch_work& work, std::uint64_t seed)
+    {
+        if constexpr (std::same_as<Real, float>)
+        {
+            optix_scene_->launch(cam_, seed, work.first_pass, work.pass_count, work.first_row, work.row_count,
+                                 sums_.data(), ray_count_.data());
+        }
+    }
+
+    // The wait for OptiX's launch, and a failure while it ran in OptiX's words: with OPTIX_EXCEPTION_FLAG_NONE nothing
+    // else reports one (an illegal address, a stub's __trap())
+    void synchronize_optix()
+    {
+        try
+        {
+            stop_.synchronize();
+        }
+        catch (const std::runtime_error& error)
+        {
+            throw std::runtime_error(std::string("OptiX's programs failed on the GPU: ") + error.what());
+        }
+    }
+    // --- end of the run_optix region -------------------------------------------------------------------------------
+
+    session_options options_; // its optix runtime too, which every OptiX object of this session needs: declared first,
+                              // it goes last
     sampling_strategy sampling_; // the scene's
     device_scene<Real> device_;
+    bool optix_;      // OptiX's programs render (float only), with the quality kernel's integrator
     bool quality_;    // the quality kernel renders (float only)
-    bool first_book_; // the first book's kernel renders; neither: the kernel for all three books
-    detail::quality_scene_ptr quality_scene_; // the quality kernel's own arrays, if it renders
+    bool first_book_; // the first book's kernel renders; none of the three: the kernel for all three books
+    detail::quality_scene_ptr quality_scene_; // the quality kernel's own arrays, if it or OptiX renders
+    std::unique_ptr<detail::optix_scene> optix_scene_; // the scene in OptiX's acceleration structures, if OptiX renders
     kernel_info kernel_;
     int resident_blocks_;
     camera_desc camera_;
@@ -1608,11 +1713,15 @@ private:
     device_array<double> sums_{0};
     device_array<unsigned long long> ray_count_;
     double kernel_seconds_ = 0;
+    std::int64_t generation_ = 0; // start_view's count: what belongs to one view (the denoiser's guides) knows it
     std::optional<launch_planner> planner_;
     event start_{options_.wait};
     event stop_{options_.wait};
     device_array<std::uint8_t> rgba_{0}; // the display's bytes on the GPU (see display), and their copy on the host
     pinned_array<std::uint8_t> shown_;
+    // --- The display_denoised region's state (track C, Step 94): the guide, beauty and denoised buffers, sized to the
+    // view like sums_, and the (generation, passes, rows) of the kept denoised floats ---------------------------------
+    // --- end of the display_denoised region's state ----------------------------------------------------------------
 };
 
 session::session(const scene_desc& scene, const session_options& options)
@@ -1622,6 +1731,37 @@ session::session(const scene_desc& scene, const session_options& options)
     {
         throw std::invalid_argument(
             std::format("a launch must be planned to take more than 0 and at most {} seconds", max_launch_seconds));
+    }
+    // What OptiX's tracer can't render, and what nothing else renders (the programs say it first, in their own words).
+    // OptiX runs the quality kernel's integrator: float only, the material's bounces with the light strategies.
+    if (options.optix_tracer)
+    {
+        if (!options.optix)
+        {
+            throw std::logic_error("a session that traces with OptiX needs the program's OptiX runtime "
+                                   "(session_options::optix, from start_optix)");
+        }
+        if (options.arithmetic == precision::float64)
+        {
+            throw std::invalid_argument("OptiX's tracer computes in float only");
+        }
+        if (options.all_books_kernel)
+        {
+            throw std::invalid_argument("OptiX's tracer and the kernel for all three books can't both render");
+        }
+        if (options.quality_kernel)
+        {
+            throw std::invalid_argument("OptiX's tracer and the quality kernel can't both render");
+        }
+        if (scene.camera.sampling != sampling_strategy::material)
+        {
+            throw std::invalid_argument("OptiX's tracer samples bounces as the material scatters (-p material, nee or "
+                                        "mis)");
+        }
+    }
+    else if (!scene.meshes.instances.empty())
+    {
+        throw std::invalid_argument("a scene with triangle meshes renders only with OptiX");
     }
     // What the quality kernel can't render (the programs say it first, in their own words)
     if (uses_quality_kernel(scene, options))
@@ -1703,6 +1843,21 @@ std::span<const std::uint8_t> session::display(const display_options& options)
     return impl_->display(options);
 }
 
+std::span<const std::uint8_t> session::display_denoised(const display_options& options)
+{
+    return impl_->display_denoised(options);
+}
+
+std::vector<float> session::denoised_pixels() const
+{
+    return impl_->denoised_pixels();
+}
+
+double session::pick_distance(const std::array<double, 3>& origin, const std::array<double, 3>& direction)
+{
+    return impl_->pick_distance(origin, direction);
+}
+
 std::uint64_t session::rays() const
 {
     return impl_->rays();
@@ -1726,6 +1881,11 @@ double session::kernel_seconds() const
 const kernel_info& session::kernel() const
 {
     return impl_->kernel();
+}
+
+bool uses_quality_integrator(const kernel_info& kernel)
+{
+    return kernel.name == "quality" || kernel.name == "optix";
 }
 
 bool is_convex(const std::vector<quad_desc>& quads)
@@ -1802,11 +1962,24 @@ render_result render(const scene_desc& scene, const render_options& options)
 {
     const auto start_time = std::chrono::steady_clock::now();
     check_display(options.display, options.arithmetic);
+    // The denoiser's refusals, before any session is built or anything rendered (display_denoised would say them only
+    // after the last pass)
+    if (options.denoise && !options.optix)
+    {
+        throw std::logic_error("a render that denoises needs the program's OptiX runtime (render_options::optix, from "
+                               "start_optix)");
+    }
+    if (options.denoise && options.arithmetic == precision::float64)
+    {
+        throw std::invalid_argument("OptiX's denoiser computes in float only");
+    }
     session one(scene, {.seed = options.seed,
                          .arithmetic = options.arithmetic,
                          .all_books_kernel = options.all_books_kernel,
                          .quality_kernel = options.quality_kernel,
-                         .launch_seconds = options.launch_seconds});
+                         .launch_seconds = options.launch_seconds,
+                         .optix_tracer = options.optix_tracer,
+                         .optix = options.optix});
     if (options.passes < 0)
     {
         throw std::invalid_argument("a render's passes must be 0 (one round of strata) or more");
@@ -1833,6 +2006,14 @@ render_result render(const scene_desc& scene, const render_options& options)
     {
         const std::span<const std::uint8_t> bytes = one.display(options.display);
         result.rgba.assign(bytes.begin(), bytes.end());
+    }
+    // The image denoised by OptiX, through the same display (session::display_denoised): beside the pixels, which stay
+    // the image as rendered
+    if (options.denoise)
+    {
+        const std::span<const std::uint8_t> bytes = one.display_denoised(options.display);
+        result.denoised_rgba.assign(bytes.begin(), bytes.end());
+        result.denoised = one.denoised_pixels();
     }
     result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
     return result;

@@ -22,6 +22,7 @@
 
 #include "gpu_test.h"
 #include "host_services.h"
+#include "optix_fixture.h"
 #include "renderer.h"
 #include "statistics.h"
 
@@ -448,6 +449,7 @@ int context::end_suite()
 
 int main(int argc, char* argv[])
 {
+    const gpu_test::optix::release_at_return optix_released{}; // OptiX goes when main returns, not at exit
     using namespace gpu_test;
     std::error_code no_folder;
     host::executable_folder = std::filesystem::absolute(argv[0], no_folder).parent_path(); // for find_repo_file
@@ -541,8 +543,9 @@ int main(int argc, char* argv[])
             return 2;
         }
     }
-    // The gate's command names suites that arrive in later steps (final.md B, GT lean), so a name this build doesn't
-    // register is said on the "Left out" line, not an error: a misspelled one runs one suite more, never one fewer.
+    // The gate's --exclude list names suites that arrive in later steps (one list for every step), so a name this
+    // build doesn't register is said on the "Left out" line, not an error: a misspelled one runs one suite more, never
+    // one fewer.
     // What GPU_TEST can't give is an error: an empty name (a stray comma), an option swallowed as the list ("--exclude
     // --quick"), all, or another character (the identifier's '_' for the name's '-', a capital letter).
     const auto suite_like = [](std::string_view name) {

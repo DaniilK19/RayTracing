@@ -649,6 +649,67 @@ std::expected<std::optional<gpu::environment_desc>, std::string> load_environmen
     return std::optional{std::move(environment)};
 }
 
+// --- glTF models: a file in place of a scene's name ------------------------------------------------------------
+
+// A loaded model as every build reuses it (not exported; filled in Step 93): meshes::model from load_gltf is converted
+// once per load into these shared pieces and dropped; a build copies the shared_ptrs into scene_desc::meshes, never
+// the meshes themselves
+struct loaded_model
+{
+    std::vector<std::shared_ptr<const gpu::mesh_desc>> meshes;
+    std::vector<gpu::mesh_instance_desc> placements;
+    std::vector<gpu::mesh_material_desc> materials;
+    std::vector<std::shared_ptr<const gpu::mesh_texture_desc>> textures;
+    std::array<double, 3> lower{};
+    std::array<double, 3> upper{};
+    std::vector<std::string> warnings;
+};
+
+// Whether a scene argument names a glTF 2.0 file: it ends in .glb or .gltf, in any case (no scene's name has a dot)
+export bool is_model_path(std::string_view argument)
+{
+    const auto ends_with = [argument](std::string_view suffix) {
+        return argument.size() >= suffix.size() &&
+               std::ranges::equal(argument.substr(argument.size() - suffix.size()), suffix, [](char a, char b) {
+                   return std::tolower(static_cast<unsigned char>(a)) == b;
+               });
+    };
+    return ends_with(".glb") || ends_with(".gltf");
+}
+
+// A model file's scene is built from the file (build_gpu_scene, Step 93), never by an entry's function: this one only
+// says so
+gpu_scene_parts model_scene()
+{
+    throw std::logic_error("a glTF model's scene comes in Step 93");
+}
+
+// The entry of a model file's scene, outside the list (neither the help nor Tab shows it): a showcase, rendered with
+// -p mis and shown through AgX at 0 EV
+constexpr gpu_scene_entry model_scene_entry{.name = "model",
+                                            .description = "a glTF 2.0 model, FILE.glb or FILE.gltf, in a photo studio",
+                                            .role = scene_role::showcase,
+                                            .build = &model_scene,
+                                            .default_strategy = strategy::mis,
+                                            .display = {.op = gpu::tone_map::agx, .exposure = 0}};
+
+export const gpu_scene_entry& model_entry()
+{
+    return model_scene_entry;
+}
+
+// The entry of a scene's name (find_gpu_scene), or the model entry for a model file's path; nullptr for neither
+export const gpu_scene_entry* scene_entry(std::string_view scene_or_path)
+{
+    if (const gpu_scene_entry* entry = find_gpu_scene(scene_or_path))
+    {
+        return entry;
+    }
+    return is_model_path(scene_or_path) ? &model_entry() : nullptr;
+}
+// build_gpu_scene(name, …) also takes a model path from Step 93: the model through the cache (the last two, by
+// canonical path, size and write time, as std::shared_ptr<const loaded_model>), unit_placement, the ground and camera
+
 // --- A scene ready for the GPU ---------------------------------------------------------------------------------
 
 // The largest side of a pixel's grid of samples, the renderer's (see gpu::max_sqrt_spp)

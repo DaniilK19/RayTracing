@@ -77,18 +77,23 @@ export constexpr strategy from_books(sampling_strategy books)
 }
 
 // Which kernel renders: the one the scene needs, the books' kernel for all three books even where the first book's
-// would do (--all-books-kernel), or the quality kernel even for the books' scenes (--quality-kernel)
+// would do (--all-books-kernel), the quality kernel even for the books' scenes (--quality-kernel), or the quality
+// kernel's integrator in OptiX's programs (--optix, which the programs accept from Steps 89 and 95)
 export enum class kernel_choice
 {
     automatic,
     all_books,
     quality,
+    optix,
 };
 
-// Its name in the window's scripts (kernel auto|all-books|quality)
+// Its name in the window's scripts (kernel auto|all-books|quality; optix from Step 95)
 export constexpr std::string_view kernel_choice_name(kernel_choice kernel)
 {
-    return kernel == kernel_choice::all_books ? "all-books" : kernel == kernel_choice::quality ? "quality" : "auto";
+    return kernel == kernel_choice::all_books ? "all-books"
+           : kernel == kernel_choice::quality ? "quality"
+           : kernel == kernel_choice::optix   ? "optix"
+                                              : "auto";
 }
 
 // The list for the programs' help, a line per strategy: as RayTracing prints it, the camera's default marked
