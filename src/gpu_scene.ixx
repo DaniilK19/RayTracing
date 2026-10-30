@@ -852,12 +852,34 @@ export bool renders_with_quality_kernel(const gpu_build& build, kernel_choice ke
            });
 }
 
+// The strategy the integrator's rules check: the one -p gave as given (a books' strategy but the material's is refused,
+// even where a scene without lamps would fall back to it), a scene's own as it renders
+strategy checked_strategy(const gpu_build& build)
+{
+    return build.sampling_given ? build.requested : build.sampling;
+}
+
 // What the quality kernel can't render, as the programs say it after "Error: ", before anything is rendered (the
 // renderer refuses it too, in its own words): float64, the kernel for all three books, and the books' strategies but
-// the material's. `scene` is the scene's name, for the message.
+// the material's. With kernel_choice::optix (--optix) the rules of OptiX's programs, which run the quality kernel's
+// integrator on every scene: float64, and the books' strategies but the material's (so a scene whose own strategy is
+// one of them needs -p). Another option that picks a renderer beside --optix is the programs' to refuse. `scene` is
+// the scene's name, for the message.
 export std::expected<void, std::string> check_kernel(const gpu_build& build, std::string_view scene,
                                                      kernel_choice kernel, bool fp64)
 {
+    if (kernel == kernel_choice::optix)
+    {
+        if (fp64)
+        {
+            return std::unexpected("--optix renders with OptiX, which computes in float only: drop --fp64");
+        }
+        if (!integrator_renders(checked_strategy(build)))
+        {
+            return std::unexpected(std::format("OptiX samples the materials: use -p {}", integrator_strategies()));
+        }
+        return {};
+    }
     if (!renders_with_quality_kernel(build, kernel))
     {
         return {};
@@ -887,19 +909,11 @@ export std::expected<void, std::string> check_kernel(const gpu_build& build, std
         return std::unexpected(std::format(
             "--all-books-kernel picks the books' kernel for all three books; {} needs the quality kernel", what));
     }
-    // Its bounces sample as the material scatters. The strategy -p gave is checked as given (a books' strategy but the
-    // material's is refused, even where a scene without lamps would fall back to it); a scene's own as it renders.
-    const strategy checked = build.sampling_given ? build.requested : build.sampling;
-    if (entry_of(checked).books.value_or(sampling_strategy::material) != sampling_strategy::material)
+    // Its bounces sample as the material scatters
+    if (!integrator_renders(checked_strategy(build)))
     {
         // The strategies it renders: material, and every one of its own (those that aren't the books')
-        std::string strategies = "material";
-        const auto own = strategy_list | std::views::filter([](const strategy_entry& e) { return !e.books; }) |
-                         std::ranges::to<std::vector>();
-        for (std::size_t i = 0; i < own.size(); ++i)
-        {
-            strategies += std::format("{}{}", i + 1 == own.size() ? " or " : ", ", own[i].name);
-        }
+        const std::string strategies = integrator_strategies();
         if (!reason.empty() && kernel != kernel_choice::quality)
         {
             return std::unexpected(std::format("'{}' has {}, which the books' kernels can't render: use -p {}", scene,

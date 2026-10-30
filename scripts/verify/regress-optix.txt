@@ -1,0 +1,17 @@
+# OptiX's renders for scripts/verify/hostgate.ps1's chained section regress-optix (from Step 89; chained.txt: kind G,
+# stamped): one RayTracingGPU command's arguments a line, each rendered by hostgate with -o NAME.pfm -o NAME.png into a
+# folder of its own. The graphics driver compiles OptiX's programs, so the kept lines (the Scene, View, Kernel, Mean
+# radiance, Rays traced and Shadow rays lines, and every file's SHA-256) carry a stamp, the driver's version and the
+# programs' SHA-256: under the stamp of the last accepted lines a step's lines must equal them, under another they wait
+# for review (RE-VERIFY).
+#
+# Tiny renders (96 by 54 pixels, 16 samples) of the kinds of geometry and light the OptiX tracer handles: quads and a
+# lamp (cornell), every kind with media and textures (final), an environment map and GGX metals (studio), moving
+# spheres (bouncing), media bounded by quads (smoke), an image texture on a sphere (earth); and the three combinations
+# of the quality kernel's integrator, material, nee and mis.
+cornell --optix -p mis -w 96 --height 54 -s 16
+final --optix -p mis -w 96 --height 54 -s 16
+studio --optix -p mis -w 96 --height 54 -s 16
+bouncing --optix -p material -w 96 --height 54 -s 16
+smoke --optix -p nee -w 96 --height 54 -s 16
+earth --optix -p material -w 96 --height 54 -s 16

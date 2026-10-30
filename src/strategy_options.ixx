@@ -76,9 +76,30 @@ export constexpr strategy from_books(sampling_strategy books)
     return std::ranges::find(strategy_list, std::optional{books}, &strategy_entry::books)->value;
 }
 
+// Whether the quality kernel's integrator renders a strategy (the quality kernel, and OptiX's programs under --optix):
+// its bounces sample as the material scatters, so of the books' strategies only material, and every one of its own
+export constexpr bool integrator_renders(strategy value)
+{
+    return entry_of(value).books.value_or(sampling_strategy::material) == sampling_strategy::material;
+}
+
+// Those strategies as the programs' refusals list them: material, then every one that isn't the books' ("material, nee
+// or mis")
+export std::string integrator_strategies()
+{
+    std::string strategies = "material";
+    const auto own = strategy_list | std::views::filter([](const strategy_entry& e) { return !e.books; }) |
+                     std::ranges::to<std::vector>();
+    for (std::size_t i = 0; i < own.size(); ++i)
+    {
+        strategies += std::format("{}{}", i + 1 == own.size() ? " or " : ", ", own[i].name);
+    }
+    return strategies;
+}
+
 // Which kernel renders: the one the scene needs, the books' kernel for all three books even where the first book's
 // would do (--all-books-kernel), the quality kernel even for the books' scenes (--quality-kernel), or the quality
-// kernel's integrator in OptiX's programs (--optix, which the programs accept from Steps 89 and 95)
+// kernel's integrator in OptiX's programs (--optix: RayTracingGPU's from Step 89, the window's from Step 95)
 export enum class kernel_choice
 {
     automatic,

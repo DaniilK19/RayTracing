@@ -98,6 +98,13 @@ G --exposure abc -w 16 -s 1 -o out\m5\runs\cli-case.png
 G --tonemap agx --exposure nan -w 16 -s 1 -o out\m5\runs\cli-case.png
 G --tonemap agx --exposure 25 -w 16 -s 1 -o out\m5\runs\cli-case.png
 G --tonemap neutral --exposure -24.5 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --optix --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --optix --all-books-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --optix --quality-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
+G cornell --optix -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --optix -p uniform -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --optix -p lights -w 16 -s 1 -o out\m5\runs\cli-case.png
+G cornell --optix -p mixture -w 16 -s 1 -o out\m5\runs\cli-case.png
 V -p mis --fp64 --headless -w 16 -s 1
 V final -p mis --headless -w 16 -s 1
 V cornell -p mis --fp64 --headless -w 16 -s 1

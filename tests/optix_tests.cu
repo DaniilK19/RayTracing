@@ -1,6 +1,6 @@
-// The OptiX suites of track A: optix-runtime (Steps 87 and 88) and optix-tracer (Step 88), in that order below.
-// Everything goes through the abstract runtime of the fixture (optix_fixture.h) and the renderer's interface, so a
-// build without OptiX links this file as it is and every OptiX check skips, saying why.
+// The OptiX suites of track A: optix-runtime (Steps 87 and 88), optix-tracer (Step 88) and optix-render (Step 89),
+// in that order below. Everything goes through the abstract runtime of the fixture (optix_fixture.h) and the
+// renderer's interface, so a build without OptiX links this file as it is and every OptiX check skips, saying why.
 //
 // Suite optix-runtime: OptiX started from the graphics driver, the programs compiled by it, and launches of the check
 // module's probes (tests/optix_check_programs.cu), first before any scene or acceleration structure (Step 87's probes:
@@ -24,9 +24,10 @@
 //   P5  a scene without any of the books' primitives (an empty custom build input): its upload doesn't throw, and
 //       nothing is hit (INFO: whether its root is 0, as planned: no GAS at all).
 //
-// Suite optix-tracer: __raygen__check, the two tracers ray by ray on the geometry of the 22 GPU scenes,
-// and its three planted faults; from Step 91 the same under an instance root. It is left out of the every-step GT run;
-// its comment below says what it decides.
+// Suite optix-tracer: __raygen__check, the two tracers ray by ray on the geometry of the 22 GPU scenes, and its three
+// planted faults; from Step 91 the same under an instance root. Suite optix-render: gpu::render with the quality
+// kernel and with OptiX on the same seed, the furnaces, determinism, the session's refusals, and a view rendered in
+// three calls. Both are left out of the every-step GT run; their comments below say what they decide.
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -715,5 +716,353 @@ GPU_TEST(optix_tracer, instance_root)
         report_check(ctx, std::format("instance-root.{}", name),
                      run_check(*uploaded, cam, size.samples, 0, instance_seed), cam, size.samples, !ctx.quick());
     }
+}
+}
+
+// --- Suite optix-render (Step 89): the same seed through both renderers ----------------------------------------------
+//
+// gpu::render, the library's own path, with the quality kernel and with OptiX (render_options::optix_tracer and the
+// fixture's runtime) on each of the 22 GPU scenes at 240 × 135, 16 samples, seed 7 (the same-seed comparisons' seed),
+// with the scene's strategy for light: -p mis where it has a lamp of the light set or an environment map, else
+// -p material (gpu_scene's rule for -p mis). Both run one integrator (quality_path.cuh) with the same random numbers,
+// so a pixel differs only where a path met another primitive or another t. Per scene (test survey):
+//   INFO                  the share of the pixels equal bit for bit, the largest distance between a channel's two
+//                         values in float steps (ulps), the rays and shadow rays of both;
+//   <scene>.kernels       the quality kernel rendered the one, OptiX the other (the comparison is never vacuous);
+//   <scene>.not-finite    no NaN and no infinity in OptiX's image;
+//   <scene>.rays          OptiX's rays within 0.5% of the quality kernel's;
+//   <scene>.shadow-rays   the same for the shadow rays (exactly the same 0 under -p material).
+// The other tests: furnaces (furnace and env-furnace under OptiX with -p material: every value exactly 1.0, as for the
+// CUDA kernels; under -p mis env-furnace is 1 on average only, docs/quality.md), determinism (OptiX twice on cornell,
+// final and studio in this process: the same bytes; across processes is Step 89's own check, with RayTracingGPU),
+// refusals (the session's, before anything renders), three_calls (a view rendered by three calls of render_to, the
+// second ending inside a pass, equals one render of as many passes, bit for bit) and planted_faults (what the exact
+// gates must reject).
+//
+// --quick: 64 × 36 pixels, 4 samples, and five scenes: cornell, final, studio, furnace and env-furnace.
+
+namespace
+{
+struct survey_size
+{
+    int width;
+    int height;
+    int samples; // a square: a whole round of strata
+};
+constexpr survey_size full_survey{.width = 240, .height = 135, .samples = 16};
+constexpr survey_size quick_survey{.width = 64, .height = 36, .samples = 4};
+constexpr std::array<std::string_view, 5> quick_survey_scenes{"cornell", "final", "studio", "furnace", "env-furnace"};
+
+constexpr std::uint64_t survey_seed = 7; // the milestone's seed of the same-seed comparisons
+constexpr std::uint64_t three_calls_seed = 9004;
+constexpr std::uint64_t planted_seed = 9005;
+
+gpu::scene_desc survey_scene(std::string_view name, const survey_size& size, gpu_test::host::scene_strategy sampling)
+{
+    return gpu_test::host::built_scene(
+        name, {.width = size.width, .height = size.height, .samples = size.samples, .sampling = sampling});
+}
+
+gpu::render_result render_quality(const gpu::scene_desc& scene, std::uint64_t seed)
+{
+    return gpu::render(scene, {.seed = seed, .quality_kernel = true});
+}
+
+gpu::render_result render_optix(const gpu::scene_desc& scene, std::uint64_t seed,
+                                const std::shared_ptr<gpu::optix_runtime>& runtime)
+{
+    return gpu::render(scene, {.seed = seed, .optix_tracer = true, .optix = runtime});
+}
+
+// A float's place on the number line in steps of one ulp: neighbouring floats differ by 1, -0 and +0 are both 0
+std::int64_t float_steps(float x)
+{
+    const auto bits = std::bit_cast<std::int32_t>(x);
+    return bits >= 0 ? bits : -static_cast<std::int64_t>(bits & 0x7fffffff);
+}
+
+struct image_comparison
+{
+    std::int64_t pixels = 0;
+    std::int64_t identical = 0;     // pixels whose three values are equal bit for bit
+    std::int64_t values_differ = 0; // values (channels) that aren't
+    std::int64_t largest_steps = 0; // the largest distance of two finite values, rounded to float, in float steps
+};
+
+image_comparison compare(std::span<const double> a, std::span<const double> b)
+{
+    if (a.size() != b.size())
+    {
+        throw std::runtime_error(std::format("two images of {} and {} values", a.size(), b.size()));
+    }
+    image_comparison c{.pixels = static_cast<std::int64_t>(a.size() / 3)};
+    for (std::size_t p = 0; p + 2 < a.size(); p += 3)
+    {
+        bool equal = true;
+        for (std::size_t k = p; k < p + 3; ++k)
+        {
+            if (std::bit_cast<std::uint64_t>(a[k]) == std::bit_cast<std::uint64_t>(b[k]))
+            {
+                continue;
+            }
+            equal = false;
+            ++c.values_differ;
+            if (std::isfinite(a[k]) && std::isfinite(b[k]))
+            {
+                const std::int64_t steps =
+                    float_steps(static_cast<float>(a[k])) - float_steps(static_cast<float>(b[k]));
+                c.largest_steps = std::max(c.largest_steps, steps < 0 ? -steps : steps);
+            }
+        }
+        c.identical += equal ? 1 : 0;
+    }
+    return c;
+}
+
+std::int64_t not_finite(std::span<const double> values)
+{
+    return std::ranges::count_if(values, [](double v) { return !std::isfinite(v); });
+}
+
+double percent(std::int64_t part, std::int64_t whole)
+{
+    return whole > 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+}
+
+GPU_TEST(optix_render, survey)
+{
+    const std::shared_ptr<gpu::optix_runtime> runtime = gpu_test::optix::runtime(ctx, "survey");
+    if (!runtime)
+    {
+        return;
+    }
+    compile_render_programs(ctx, *runtime);
+    const survey_size size = ctx.quick() ? quick_survey : full_survey;
+    std::int64_t all_pixels = 0;
+    std::int64_t all_identical = 0;
+    for (const std::string_view name : gpu_scene_names)
+    {
+        if (ctx.quick() && !listed(quick_survey_scenes, name))
+        {
+            continue;
+        }
+        const gpu::scene_desc scene = survey_scene(name, size, gpu_test::host::scene_strategy::mis);
+        const bool mis = scene.quality.combination == gpu::light_combination::power_heuristic;
+        const gpu::render_result quality = render_quality(scene, survey_seed);
+        const gpu::render_result optix = render_optix(scene, survey_seed, runtime);
+        const image_comparison c = compare(quality.pixels, optix.pixels);
+        all_pixels += c.pixels;
+        all_identical += c.identical;
+        ctx.info(name, std::format("-p {}: {:.2f}% of the pixels equal bit for bit, a channel at most {} float steps "
+                                   "apart; rays {} (quality) and {} (OptiX), shadow rays {} and {}",
+                                   mis ? "mis" : "material", percent(c.identical, c.pixels), c.largest_steps,
+                                   quality.rays, optix.rays, quality.shadow_rays, optix.shadow_rays));
+        if (const std::int64_t bad = not_finite(quality.pixels); bad > 0)
+        {
+            ctx.info(std::format("{}.quality-not-finite", name),
+                     std::format("{} values of the quality kernel's image aren't finite", bad));
+        }
+        ctx.exact(std::format("{}.kernels", name),
+                  quality.kernel.name == "quality" && optix.kernel.name == "optix" ? 1 : 0, 1, 0);
+        ctx.count(std::format("{}.not-finite", name), not_finite(optix.pixels), 0,
+                  static_cast<std::int64_t>(optix.pixels.size()));
+        ctx.exact(std::format("{}.rays", name), static_cast<double>(optix.rays), static_cast<double>(quality.rays),
+                  0.005 * static_cast<double>(quality.rays));
+        ctx.exact(std::format("{}.shadow-rays", name), static_cast<double>(optix.shadow_rays),
+                  static_cast<double>(quality.shadow_rays), 0.005 * static_cast<double>(quality.shadow_rays));
+    }
+    ctx.info("all-scenes",
+             std::format("{:.2f}% of {} pixels equal bit for bit", percent(all_identical, all_pixels), all_pixels));
+}
+
+// furnace and env-furnace under OptiX with -p material: a white sphere under a white sky or map, every path ending in
+// the sky with all of its light, so every value is exactly 1.0 (gpu_scenes.ixx says why in float too)
+GPU_TEST(optix_render, furnaces)
+{
+    const std::shared_ptr<gpu::optix_runtime> runtime = gpu_test::optix::runtime(ctx, "furnaces");
+    if (!runtime)
+    {
+        return;
+    }
+    compile_render_programs(ctx, *runtime);
+    const survey_size size = ctx.quick() ? quick_survey : full_survey;
+    for (const std::string_view name : std::array<std::string_view, 2>{"furnace", "env-furnace"})
+    {
+        const gpu::scene_desc scene = survey_scene(name, size, gpu_test::host::scene_strategy::material);
+        const gpu::render_result r = render_optix(scene, survey_seed, runtime);
+        ctx.count(std::format("{}.not-one", name), std::ranges::count_if(r.pixels, [](double v) { return v != 1.0; }),
+                  0, static_cast<std::int64_t>(r.pixels.size()));
+    }
+}
+
+// OptiX twice on the same scene, seed and options in one process (one GAS build per render): the same bytes, and the
+// same rays. If they differ, the OptiX carry and the viewer's byte checks turn statistical.
+GPU_TEST(optix_render, determinism)
+{
+    const std::shared_ptr<gpu::optix_runtime> runtime = gpu_test::optix::runtime(ctx, "determinism");
+    if (!runtime)
+    {
+        return;
+    }
+    compile_render_programs(ctx, *runtime);
+    const survey_size size = ctx.quick() ? quick_survey : full_survey;
+    for (const std::string_view name : std::array<std::string_view, 3>{"cornell", "final", "studio"})
+    {
+        const gpu::scene_desc scene = survey_scene(name, size, gpu_test::host::scene_strategy::mis);
+        const gpu::render_result first = render_optix(scene, survey_seed, runtime);
+        const gpu::render_result second = render_optix(scene, survey_seed, runtime);
+        ctx.count(std::format("{}.second-run-differs", name), compare(first.pixels, second.pixels).values_differ, 0,
+                  static_cast<std::int64_t>(first.pixels.size()));
+        ctx.exact(std::format("{}.second-run-rays", name), static_cast<double>(second.rays),
+                  static_cast<double>(first.rays), 0);
+        ctx.exact(std::format("{}.second-run-shadow-rays", name), static_cast<double>(second.shadow_rays),
+                  static_cast<double>(first.shadow_rays), 0);
+    }
+}
+
+// A tiny scene: one matte sphere under a sky, a 4 × 4 image of one sample, sampled as the material scatters
+gpu::scene_desc refusal_scene()
+{
+    gpu::scene_desc scene;
+    scene.textures.push_back({.kind = gpu::texture_kind::solid, .rgb = {0.5, 0.5, 0.5}});
+    scene.materials.push_back({.kind = gpu::material_kind::lambertian, .texture = 0});
+    scene.spheres.push_back({.center = {0, 0, -2}, .radius = 1, .material = 0});
+    scene.camera = {.image_width = 4,
+                    .image_height = 4,
+                    .sqrt_spp = 1,
+                    .max_depth = 4,
+                    .center = {0, 0, 0},
+                    .pixel00_loc = {-0.375, 0.375, -1},
+                    .pixel_delta_u = {0.25, 0, 0},
+                    .pixel_delta_v = {0, -0.25, 0},
+                    .sky_bottom = {1, 1, 1},
+                    .sky_top = {0.5, 0.7, 1},
+                    .sampling = gpu::sampling_strategy::material};
+    return scene;
+}
+
+// What making a session throws: std::invalid_argument, a std::logic_error that isn't one, another exception, or nothing
+// (the first word), and its message
+std::pair<std::string, std::string> refusal(const gpu::scene_desc& scene, const gpu::session_options& options)
+{
+    try
+    {
+        gpu::session s(scene, options);
+    }
+    catch (const std::invalid_argument& error)
+    {
+        return {"std::invalid_argument", error.what()};
+    }
+    catch (const std::logic_error& error)
+    {
+        return {"std::logic_error", error.what()};
+    }
+    catch (const std::exception& error)
+    {
+        return {"another exception", error.what()};
+    }
+    return {"nothing", ""};
+}
+
+void expect_refusal(gpu_test::context& ctx, std::string_view name, const gpu::scene_desc& scene,
+                    const gpu::session_options& options, std::string_view expected)
+{
+    const auto [thrown, message] = refusal(scene, options);
+    ctx.info(name, std::format("{}: {}", thrown, message)); // the words, for the review
+    ctx.exact(name, thrown == expected ? 1 : 0, 1, 0);
+}
+
+// The session's refusals for OptiX (renderer.h), each before anything renders: optix_tracer in float64, with the
+// kernel for all three books, with the quality kernel, or with a strategy of the books' lights list (std::
+// invalid_argument: what OptiX's tracer can't render); optix_tracer without a runtime (std::logic_error: the caller's
+// mistake); and a scene with triangle meshes without optix_tracer (std::invalid_argument: only OptiX renders them),
+// which needs no OptiX, so it is decided even where OptiX can't run.
+GPU_TEST(optix_render, refusals)
+{
+    const gpu::scene_desc scene = refusal_scene();
+    gpu::scene_desc meshes = scene;
+    auto triangle = std::make_shared<gpu::mesh_desc>();
+    triangle->positions = {-1, -1, -3, 1, -1, -3, 0, 1, -3};
+    triangle->indices = {0, 1, 2};
+    triangle->material_of = {0};
+    meshes.meshes.meshes.push_back(std::move(triangle));
+    meshes.meshes.instances.push_back({.mesh = 0});
+    meshes.meshes.materials.push_back({.scene_material = 0});
+    expect_refusal(ctx, "meshes-without-optix-tracer", meshes, {}, "std::invalid_argument");
+    expect_refusal(ctx, "optix-tracer-without-runtime", scene, {.optix_tracer = true}, "std::logic_error");
+
+    const std::shared_ptr<gpu::optix_runtime> runtime = gpu_test::optix::runtime(ctx, "refusals");
+    if (!runtime)
+    {
+        return;
+    }
+    expect_refusal(ctx, "optix-tracer-float64", scene,
+                   {.arithmetic = gpu::precision::float64, .optix_tracer = true, .optix = runtime},
+                   "std::invalid_argument");
+    expect_refusal(ctx, "optix-tracer-all-books-kernel", scene,
+                   {.all_books_kernel = true, .optix_tracer = true, .optix = runtime}, "std::invalid_argument");
+    expect_refusal(ctx, "optix-tracer-quality-kernel", scene,
+                   {.quality_kernel = true, .optix_tracer = true, .optix = runtime}, "std::invalid_argument");
+    gpu::scene_desc mixture = scene;
+    mixture.camera.sampling = gpu::sampling_strategy::mixture;
+    mixture.lights.push_back({.kind = gpu::light_shape::sphere, .center = {0, 0, -2}, .radius = 1, .weight = 1});
+    expect_refusal(ctx, "optix-tracer-mixture", mixture, {.optix_tracer = true, .optix = runtime},
+                   "std::invalid_argument");
+}
+
+// One view of cornell (-p mis) rendered by a session in three calls of render_to, the second ending inside a pass
+// (rows of the next pass done: a band that starts below the top), against one gpu::render of as many passes: the
+// same doubles bit for bit, and the same rays (renderer.h's promise, here for OptiX's launches)
+GPU_TEST(optix_render, three_calls)
+{
+    const std::shared_ptr<gpu::optix_runtime> runtime = gpu_test::optix::runtime(ctx, "three-calls");
+    if (!runtime)
+    {
+        return;
+    }
+    compile_render_programs(ctx, *runtime);
+    const survey_size size = ctx.quick() ? quick_survey : full_survey;
+    const gpu::scene_desc scene = survey_scene("cornell", size, gpu_test::host::scene_strategy::mis);
+    const std::int64_t passes = size.samples;
+    gpu::session split(scene, {.seed = three_calls_seed, .optix_tracer = true, .optix = runtime});
+    split.render_to({.passes = passes / 4, .rows = 0});
+    split.render_to({.passes = passes / 2, .rows = size.height / 2});
+    split.render_to({.passes = passes, .rows = 0});
+    const gpu::render_result whole =
+        gpu::render(scene, {.seed = three_calls_seed, .passes = passes, .optix_tracer = true, .optix = runtime});
+    ctx.count("three-calls.differ", compare(split.pixels(), whole.pixels).values_differ, 0,
+              static_cast<std::int64_t>(whole.pixels.size()));
+    ctx.exact("three-calls.rays", static_cast<double>(split.rays()), static_cast<double>(whole.rays), 0);
+    ctx.exact("three-calls.shadow-rays", static_cast<double>(split.shadow_rays()),
+              static_cast<double>(whole.shadow_rays), 0);
+}
+
+// The suite's planted faults, each of which a gate above must reject: OptiX's cornell at another seed
+// (9005) against seed 7's, which determinism and three_calls must call different; and env-furnace under -p mis, where
+// the map is a light and a value is 1 only on average (docs/quality.md: 1.0008 ± 0.0007 at the sphere's centre), which
+// furnaces must call not exactly 1. Each passes when its gate would have seen at least one value.
+GPU_TEST(optix_render, planted_faults)
+{
+    const std::shared_ptr<gpu::optix_runtime> runtime = gpu_test::optix::runtime(ctx, "planted-faults");
+    if (!runtime)
+    {
+        return;
+    }
+    compile_render_programs(ctx, *runtime);
+    const survey_size size = ctx.quick() ? quick_survey : full_survey;
+    const gpu::scene_desc cornell = survey_scene("cornell", size, gpu_test::host::scene_strategy::mis);
+    const gpu::render_result seven = render_optix(cornell, survey_seed, runtime);
+    const gpu::render_result other = render_optix(cornell, planted_seed, runtime);
+    const auto values = static_cast<std::int64_t>(seven.pixels.size());
+    const std::int64_t differ = compare(seven.pixels, other.pixels).values_differ;
+    ctx.info("fault-other-seed.cornell", std::format("{} of {} values differ", differ, values));
+    ctx.count("fault-other-seed.cornell.equal", values - differ, values - 1, values);
+
+    const gpu::scene_desc furnace = survey_scene("env-furnace", size, gpu_test::host::scene_strategy::mis);
+    const gpu::render_result mis = render_optix(furnace, survey_seed, runtime);
+    const std::int64_t not_one = std::ranges::count_if(mis.pixels, [](double v) { return v != 1.0; });
+    const auto furnace_values = static_cast<std::int64_t>(mis.pixels.size());
+    ctx.info("fault-mis.env-furnace", std::format("{} of {} values aren't exactly 1", not_one, furnace_values));
+    ctx.count("fault-mis.env-furnace.exactly-one", furnace_values - not_one, furnace_values - 1, furnace_values);
 }
 }

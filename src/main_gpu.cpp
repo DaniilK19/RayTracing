@@ -5,10 +5,11 @@
 // stays the reference: a scene rendered by both must come out the same up to the noise.
 // RayTracingGPU weekend -s 1024
 
-// The header includes standard headers (<vector>, <string>...), so it must come before `import std;`. MSVC can merge
+// The headers include standard headers (<vector>, <string>...), so they must come before `import std;`. MSVC can merge
 // the two copies of the standard library, the headers' and the module's, only in this order: after the import, the
 // headers would define its class templates a second time (error C2953).
 #include "gpu/renderer.h"
+#include "gpu/start_optix.h"
 
 import std;
 import camera;
@@ -25,9 +26,9 @@ import view_options;
 constexpr std::string_view default_gpu_scene = "weekend";
 constexpr int max_launch_ms = static_cast<int>(gpu::max_launch_seconds * 1000);
 
-// The options are RayTracing's, plus the GPU programs' own: --fp64, --all-books-kernel, --quality-kernel, --launch-ms,
-// --strata, the view options (view_options.ixx) and the display's (tone_options.ixx). std::optional tells "not given:
-// take it from the scene" apart from any given value.
+// The options are RayTracing's, plus the GPU programs' own: --fp64, --all-books-kernel, --quality-kernel, --optix,
+// --launch-ms, --strata, the view options (view_options.ixx) and the display's (tone_options.ixx). std::optional tells
+// "not given: take it from the scene" apart from any given value.
 struct options
 {
     std::string_view scene = default_gpu_scene;
@@ -42,6 +43,7 @@ struct options
     bool fp64 = false;
     bool all_books_kernel = false;
     bool quality_kernel = false;
+    bool optix = false; // OptiX traces the quality kernel's integrator (render_options::optix_tracer)
     int launch_ms = 50; // how long one kernel launch should take (see render_options::launch_seconds)
     bool help = false;
 };
@@ -75,6 +77,9 @@ Options:
                        (a check: the same image, bit for bit expected; and the price of generality)
       --quality-kernel render with the quality kernel, the third one, also the books' scenes under
                        -p material (a check: the same image within its noise, mostly bit for bit)
+      --optix          trace with OptiX (on the ray tracing cores where the GPU has them): the
+                       quality kernel's integrator in an OptiX program (float; -p material, nee or
+                       mis); scenes with triangle meshes always use it
       --launch-ms N    how long one kernel launch should take, in milliseconds, from 1 to {}
                        (default 50): a check, as the image doesn't depend on it, only the speed
       --seed N         which random numbers to draw, from 0 (the default) to {}:
@@ -114,6 +119,11 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         if (arg == "--quality-kernel")
         {
             opts.quality_kernel = true;
+            continue;
+        }
+        if (arg == "--optix")
+        {
+            opts.optix = true;
             continue;
         }
 
@@ -296,14 +306,26 @@ int main(int argc, char* argv[])
         std::println("Error: {}", built.error());
         return 1;
     }
-    // The kernel asked for, and what the quality kernel can't render (see check_kernel in gpu_scene.ixx)
+    // The kernel asked for, and what the quality kernel or OptiX can't render (see check_kernel in gpu_scene.ixx)
     if (opts->quality_kernel && opts->all_books_kernel)
     {
         std::println("Error: --all-books-kernel picks the books' kernel for all three books; --quality-kernel needs "
                      "the quality kernel");
         return 1;
     }
-    const kernel_choice chosen = opts->quality_kernel     ? kernel_choice::quality
+    if (opts->optix && opts->quality_kernel)
+    {
+        std::println("Error: --optix and --quality-kernel each pick a renderer: give one");
+        return 1;
+    }
+    if (opts->optix && opts->all_books_kernel)
+    {
+        std::println("Error: --all-books-kernel picks the books' kernel for all three books; --optix renders with "
+                     "OptiX");
+        return 1;
+    }
+    const kernel_choice chosen = opts->optix              ? kernel_choice::optix
+                                 : opts->quality_kernel   ? kernel_choice::quality
                                  : opts->all_books_kernel ? kernel_choice::all_books
                                                           : kernel_choice::automatic;
     if (const auto checked = check_kernel(*built, opts->scene, chosen, opts->fp64); !checked)
@@ -316,6 +338,27 @@ int main(int argc, char* argv[])
     if (const auto checked = check_display(opts->display, scene_display, opts->fp64); !checked)
     {
         std::println("Error: {}", checked.error());
+        return 1;
+    }
+    // OptiX, only for --optix: nothing of it starts otherwise, so every other run is as before. It runs on the CUDA
+    // device query_device() starts, so it starts after that, below; a build without OptiX's headers refuses --optix
+    // here instead, before CUDA starts (start_optix() then says why, and starts nothing). The runtime lives until main
+    // returns, after every session that used it (never a static: CUDA's own exit comes first).
+    std::shared_ptr<gpu::optix_runtime> optix;
+    const auto open_optix = [&optix] {
+        try
+        {
+            optix = gpu::start_optix();
+            return true;
+        }
+        catch (const std::exception& error)
+        {
+            std::println("Error: --optix: {}", error.what()); // why: no headers, the driver, OptiX's version
+            return false;
+        }
+    };
+    if (opts->optix && !gpu::optix_built() && !open_optix())
+    {
         return 1;
     }
     const gpu::display_options display = effective_display(opts->display, scene_display);
@@ -344,6 +387,10 @@ int main(int argc, char* argv[])
                      device.name, device.multiprocessors, device.compute_capability_major,
                      device.compute_capability_minor, device.memory_gib, cuda_version(device.runtime_version),
                      cuda_version(device.driver_version), opts->fp64 ? "float64" : "float32");
+        if (opts->optix && !open_optix())
+        {
+            return 1;
+        }
         std::println("Rendering {}×{}, rays per pixel: {} ({}{}×{} strata)", width, height, rays_per_pixel,
                      opts->strata ? "rounds of " : "", frame.sqrt_spp, frame.sqrt_spp);
 
@@ -368,7 +415,9 @@ int main(int argc, char* argv[])
             .quality_kernel = opts->quality_kernel,
             .launch_seconds = opts->launch_ms / 1000.0,
             .passes = rays_per_pixel,
-            .display = display};
+            .display = display,
+            .optix_tracer = opts->optix,
+            .optix = optix};
         result = gpu::render(built->desc, gpu_options);
     }
     catch (const std::exception& error)
@@ -382,14 +431,26 @@ int main(int argc, char* argv[])
     // Both times come from the renderer: the whole render() call (the BVH, copying the scene to the GPU and the image
     // back, all the passes), and the passes alone, timed on the GPU
     std::println("Render time: {:.2f} s (GPU passes: {:.2f} s)", result.seconds, result.kernel_seconds);
-    // Which of the three kernels rendered (see the kernels in renderer.cu), and what decides how many of its threads
-    // the GPU keeps in flight: the registers a thread takes (see blocks_per_multiprocessor)
+    // Which kernel rendered (see the kernels in renderer.cu), and what decides how many of its threads the GPU keeps in
+    // flight: the registers a thread takes (see blocks_per_multiprocessor)
     const gpu::kernel_info& kernel = result.kernel;
-    std::println("Kernel: {}, {} registers and {} bytes of local memory per thread, {} blocks of {} threads per "
-                 "multiprocessor ({} of its {} threads)",
-                 kernel.name, kernel.registers, kernel.local_bytes, kernel.blocks_per_multiprocessor,
-                 kernel.threads_per_block, kernel.blocks_per_multiprocessor * kernel.threads_per_block,
-                 kernel.max_threads_per_multiprocessor);
+    if (!kernel.programs.empty())
+    {
+        // OptiX's programs: the graphics driver compiles them, and reports no registers or occupancy. The first 8 hex
+        // digits of their PTX's SHA-256 name the programs that rendered, and the continuation stack is what replaced
+        // the BVH's stack in each thread's memory.
+        std::println("Kernel: {}, programs {} compiled by the graphics driver, {} bytes of continuation stack per "
+                     "thread",
+                     kernel.name, kernel.programs, kernel.local_bytes);
+    }
+    else
+    {
+        std::println("Kernel: {}, {} registers and {} bytes of local memory per thread, {} blocks of {} threads per "
+                     "multiprocessor ({} of its {} threads)",
+                     kernel.name, kernel.registers, kernel.local_bytes, kernel.blocks_per_multiprocessor,
+                     kernel.threads_per_block, kernel.blocks_per_multiprocessor * kernel.threads_per_block,
+                     kernel.max_threads_per_multiprocessor);
+    }
     // A ray traced is a search for the closest hit, counted as on the CPU, so per sample it is the average number of
     // rays in a path: the camera ray and its bounces. The speed is that of the whole call, as the CPU's.
     const auto rays = static_cast<double>(result.rays);
