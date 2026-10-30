@@ -198,5 +198,6 @@ else()
     target_sources(GpuTests PRIVATE tests/optix_check_absent.cpp) # an empty check module: the OptiX suites SKIP
 endif()
 target_link_libraries(gpu_scene PUBLIC gpu_optix)
+target_sources(GpuTests PRIVATE tests/scene_services.cpp) # the scenes as gpu_scene builds them, for the OptiX suites
 # The denoiser's CUDA kernels (both builds): new translation units of the renderer, its existing ones untouched
 target_sources(gpu_renderer PRIVATE src/gpu/guides.cu src/gpu/denoise.cu)

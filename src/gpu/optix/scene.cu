@@ -173,12 +173,135 @@ private:
 // The books' AABBs from bvh.cuh's host boxes, placed at each primitive's global id (sphere_ids, quad_ids), their GAS,
 // the root (the books' GAS, or the IAS over it and the meshes' instances), and quality_view_of(quality, base)
 // lengthened by the meshes: then a scene_in_optix of them.
-std::unique_ptr<optix_scene> upload_scene(optix_core::core& /*core*/, const scene_desc& /*scene*/,
-                                          const scene_view<float>& /*base*/, const quality_scene& /*quality*/,
-                                          std::span<const int> /*sphere_ids*/, std::span<const int> /*quad_ids*/,
-                                          const optix_upload_options& /*options*/)
+namespace
 {
-    throw std::logic_error("optix_runtime::upload comes in Step 88");
+// A primitive's kind is its sbtIndexOffset in the books' GAS (accel.cpp): which of the books' three intersection
+// programs tests it, in runtime.cpp's order of the hit groups
+static_assert(static_cast<int>(primitive_kind::sphere) == 0 && static_cast<int>(primitive_kind::moving_sphere) == 1 &&
+              static_cast<int>(primitive_kind::quad) == 2);
+
+// A box of the BVH's builder (in double) rounded outward to float, as the builder rounds its nodes' boxes (round_down,
+// round_up in bvh.cuh): the nearest float to a corner may lie inside the primitive, and a ray grazing it there would
+// miss the box and with it the primitive
+optix_core::aabb rounded_outward(const build_box& box)
+{
+    return {.lo = {round_down<float>(box.min[0]), round_down<float>(box.min[1]), round_down<float>(box.min[2])},
+            .hi = {round_up<float>(box.max[0]), round_up<float>(box.max[1]), round_up<float>(box.max[2])}};
+}
+
+// The books' primitives in global-id order (bvh.cuh: the spheres that stand still, the moving ones, the quads): each
+// one's box, and its kind as a byte, the build's sbtIndexOffset
+struct books_boxes
+{
+    std::vector<optix_core::aabb> boxes;
+    std::vector<std::uint8_t> kinds;
+};
+
+// Each primitive's box is the one the BVH's builder gives it in its leaf (sphere_box, sweep_box, quad_box), around the
+// primitive the GPU tests: a sphere's center and radius rounded to float first, as add_sphere and add_moving_sphere
+// convert them, and for a moving sphere its whole sweep, the end computed in float as the GPU computes its center. Each
+// goes to its global id through the BVH's own ids, and its kind is that id's range: the range also tells which of the
+// tree's arrays the intersection program reads the primitive from.
+books_boxes boxes_of(const scene_desc& scene, const bvh_view<float>& tree, std::span<const int> sphere_ids,
+                     std::span<const int> quad_ids)
+{
+    const std::size_t count = scene.spheres.size() + scene.quads.size();
+    if (sphere_ids.size() != scene.spheres.size() || quad_ids.size() != scene.quads.size() ||
+        static_cast<std::size_t>(tree.quad_base) != scene.spheres.size())
+    {
+        throw std::logic_error("optix_runtime::upload takes the BVH's ids of the scene's spheres and quads");
+    }
+    books_boxes books{.boxes = std::vector<optix_core::aabb>(count), .kinds = std::vector<std::uint8_t>(count)};
+    const auto place = [&books, count](int id, const build_box& box, primitive_kind kind) {
+        if (id < 0 || static_cast<std::size_t>(id) >= count)
+        {
+            throw std::logic_error("optix_runtime::upload: a BVH id outside the scene's primitives");
+        }
+        books.boxes[static_cast<std::size_t>(id)] = rounded_outward(box);
+        books.kinds[static_cast<std::size_t>(id)] = static_cast<std::uint8_t>(kind);
+    };
+    for (std::size_t i = 0; i < scene.spheres.size(); ++i)
+    {
+        const sphere_desc& s = scene.spheres[i];
+        const int id = sphere_ids[i];
+        const point3<float> center = to_real<float>(s.center);
+        const auto radius = static_cast<float>(s.radius);
+        if (id < tree.moving_base)
+        {
+            place(id, sphere_box(center, center, radius), primitive_kind::sphere);
+        }
+        else
+        {
+            const moving_sphere<float> moving{
+                .center = center, .radius = radius, .displacement = to_real<float>(s.displacement), .unused = 0};
+            place(id, sweep_box(moving), primitive_kind::moving_sphere);
+        }
+    }
+    for (std::size_t i = 0; i < scene.quads.size(); ++i)
+    {
+        place(quad_ids[i], quad_box(scene.quads[i]), primitive_kind::quad);
+    }
+    return books;
+}
+
+// The books' GAS (accel.cpp), or none (handle 0) in a scene without books' primitives. The boxes and kinds are freed
+// once it is built: a custom-primitive GAS keeps no reference to them.
+optix_core::accel books_gas(optix_core::core& core, const books_boxes& books)
+{
+    if (books.boxes.empty())
+    {
+        return {};
+    }
+    const device_array<optix_core::aabb> boxes(books.boxes); // cudaMalloc: OPTIX_AABB_BUFFER_BYTE_ALIGNMENT and more
+    const device_array<std::uint8_t> kinds(books.kinds);
+    return optix_core::build_custom(core, boxes.data(), kinds.data(), static_cast<unsigned int>(books.boxes.size()));
+}
+}
+
+std::unique_ptr<optix_scene> upload_scene(optix_core::core& core, const scene_desc& scene,
+                                          const scene_view<float>& base, const quality_scene& quality,
+                                          std::span<const int> sphere_ids, std::span<const int> quad_ids,
+                                          const optix_upload_options& options)
+{
+    std::vector<optix_core::accel> accels; // every acceleration structure the root reaches, kept by the scene
+    const optix_core::accel books = books_gas(core, boxes_of(scene, base.tree, sphere_ids, quad_ids));
+    if (books.handle != 0)
+    {
+        accels.push_back(books);
+    }
+
+    // The meshes, track B's holder (empty in a scene without them): their GASes, and the integrator's view lengthened
+    // for them. A scene without meshes gets the quality kernel's view unchanged.
+    const quality_view view = quality_view_of(quality, base);
+    auto meshes = std::make_unique<mesh_scene>(core, scene, view);
+    const quality_view lengthened = meshes->lengthened(view);
+
+    // The root: the books' GAS alone in a scene without meshes (the books' scenes see no instance); else an IAS of
+    // instance 0, the books' GAS under the identity (instanceId 0, sbtOffset 0: the books' three records), and mesh
+    // instance k as instance k + 1 (sbtOffset 3: the triangles' hit group). GpuTests may ask for the IAS in a books'
+    // scene (force_instance_root). accel.cpp's IAS build gives every instance visibilityMask 0xFF and DISABLE_ANYHIT.
+    std::uint64_t root = books.handle;
+    if (!meshes->empty() || options.force_instance_root)
+    {
+        std::vector<optix_core::instance> instances;
+        if (books.handle != 0)
+        {
+            instances.push_back({.transform = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0},
+                                 .id = 0,
+                                 .sbt_offset = 0,
+                                 .handle = books.handle});
+        }
+        const std::span<const optix_core::instance> placed = meshes->instances(); // ids k + 1, sbt_offset 3
+        instances.insert(instances.end(), placed.begin(), placed.end());
+        root = 0; // nothing at all: closest() is a miss without tracing
+        if (!instances.empty())
+        {
+            accels.push_back(optix_core::build_instances(core, instances));
+            root = accels.back().handle;
+        }
+    }
+    // (The lengthened view is taken before the holder moves: arguments are initialized in no fixed order.)
+    return std::make_unique<scene_in_optix>(core, lengthened, root, std::move(accels), std::move(meshes), options);
 }
 // --- end of the upload region ------------------------------------------------------------------------------------
 }
