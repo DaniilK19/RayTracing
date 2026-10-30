@@ -1,7 +1,13 @@
 # Line ends: git's own guess for text, but bash scripts keep LF in every checkout (bash reads a CR at a line's end as
-# part of the command), and images, the GIF and the HDR environment maps are binary: never converted, never diffed.
+# part of the command), and images, the GIF, the HDR environment maps and glTF's binary files (a .glb model, a .bin
+# buffer beside a .gltf) are binary: never converted, never diffed. A .gltf (glTF's JSON) is kept byte for byte as
+# published, its line ends never converted (it still diffs as text), so the SHA-256 pins of the committed models hold
+# in every checkout, whatever its core.autocrlf.
 *.sh text eol=lf
 *.png binary
 *.jpg binary
 *.gif binary
 *.hdr binary
+*.glb binary
+*.bin binary
+*.gltf -text

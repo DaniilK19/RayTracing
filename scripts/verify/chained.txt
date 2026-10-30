@@ -1,0 +1,30 @@
+# The host gate's chained sections (scripts\verify\hostgate.ps1, part 6): output that has no fixed reference, so each
+# step's run is compared with the newest earlier step's accepted lines. One section a line, five fields between |:
+#   name|kind|file|stamped|baseline
+#   name      the section's files, in hostgate's -State (out\m5): chained\stepNN\<name>.txt, the lines Step NN
+#             accepted; chained\NN.<name>.pending.txt, a run's lines waiting for review; baseline\chained-<name>.txt,
+#             the reference exes' lines
+#   kind      V: a RayTracingViewer script, rendered --headless --script FILE --frames DIR --record REC. Kept: what the
+#                window prints (times masked), every frame's SHA-256 and the record's.
+#             G: a list of RayTracingGPU commands, one command's arguments a line ("quoted parts" stay together; a
+#                line starting with # is a comment), each rendered with -o NAME.pfm -o NAME.png into a folder of its
+#                own (NAME: c01, c02...). Kept: the command, its Scene, View, Kernel, Mean radiance, Rays traced,
+#                Shadow rays and Denoised lines (times and speeds masked), and the SHA-256 of every file it wrote, the
+#                -denoised ones included.
+#   file      the script or the list, from the repository's root
+#   stamped   no: the bytes must stay the same at every step (the CUDA kernels' machine code is in the exes).
+#             yes: OptiX's output, whose programs the graphics driver compiles: the kept lines start with "stamp:
+#             <driver>|<programs>" (the driver's version, the OptiX programs' SHA-256 or none). Under the accepted
+#             lines' stamp the section compares as an unstamped one; under another, a run says RE-VERIFY, neither a
+#             pass nor a failure, and its lines wait for review and -Accept. A stamp that can't be read (nvidia-smi
+#             failing, kept lines without their stamp line) stops the gate with an error, never a stamp of its own
+#   baseline  reference: before any step has accepted lines, a run is compared with the reference exes' (made once);
+#             none: the first run waits for review and -Accept (for options the reference exes don't have)
+# A step that adds a section adds its line here; hostgate.ps1 stays as it is. A section an earlier step accepted lines
+# of (chained\stepK\<name>.txt) keeps its line: when chained.txt no longer lists it, hostgate fails before it renders
+# anything, since a line lost in a merge would drop its gate silently. A section dropped on purpose is retired with a
+# line of two fields instead, kept for good (the earlier steps' files stay):
+#   retired|name
+#
+# The window's tone maps (from Step 75): the books' bytes, agx, neutral and none, a pass in progress, a scene change
+regress-tone|V|tests/regress-tone.txt|no|reference

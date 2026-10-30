@@ -69,35 +69,35 @@ V --headless --input input.txt
 V --script script.txt --input input.txt
 
 # Options of the later steps: unknown so far, then each step's own errors. They are tiny renders (-w 16 -s 1, the
-# window --headless, RayTracingGPU writing into out\m4\runs), so that a step that failed to refuse one would cost
+# window --headless, RayTracingGPU writing into out\m5\runs), so that a step that failed to refuse one would cost
 # nothing, open no window and write nothing into the project.
-G -p nee -w 16 -s 1 -o out\m4\runs\cli-case.png
-G -p mis -w 16 -s 1 -o out\m4\runs\cli-case.png
-G cornell -p mis --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
-G final -p mis -w 16 -s 1 -o out\m4\runs\cli-case.png
-G smoke -p nee -w 16 -s 1 -o out\m4\runs\cli-case.png
-G cornell -p nee --all-books-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
-G ggx-furnace --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
-G ggx-furnace -p mixture -w 16 -s 1 -o out\m4\runs\cli-case.png
-G ggx-furnace --all-books-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
-G gloss-furnace --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
-G cornell-ggx --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
-G veach -p mixture -w 16 -s 1 -o out\m4\runs\cli-case.png
-G cornell-ggx --all-books-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
-G studio --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
-G studio -p mixture -w 16 -s 1 -o out\m4\runs\cli-case.png
-G --quality-kernel --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
-G --quality-kernel -p mixture -w 16 -s 1 -o out\m4\runs\cli-case.png
-G --quality-kernel --all-books-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
-G cornell --quality-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
-G weekend -p mixture --quality-kernel -w 16 -s 1 -o out\m4\runs\cli-case.png
-G --tonemap bogus -w 16 -s 1 -o out\m4\runs\cli-case.png
-G --tonemap agx --fp64 -w 16 -s 1 -o out\m4\runs\cli-case.png
-G --exposure 1 -w 16 -s 1 -o out\m4\runs\cli-case.png
-G --exposure abc -w 16 -s 1 -o out\m4\runs\cli-case.png
-G --tonemap agx --exposure nan -w 16 -s 1 -o out\m4\runs\cli-case.png
-G --tonemap agx --exposure 25 -w 16 -s 1 -o out\m4\runs\cli-case.png
-G --tonemap neutral --exposure -24.5 -w 16 -s 1 -o out\m4\runs\cli-case.png
+G -p nee -w 16 -s 1 -o out\m5\runs\cli-case.png
+G -p mis -w 16 -s 1 -o out\m5\runs\cli-case.png
+G cornell -p mis --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G final -p mis -w 16 -s 1 -o out\m5\runs\cli-case.png
+G smoke -p nee -w 16 -s 1 -o out\m5\runs\cli-case.png
+G cornell -p nee --all-books-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
+G ggx-furnace --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G ggx-furnace -p mixture -w 16 -s 1 -o out\m5\runs\cli-case.png
+G ggx-furnace --all-books-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
+G gloss-furnace --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G cornell-ggx --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G veach -p mixture -w 16 -s 1 -o out\m5\runs\cli-case.png
+G cornell-ggx --all-books-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
+G studio --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G studio -p mixture -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --quality-kernel --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --quality-kernel -p mixture -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --quality-kernel --all-books-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
+G cornell --quality-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
+G weekend -p mixture --quality-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --tonemap bogus -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --tonemap agx --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --exposure 1 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --exposure abc -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --tonemap agx --exposure nan -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --tonemap agx --exposure 25 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --tonemap neutral --exposure -24.5 -w 16 -s 1 -o out\m5\runs\cli-case.png
 V -p mis --fp64 --headless -w 16 -s 1
 V final -p mis --headless -w 16 -s 1
 V cornell -p mis --fp64 --headless -w 16 -s 1
@@ -119,7 +119,7 @@ V --headless --script scripts\verify\cli-scripts\no-last-frame.txt
 V --headless --script scripts\verify\cli-scripts\later-sampling.txt
 V --headless --script scripts\verify\cli-scripts\later-kernel.txt
 V --headless --script scripts\verify\cli-scripts\no-such-file.txt
-V --headless --script scripts\verify\cli-scripts\gpu-scene.txt -o out\m4\runs\cli-case.pfm
+V --headless --script scripts\verify\cli-scripts\gpu-scene.txt -o out\m5\runs\cli-case.pfm
 V --headless --script scripts\verify\cli-scripts\quality-mixture.txt
 V --headless --script scripts\verify\cli-scripts\unknown-tonemap.txt
 V --headless --script scripts\verify\cli-scripts\bad-exposure.txt

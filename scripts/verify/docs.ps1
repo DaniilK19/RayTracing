@@ -11,7 +11,7 @@
 #      the page as it was at -Baseline (the tag gpu-3: the last milestone that measured speed), with its words around
 #      it, so no new one comes in unnoticed;
 #   4. commands: the first RayTracingGPU command of each page that has one (with a scene first) runs as written, with
-#      -w 64 -s 16 appended (the last of a repeated option counts), its PNG written into out\m4\runs\stepNN\docs\
+#      -w 64 -s 16 appended (the last of a repeated option counts), its PNG written into out\m5\runs\stepNN\docs\
 #      instead of the page's -o. Renders go through gpu.ps1 (the queue and the GPU log); -NoRender skips them.
 #   powershell -ExecutionPolicy Bypass -File scripts\verify\docs.ps1 -Step 85 [-NoRender] [-Baseline gpu-3]
 # Exit code 0 when every check passes.
@@ -140,7 +140,7 @@ Write-Output "speed: $speedCount figures, each in its page at $Baseline"
 if (-not $NoRender) {
     $gpuScript = Join-Path $PSScriptRoot "gpu.ps1"
     $gpu = Join-Path $project "$Build\RayTracingGPU.exe"
-    $work = Join-Path $project ("out\m4\runs\step{0}\docs" -f $Step)
+    $work = Join-Path $project ("out\m5\runs\step{0}\docs" -f $Step)
     New-Item -ItemType Directory -Force $work | Out-Null
     foreach ($page in $pages) {
         # The first command: in a code block or inline code, from the program's name (with or without its folder) on,

@@ -9,17 +9,29 @@
 # The re-run rule, fixed before any result: one failing test (or the rule) renders both strategies again with seeds
 # +10 and repeats all four comparisons and the rule, plus --tile 64 on the pair that failed; it passes if all of that
 # passes. Two failures in the first run, or any in the re-run, fail the protocol.
-#   compare.ps1 -Step 73 -Scene cornell -A material@books:ref -B material@quality:3,4 [-Spp 1024] [-ControlOnly]
-# A side is STRATEGY[@KERNEL][:SEEDS]: KERNEL books (the default) or quality (--quality-kernel); SEEDS two numbers, or
-# ref for the references rendered by Step 70's exes, out\m4\ref\<scene>-<strategy>-s1.pfm and -s2.pfm (seeds 1 and 2,
-# 1024 samples). Renders go through gpu.ps1 into out\m4\runs\stepNN\. Exit code 0 pass, 1 fail, 2 void or an error.
+#   compare.ps1 -Step 89 -Scene cornell -A mis@quality:ref -B mis@optix:3,4 [-SceneB NAME] [-Spp 1024] [-ControlOnly]
+#               [-State out\m5]
+# A side is STRATEGY[@KERNEL][:SEEDS]: KERNEL books (the default), quality (--quality-kernel) or optix (--optix, from
+# Step 89); SEEDS two numbers, or ref for the references rendered once by Step 85's exes (references.ps1 -List m5),
+# State\ref\<scene>-<strategy>-s1.pfm and -s2.pfm: seeds 1 and 2, 1024 samples, --quality-kernel, so a ref side is
+# always STRATEGY@quality:ref at -Spp 1024. A reference that isn't there is rendered by the current exe with
+# --quality-kernel and the same seed, with a note: the SASS gate proves that kernel the same machine code as Step 85's,
+# so its bytes are the reference's. The re-run renders a ref side fresh the same way.
+# -SceneB NAME: side B renders the scene NAME (same size, samples and seeds rule), side A renders -Scene: the triangle
+# Cornell box against the quads', a model's material against its reference scene. B's files carry B's scene in their
+# names. Renders go through gpu.ps1 into State\runs\stepNN\ (State: out\m5, the milestone's machine state); -Build and
+# -State may be relative to the repository or absolute.
+# Exit code 0 pass, 1 fail, 2 void or an error, 4 refused by the queue (gpu.ps1 started no render: the step's GPU
+# budget, a fullscreen application in front, a GPU too hot): nothing compared, so no verdict.
 param(
     [Parameter(Mandatory = $true)][int]$Step,
     [Parameter(Mandatory = $true)][string]$Scene,
     [Parameter(Mandatory = $true)][string]$A,
     [Parameter(Mandatory = $true)][string]$B,
+    [string]$SceneB = "",
     [int]$Spp = 1024,
     [switch]$ControlOnly,
+    [string]$State = "out\m5",
     [string]$Build = "out\build\x64-release"
 )
 $ErrorActionPreference = "Stop"
@@ -27,44 +39,62 @@ $ErrorActionPreference = "Stop"
 $project = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 Set-Location -LiteralPath $project
 $gpuScript = Join-Path $PSScriptRoot "gpu.ps1"
-$gpu = Join-Path $project "$Build\RayTracingGPU.exe"
-$compare = Join-Path $project "$Build\ImageCompare.exe"
-$stats = Join-Path $project "$Build\PfmStats.exe"
-$work = Join-Path $project ("out\m4\runs\step{0}" -f $Step)
-$refs = Join-Path $project "out\m4\ref"
+function Get-FullPath([string]$path) {
+    if ([IO.Path]::IsPathRooted($path)) { return $path }
+    return Join-Path $project $path
+}
+$buildDir = Get-FullPath $Build
+$gpu = Join-Path $buildDir "RayTracingGPU.exe"
+$compare = Join-Path $buildDir "ImageCompare.exe"
+$stats = Join-Path $buildDir "PfmStats.exe"
+$stateDir = Get-FullPath $State
+# A render gpu.ps1 refused to start (its exit code 3 or 4 and its own line): exit code 4, not an error
+$refusal = '^gpu\.ps1: (a fullscreen application is in front|Step \d+ has used|the GPU stayed above)'
+$refused = $false
+$work = Join-Path $stateDir ("runs\step{0}" -f $Step)
+$refs = Join-Path $stateDir "ref"
 New-Item -ItemType Directory -Force $work | Out-Null
 $size = @("-w", "480", "--height", "270")
+$kernelOption = @{ books = @(); quality = @("--quality-kernel"); optix = @("--optix") }
 
-function Read-Side([string]$text) {
-    if ($text -cnotmatch '^([a-z]+)(@(books|quality))?(:(ref|\d+,\d+))?$') {
-        throw "compare.ps1: a side is STRATEGY[@KERNEL][:SEEDS], not '$text'"
+function Read-Side([string]$text, [string]$scene) {
+    if ($text -cnotmatch '^([a-z]+)(@(books|quality|optix))?(:(ref|\d+,\d+))?$') {
+        throw "compare.ps1: a side is STRATEGY[@books|quality|optix][:SEEDS|:ref], not '$text'"
     }
-    $side = @{ strategy = $Matches[1]; kernel = if ($Matches[3]) { $Matches[3] } else { "books" } }
+    $side = @{ strategy = $Matches[1]; kernel = if ($Matches[3]) { $Matches[3] } else { "books" }; scene = $scene }
     $seeds = if ($Matches[5]) { $Matches[5] } else { "ref" }
     $side.ref = $seeds -eq "ref"
-    if ($side.ref -and ($side.kernel -ne "books" -or $Spp -ne 1024)) {
-        throw "compare.ps1: the references are the books' kernels at 1024 samples, not '$text' at $Spp"
+    if ($side.ref -and ($side.kernel -ne "quality" -or $Spp -ne 1024)) {
+        throw ("compare.ps1: the references are the quality kernel's at 1024 samples (STRATEGY@quality:ref), not " +
+            "'$text' at $Spp")
     }
     $side.seeds = if ($side.ref) { @(1, 2) } else { @($seeds.Split(",") | ForEach-Object { [int]$_ }) }
-    $side.name = "{0}-{1}{2}" -f $Scene, $side.strategy, $(if ($side.kernel -eq "quality") { "-quality" } else { "" })
+    $side.name = "{0}-{1}{2}" -f $scene, $side.strategy, $(if ($side.kernel -ne "books") { "-" + $side.kernel }
+        else { "" })
     return $side
 }
 
-# The PFM of one side and seed: a reference, or a render through the queue
+# The PFM of one side and seed: a reference, or a render through the queue (a missing reference too, with a note)
 function Get-Render($side, [int]$seed, [bool]$fresh) {
     if ($side.ref -and -not $fresh) {
-        $path = Join-Path $refs ("{0}-{1}-s{2}.pfm" -f $Scene, $side.strategy, $seed)
-        if (-not (Test-Path -LiteralPath $path)) { throw "compare.ps1: no reference $path" }
-        return $path
+        $path = Join-Path $refs ("{0}-{1}-s{2}.pfm" -f $side.scene, $side.strategy, $seed)
+        if (Test-Path -LiteralPath $path) { return $path }
+        Write-Host (("  note: no reference {0}: rendered by the current exe with --quality-kernel, seed {1} (the " +
+            "SASS gate proves that kernel Step 85's)") -f $path, $seed)
     }
     $path = Join-Path $work ("{0}-{1}spp-s{2}.pfm" -f $side.name, $Spp, $seed)
-    $arguments = @($Scene) + $size + @("-s", "$Spp", "--seed", "$seed", "-p", $side.strategy, "-o", $path)
-    if ($side.kernel -eq "quality") { $arguments += "--quality-kernel" }
+    $arguments = @($side.scene) + $size + @("-s", "$Spp", "--seed", "$seed", "-p", $side.strategy, "-o", $path)
+    $arguments += $kernelOption[$side.kernel]
     $all = @("-Step", "$Step", "-Label", ("{0} s{1}" -f $side.name, $seed), "--", $gpu) + $arguments
     $lines = @(& $gpuScript @all)
-    if ($LASTEXITCODE -ne 0) {
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
         $lines | ForEach-Object { Write-Host "  $_" }
-        throw "compare.ps1: the render of $($side.name), seed $seed, failed (exit code $LASTEXITCODE)"
+        if (($code -eq 3 -or $code -eq 4) -and @($lines | Where-Object { $_ -match $refusal }).Count -gt 0) {
+            $script:refused = $true
+            throw "gpu.ps1 didn't start the render of $($side.name), seed $seed (exit code $code)"
+        }
+        throw "compare.ps1: the render of $($side.name), seed $seed, failed (exit code $code)"
     }
     $lines | Where-Object { $_ -match '^(Kernel|Rays traced|Shadow rays|Mean radiance)' } |
         ForEach-Object { Write-Host ("  {0} s{1}: {2}" -f $side.name, $seed, $_) }
@@ -116,11 +146,12 @@ function Invoke-Round($sideA, $sideB, [int]$offset, [bool]$fresh) {
         pairs = @(@($a1, $b1), @($a2, $b2)) }
 }
 
-# An error (a bad side, a missing reference, a render that fails) is exit code 2, never a verdict
+# An error (a bad side, a render that fails) is exit code 2, never a verdict; a render the queue refused is 4
 try {
-    $sideA = Read-Side $A
-    $sideB = Read-Side $B
-    Write-Output ("compare {0}: A {1}, B {2}, {3} samples, 480x270" -f $Scene, $A, $B, $Spp)
+    $sideA = Read-Side $A $Scene
+    $sideB = Read-Side $B $(if ($SceneB) { $SceneB } else { $Scene })
+    $scenes = if ($SceneB) { "$Scene (A) and $SceneB (B)" } else { $Scene }
+    Write-Output ("compare {0}: A {1}, B {2}, {3} samples, 480x270" -f $scenes, $A, $B, $Spp)
     $first = Invoke-Round $sideA $sideB 0 $false
     if ($first.failed -lt 0) { Write-Output "Protocol VOID: a control failed"; exit 2 }
     if ($first.failed -eq 0) { Write-Output "Protocol: PASS"; exit 0 }
@@ -139,6 +170,10 @@ try {
     exit 1
 }
 catch {
+    if ($refused) {
+        Write-Output "Refused by the queue: nothing compared ($($_.Exception.Message))"
+        exit 4
+    }
     Write-Output "Error: $($_.Exception.Message)"
     exit 2
 }

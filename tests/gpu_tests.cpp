@@ -1,10 +1,21 @@
 // GpuTests: numeric tests of the GPU renderer's device functions, on the GPU: the samplers draw what their densities
 // say, the densities integrate to 1, the estimators converge to known values. See gpu_test.h for the checks and the
 // report; the suites are the files tests/*_tests.cu.
-//   GpuTests [all | SUITE...] [--quick] [--list] [--write FILE] [--check FILE]
-// Exit code: 0 every check passes, 1 a check fails, 2 an error (an unknown suite or option, a CUDA error), 77 no CUDA
-// device or no driver (as ctest's SKIP_RETURN_CODE: the tests are skipped on a computer without an NVIDIA GPU). A
-// driver or runtime that is there but fails is an error, 2: a broken installation must not pass for a skipped test.
+//   GpuTests [all | SUITE...] [--quick] [--list] [--require-optix] [--exclude S1,S2,...] [--write FILE]
+//            [--check FILE]
+// --require-optix makes an OptiX check that can't run here (no OptiX in this build or in the driver) a failure instead
+// of a SKIP: every gate passes it, since a gate must not pass on checks that never ran. --exclude runs every suite but
+// the ones named (with all, or with no suite named; one comma-separated argument, so that suite names stay the only
+// positional ones): the gate of every step leaves out the long statistical OptiX suites, which run in full in the steps
+// that change what they test. A name excluded that this build doesn't register, but that GPU_TEST could give (lowercase
+// letters, digits and '-', a letter first), is no error: the "Left out" line says it as "not in this build", so that
+// one gate command serves the steps before its suites arrive too. The last line is the verdict and, when there are any,
+// the number of checks skipped (SKIP with a reason; the verdicts --quick skips are said on the first line instead).
+// Exit code: 0 every check passes (a skipped check is no failure), 1 a check fails, 2 an error (an unknown suite or
+// option, a CUDA error, --exclude with named suites, leaving none, or naming what can't be a suite: an empty name, all,
+// an option, another character), 77 no CUDA device or no driver (as ctest's SKIP_RETURN_CODE: the tests are skipped on
+// a computer without an NVIDIA GPU). A driver or runtime that is there but fails is an error, 2: a broken installation
+// must not pass for a skipped test.
 
 // The headers before `import std;` (see renderer.h)
 #include <cuda_runtime_api.h>
@@ -323,21 +334,50 @@ void context::info(std::string_view name, std::string_view text)
     infos_.emplace_back(results_.size(), std::format("{}.{}: {}, INFO", suite_, name, text));
 }
 
+void context::skip(std::string_view name, std::string_view reason)
+{
+    results_.push_back({.name = std::string(name), .kind = check_kind::skip, .reason = std::string(reason)});
+}
+
+void context::fail(std::string_view name, std::string_view reason)
+{
+    results_.push_back({.name = std::string(name), .kind = check_kind::fail, .reason = std::string(reason)});
+}
+
+bool context::require_optix() const { return optix_required_; }
+
+void context::exclude_seconds(double seconds)
+{
+    // A fixture's own measurement: a negative, NaN or infinite one is its bug, and must not loosen the budget unseen
+    if (!std::isfinite(seconds) || seconds < 0)
+    {
+        throw std::invalid_argument(std::format("exclude_seconds({}): not a duration", seconds));
+    }
+    excluded_seconds_ += seconds;
+}
+
 void context::begin_suite(std::string_view suite)
 {
     suite_ = suite;
     results_.clear();
     infos_.clear();
+    excluded_seconds_ = 0;
     reset_device_peak();
     start_ns_ = now_ns();
 }
 
 int context::end_suite()
 {
-    // The suite's budget, as two checks of its own
+    // The suite's budget, as two checks of its own. The seconds excluded are left out of the second (never below 0:
+    // excluding more than the suite took is a fixture's mistake, which the info line's two numbers show)
     const double seconds = static_cast<double>(now_ns() - start_ns_) * 1e-9;
     count("budget-gpu-memory-bytes", device_peak_bytes(), suite_bytes_limit, suite_bytes_limit);
-    exact("budget-seconds", seconds, 0, suite_seconds_limit);
+    if (excluded_seconds_ > 0)
+    {
+        info("budget-seconds-excluded",
+             std::format("{:.3f} s of the suite's {:.3f} s not counted by budget-seconds", excluded_seconds_, seconds));
+    }
+    exact("budget-seconds", std::max(0.0, seconds - excluded_seconds_), 0, suite_seconds_limit);
 
     const auto chi2_tests = std::ranges::count(results_, check_kind::chi2, &check_result::kind);
     const double threshold = sidak_threshold(0.01, static_cast<int>(chi2_tests));
@@ -350,6 +390,15 @@ int context::end_suite()
             std::println("{}", infos_[next_info].second);
         }
         const check_result& r = results_[i];
+        if (r.kind == check_kind::skip || r.kind == check_kind::fail)
+        {
+            // No number to show: the reason stands in the numbers' place
+            const bool not_run = r.kind == check_kind::skip;
+            std::println("{}.{}: {} ({})", suite_, r.name, not_run ? "SKIP" : "FAIL", r.reason);
+            skipped_ += not_run ? 1 : 0;
+            failures += not_run ? 0 : 1;
+            continue;
+        }
         const bool statistical =
             r.kind == check_kind::mean || r.kind == check_kind::chi2 || r.kind == check_kind::must_reject;
         bool pass = false;
@@ -381,6 +430,9 @@ int context::end_suite()
             detail = std::format("{} of {}, expected at most {}", static_cast<std::int64_t>(r.estimate), r.out_of,
                                  static_cast<std::int64_t>(r.limit));
             break;
+        case check_kind::skip:
+        case check_kind::fail:
+            break; // printed above, with their reasons
         }
         const bool skipped = statistical && quick_;
         std::println("{}.{}: {}, {}", suite_, r.name, detail, skipped ? "SKIP (quick)" : pass ? "PASS" : "FAIL");
@@ -401,7 +453,9 @@ int main(int argc, char* argv[])
     host::executable_folder = std::filesystem::absolute(argv[0], no_folder).parent_path(); // for find_repo_file
     bool quick = false;
     bool list = false;
+    bool require_optix = false;
     std::vector<std::string> wanted;
+    std::vector<std::string> excluded;                          // --exclude S1,S2,...
     std::vector<std::pair<std::string, std::string>> arguments; // --write FILE, --check FILE
     for (int i = 1; i < argc; ++i)
     {
@@ -414,10 +468,19 @@ int main(int argc, char* argv[])
         {
             list = true;
         }
+        else if (arg == "--require-optix")
+        {
+            require_optix = true;
+        }
         else if (arg == "-h" || arg == "--help")
         {
-            std::println("Usage: GpuTests [all | SUITE...] [--quick] [--list] [--write FILE] [--check FILE]\n"
+            std::println("Usage: GpuTests [all | SUITE...] [--quick] [--list] [--require-optix] [--exclude S1,S2,...] "
+                         "[--write FILE] [--check FILE]\n"
                          "Numeric tests of the GPU renderer's device functions (see tests/gpu_test.h).\n"
+                         "--require-optix fails an OptiX check that can't run here instead of skipping it.\n"
+                         "--exclude runs every suite but the ones named (with all, or with no suite named); a suite\n"
+                         "  name this build doesn't have (lowercase letters, digits, '-') is no error: the\n"
+                         "  \"Left out\" line says it as \"not in this build\".\n"
                          "--write and --check give a suite a file (a table it writes or checks).\n"
                          "Exit code: 0 pass, 1 a check fails, 2 an error, 77 no CUDA device.");
             return 0;
@@ -430,6 +493,18 @@ int main(int argc, char* argv[])
                 return 2;
             }
             arguments.emplace_back(std::string(arg), std::string(argv[++i]));
+        }
+        else if (arg == "--exclude")
+        {
+            if (i + 1 == argc)
+            {
+                std::println("Error: --exclude needs suites, S1,S2,... (GpuTests --list names them)");
+                return 2;
+            }
+            for (const auto name : std::views::split(std::string_view(argv[++i]), ','))
+            {
+                excluded.emplace_back(name.begin(), name.end());
+            }
         }
         else if (arg.starts_with('-'))
         {
@@ -466,12 +541,50 @@ int main(int argc, char* argv[])
             return 2;
         }
     }
-    if (wanted.empty() || std::ranges::contains(wanted, std::string("all")))
+    // The gate's command names suites that arrive in later steps (final.md B, GT lean), so a name this build doesn't
+    // register is said on the "Left out" line, not an error: a misspelled one runs one suite more, never one fewer.
+    // What GPU_TEST can't give is an error: an empty name (a stray comma), an option swallowed as the list ("--exclude
+    // --quick"), all, or another character (the identifier's '_' for the name's '-', a capital letter).
+    const auto suite_like = [](std::string_view name) {
+        const auto letter = [](char c) { return c >= 'a' && c <= 'z'; };
+        return !name.empty() && letter(name.front()) && name != "all" &&
+               std::ranges::all_of(name, [&letter](char c) { return letter(c) || (c >= '0' && c <= '9') || c == '-'; });
+    };
+    std::vector<std::string> not_built; // the names excluded that this build doesn't register, sorted, once each
+    for (const std::string& name : excluded)
+    {
+        if (!suites.contains(name))
+        {
+            if (!suite_like(name))
+            {
+                std::println("Error: no suite '{}' to exclude (GpuTests --list names them)", name);
+                return 2;
+            }
+            not_built.push_back(name);
+        }
+    }
+    std::ranges::sort(not_built);
+    not_built.erase(std::ranges::unique(not_built).begin(), not_built.end());
+    const bool everything = wanted.empty() || std::ranges::contains(wanted, std::string("all"));
+    if (!excluded.empty() && !everything)
+    {
+        std::println("Error: --exclude goes with all (or with no suite named), not with the suites named");
+        return 2;
+    }
+    if (everything)
     {
         wanted.clear();
         for (const auto& [name, tests] : suites)
         {
-            wanted.push_back(name);
+            if (!std::ranges::contains(excluded, name))
+            {
+                wanted.push_back(name);
+            }
+        }
+        if (wanted.empty())
+        {
+            std::println("Error: --exclude leaves no suite to run");
+            return 2;
         }
     }
 
@@ -495,9 +608,21 @@ int main(int argc, char* argv[])
         std::println("Error: CUDA can't start: {}", error.what());
         return 2;
     }
+    if (!excluded.empty())
+    {
+        // In the log, so that a run that left suites out can't pass for one that ran them; the names this build doesn't
+        // register follow: "Left out (--exclude): none; not in this build: denoise, guides"
+        const auto left_out = [&excluded](const std::string& name) { return std::ranges::contains(excluded, name); };
+        const std::string built = suites | std::views::keys | std::views::filter(left_out) |
+                                  std::views::join_with(std::string(", ")) | std::ranges::to<std::string>();
+        const std::string absent =
+            not_built | std::views::join_with(std::string(", ")) | std::ranges::to<std::string>();
+        std::println("Left out (--exclude): {}{}{}", built.empty() ? "none" : built,
+                     absent.empty() ? "" : "; not in this build: ", absent);
+    }
 
     int failures = 0;
-    context ctx(quick);
+    context ctx(quick, require_optix);
     for (auto& [name, value] : arguments)
     {
         ctx.set_argument(std::move(name), std::move(value));
@@ -520,6 +645,9 @@ int main(int argc, char* argv[])
         }
         failures += ctx.end_suite();
     }
-    std::println("{}", failures == 0 ? "GpuTests: PASS" : std::format("GpuTests: FAIL ({} checks)", failures));
+    // The checks that couldn't run are no failure, but they are said: "GpuTests: PASS, 3 checks skipped"
+    const int skipped = ctx.skipped_checks();
+    std::println("{}{}", failures == 0 ? "GpuTests: PASS" : std::format("GpuTests: FAIL ({} checks)", failures),
+                 skipped == 0 ? "" : std::format(", {} {} skipped", skipped, skipped == 1 ? "check" : "checks"));
     return failures == 0 ? 0 : 1;
 }
