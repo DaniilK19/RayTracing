@@ -223,15 +223,21 @@ private:
     // The GGX side entries by the address of the CPU material they complete; empty for the books' scenes
     std::unordered_map<const material*, gpu::microfacet_desc> microfacets_;
     std::size_t microfacets_used_ = 0; // how many of them a material of the world has taken
-    // The mesh materials (mesh_set::materials) that wear a scene material, by the scene material's index: one entry
-    // however many meshes wear it
+    // The mesh materials (mesh_set::materials) that wear a scene material, by the scene material's index, and those of
+    // glTF's placeholders (gltf_material), by its address: one entry however many meshes wear it. The mesh set's
+    // textures by their image's address: each image once.
     std::unordered_map<int, std::uint32_t> mesh_material_slots_;
+    std::unordered_map<const material*, std::uint32_t> gltf_slots_;
+    std::unordered_map<const gpu::mesh_texture_desc*, int> mesh_texture_slots_;
 
     std::expected<void, std::string> add_shape(const hittable& shape, const placement& where);
     std::expected<void, std::string> add_medium(const constant_medium& volume, const placement& where);
     std::expected<int, std::string> material_index(const material* mat);
     std::expected<int, std::string> texture_index(const texture& tex);
     std::expected<std::uint32_t, std::string> mesh_material_slot(const material* mat);
+    std::uint32_t add_gltf_material(const gpu::mesh_material_desc& factors,
+                                    std::span<const std::shared_ptr<const gpu::mesh_texture_desc>> images);
+    int mesh_texture_slot(const std::shared_ptr<const gpu::mesh_texture_desc>& image);
 };
 
 std::expected<void, std::string> scene_translator::add_shape(const hittable& shape, const placement& where)
@@ -477,11 +483,56 @@ std::expected<int, std::string> scene_translator::texture_index(const texture& t
 // every mesh_ref an instance of it. A mesh made in code is one source per function and material: its triangles wear
 // that material, translated as the world's are (material_index, which also brings its GGX side entry), so a mesh and
 // a quad of one material share it. Which materials a triangle may wear is the upload's to check (meshes.cu): lambertian
-// and metal, also completed by a side entry.
+// and metal, also completed by a side entry, and glTF's metallic-roughness materials, which a mesh made in code wears
+// through a placeholder (gltf_material, gpu_scenes:meshes).
 
-// The mesh material (an index into mesh_set::materials) that wears the CPU material `mat`
+// The mesh set's texture of an image, added at its first use
+int scene_translator::mesh_texture_slot(const std::shared_ptr<const gpu::mesh_texture_desc>& image)
+{
+    const auto [found, added] =
+        mesh_texture_slots_.try_emplace(image.get(), static_cast<int>(desc_.meshes.textures.size()));
+    if (added)
+    {
+        desc_.meshes.textures.push_back(image);
+    }
+    return found->second;
+}
+
+// A glTF material of the mesh set: its factors, its texture indices (into `images`, -1 for none) made the set's. An
+// index `images` doesn't have, below -1 too, is the program's mistake (the loader and the scenes make both), an
+// exception.
+std::uint32_t scene_translator::add_gltf_material(const gpu::mesh_material_desc& factors,
+                                                  std::span<const std::shared_ptr<const gpu::mesh_texture_desc>> images)
+{
+    gpu::mesh_material_desc m = factors;
+    m.scene_material = -1;
+    for (int* texture : {&m.base_color_texture, &m.metal_rough_texture})
+    {
+        const auto at = static_cast<std::size_t>(*texture);
+        if (*texture < -1 || *texture >= static_cast<int>(images.size()) || (*texture >= 0 && !images[at]))
+        {
+            throw std::logic_error("a glTF material names an image it doesn't have");
+        }
+        *texture = *texture >= 0 ? mesh_texture_slot(images[at]) : -1;
+    }
+    desc_.meshes.materials.push_back(m);
+    return static_cast<std::uint32_t>(desc_.meshes.materials.size() - 1);
+}
+
+// The mesh material (an index into mesh_set::materials) that wears the CPU material `mat`: glTF's for its
+// placeholder, else the scene material it translates to
 std::expected<std::uint32_t, std::string> scene_translator::mesh_material_slot(const material* mat)
 {
+    if (const auto* gltf = dynamic_cast<const gltf_material*>(mat))
+    {
+        if (const auto found = gltf_slots_.find(mat); found != gltf_slots_.end())
+        {
+            return found->second;
+        }
+        const std::uint32_t slot = add_gltf_material(gltf->factors(), gltf->images());
+        gltf_slots_.emplace(mat, slot);
+        return slot;
+    }
     const auto index = material_index(mat);
     if (!index)
     {

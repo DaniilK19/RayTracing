@@ -5,9 +5,11 @@
 // instance of it. The ground, the Cornell box's lamp and the camera stay the books' own objects.
 //
 // The test scenes check the triangles against what the quads and spheres already render: the Cornell box with its
-// walls and blocks made of triangles, white furnaces of icospheres, and one mesh under four instances against the
-// same four baked into the world on the CPU. An interface partition that exports nothing but to_mesh_desc: the scenes'
-// functions have module linkage, seen by the module's other units and by no importer (as in the other partitions).
+// walls and blocks made of triangles, white furnaces of icospheres, one mesh under four instances against the same
+// four baked into the world on the CPU, and glTF's materials on spheres of triangles against the scene materials
+// their mapping promises. An interface partition that exports only what gpu_scene.ixx's translation needs
+// (to_mesh_desc, gltf_material): the scenes' functions have module linkage, seen by the module's other units and by no
+// importer (as in the other partitions).
 module;
 
 // The renderer's types (a mesh, a GGX side entry), before `import std;` (see gpu_scene.ixx)
@@ -23,6 +25,7 @@ import instance;
 import material;
 import meshes;
 import quad;
+import ray;
 import scenes;
 import vec3;
 
@@ -36,6 +39,34 @@ export gpu::mesh_desc to_mesh_desc(meshes::mesh m)
             .indices = std::move(m.indices),
             .material_of = std::move(m.material_of)};
 }
+
+// glTF's metallic-roughness material for a mesh made in code (pbr-test). The CPU renders no triangle, so this is a CPU
+// material in name only, a carrier as the GGX placeholders are: gpu_scene.ixx's translation knows it by its type and
+// makes it one of the mesh set's glTF materials, its images with it (a mesh_ref names a CPU material, and glTF's
+// factors have no CPU class)
+export class gltf_material final : public material
+{
+public:
+    // factors: scene_material -1, its texture indices into `images`
+    gltf_material(const gpu::mesh_material_desc& factors,
+                  std::vector<std::shared_ptr<const gpu::mesh_texture_desc>> images)
+        : factors_(factors), images_(std::move(images))
+    {
+    }
+
+    // No CPU object wears it
+    std::optional<scatter_record> scatter(const ray& /*r_in*/, const hit_record& /*rec*/) const override
+    {
+        return std::nullopt;
+    }
+
+    const gpu::mesh_material_desc& factors() const { return factors_; }
+    std::span<const std::shared_ptr<const gpu::mesh_texture_desc>> images() const { return images_; }
+
+private:
+    gpu::mesh_material_desc factors_;
+    std::vector<std::shared_ptr<const gpu::mesh_texture_desc>> images_;
+};
 
 // The helpers are this file's own (an unnamed namespace): the other partitions of gpu_scenes have helpers of the
 // same names
@@ -246,7 +277,7 @@ gpu_scene_parts mesh_furnace_smooth()
     return parts;
 }
 
-// --- One mesh, four instances ---------------------------------------------------------------------------------------
+// --- One mesh, four instances ----------------------------------------------------------------------------------------
 
 namespace
 {
@@ -342,5 +373,153 @@ gpu_scene_parts instances_baked()
         mesh_ref{.generated = &baked_ellipsoid<2>, .material = coat},
         mesh_ref{.generated = &baked_ellipsoid<3>, .material = coat},
     };
+    return parts;
+}
+
+// --- glTF's materials, against the scene materials they map to -------------------------------------------------------
+
+namespace
+{
+// The spheres: smooth level-4 icospheres (5120 triangles), one of them with texture coordinates for the textured
+// material: the sphere's longitude and latitude, u = 1/2 + atan2(z, x)/2π and v = acos(y)/π (the triangles along the
+// seam interpolate across it, which a texture of one color can't show)
+gpu::mesh_desc pbr_sphere()
+{
+    return to_mesh_desc(meshes::icosphere(4, true));
+}
+
+gpu::mesh_desc pbr_textured_sphere()
+{
+    meshes::mesh m = meshes::icosphere(4, true);
+    m.uvs.reserve(m.positions.size() / 3 * 2);
+    for (std::size_t i = 0; i < m.positions.size(); i += 3)
+    {
+        const double x = m.positions[i];
+        const double y = m.positions[i + 1];
+        const double z = m.positions[i + 2];
+        m.uvs.push_back(static_cast<float>(0.5 + std::atan2(z, x) / (2 * std::numbers::pi)));
+        m.uvs.push_back(static_cast<float>(std::acos(std::clamp(y, -1.0, 1.0)) / std::numbers::pi));
+    }
+    return to_mesh_desc(std::move(m));
+}
+
+// The four spheres of factors alone, left to right: two metals, gold at r = 0.1 and silver at r = 0.5 (the F0 of
+// gpu_scenes:environments' gold and silver), and two dielectrics, red at r = 0.3 and blue at r = 0.8. Metallic is 1
+// or 0, so the lobe is certain and the two scenes differ only in the random numbers the glTF lobe takes.
+struct pbr_factors
+{
+    color base;
+    double metallic;
+    double roughness;
+};
+constexpr std::array<pbr_factors, 4> pbr_spheres{{{color{1.000, 0.766, 0.336}, 1, 0.1},
+                                                  {color{0.972, 0.960, 0.915}, 1, 0.5},
+                                                  {color{0.7, 0.08, 0.06}, 0, 0.3},
+                                                  {color{0.1, 0.25, 0.7}, 0, 0.8}}};
+// The fifth: a metal of r = 0.3 whose base color is a 2×2 texture of one sRGB color (a copper's), its factor 1
+constexpr std::array<std::uint8_t, 4> pbr_texel{232, 160, 110, 255};
+constexpr double pbr_textured_roughness = 0.3;
+
+// A byte of sRGB as the linear value it encodes: IEC 61966-2-1's curve, the texture hardware's decoding
+double srgb_to_linear(std::uint8_t byte)
+{
+    const double c = byte / 255.0;
+    return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4);
+}
+
+// Sphere i, radius 1, 2.2 apart along x
+matrix pbr_place(std::size_t i)
+{
+    return shift(-4.4 + 2.2 * static_cast<double>(i), 0, 0);
+}
+
+camera_settings pbr_camera()
+{
+    return {.aspect_ratio = 16.0 / 9.0,
+            .image_width = 480,
+            .samples_per_pixel = 1024,
+            .max_depth = 10,
+            .sampling = sampling_strategy::material,
+            .vfov = 30,
+            .lookfrom = {0, 2.5, 13},
+            .lookat = {0, 0, 0}};
+}
+}
+
+// Five spheres of triangles wearing glTF's metallic-roughness materials, in the studio's light: four of factors alone
+// and one whose base color is a texture, read by the texture hardware (sRGB decoded, bilinear). Each hit writes the
+// material glTF's mapping makes of them (triangles.cuh) into its pixel's scratch slot, which the integrator reads as
+// any material. Compared with pbr-reference (compare.ps1): the scratch path must render the table path's image.
+gpu_scene_parts pbr_test()
+{
+    gpu_scene_parts parts{.cpu = scene{hittable_list{}, pbr_camera()}, .environment = studio_light};
+    for (std::size_t i = 0; i < pbr_spheres.size(); ++i)
+    {
+        const pbr_factors& f = pbr_spheres[i];
+        const gpu::mesh_material_desc factors{.scene_material = -1,
+                                              .base_color = {f.base.x, f.base.y, f.base.z},
+                                              .metallic = f.metallic,
+                                              .roughness = f.roughness};
+        parts.meshes.push_back({.generated = &pbr_sphere,
+                                .material = std::make_shared<gltf_material>(
+                                    factors, std::vector<std::shared_ptr<const gpu::mesh_texture_desc>>{}),
+                                .placement = pbr_place(i)});
+    }
+    gpu::mesh_texture_desc image{.width = 2, .height = 2, .srgb = true};
+    for (int texel = 0; texel < 4; ++texel)
+    {
+        image.rgba.insert(image.rgba.end(), pbr_texel.begin(), pbr_texel.end());
+    }
+    const gpu::mesh_material_desc textured{.scene_material = -1,
+                                           .base_color = {1, 1, 1},
+                                           .metallic = 1,
+                                           .roughness = pbr_textured_roughness,
+                                           .base_color_texture = 0};
+    parts.meshes.push_back(
+        {.generated = &pbr_textured_sphere,
+         .material = std::make_shared<gltf_material>(
+             textured, std::vector<std::shared_ptr<const gpu::mesh_texture_desc>>{
+                           std::make_shared<const gpu::mesh_texture_desc>(std::move(image))}),
+         .placement = pbr_place(pbr_spheres.size())});
+    return parts;
+}
+
+// pbr-test's spheres wearing the scene materials glTF's mapping promises, as milestone 4 makes them: a metal of fuzz 0
+// whose albedo is F0, completed by a GGX conductor of the same roughness; a lambertian of the base color under the
+// glossy coat (r at least 0.0317, the coat's floor); the textured metal with the texel's linear color as F0
+gpu_scene_parts pbr_reference()
+{
+    gpu_scene_parts parts{.cpu = scene{hittable_list{}, pbr_camera()}, .environment = studio_light};
+    const auto conductor = [&parts](const color& f0, double roughness) {
+        auto placeholder = std::make_shared<metal>(f0, 0.0);
+        parts.microfacets.emplace_back(
+            placeholder.get(), gpu::microfacet_desc{.kind = gpu::microfacet_kind::conductor, .roughness = roughness});
+        return placeholder;
+    };
+    const auto coat = [&parts](const color& base, double roughness) {
+        auto placeholder = std::make_shared<lambertian>(base);
+        parts.microfacets.emplace_back(placeholder.get(),
+                                       gpu::microfacet_desc{.kind = gpu::microfacet_kind::gloss,
+                                                            .roughness = std::max(roughness, 0.0317)});
+        return placeholder;
+    };
+    for (std::size_t i = 0; i < pbr_spheres.size(); ++i)
+    {
+        const pbr_factors& f = pbr_spheres[i];
+        std::shared_ptr<material> worn;
+        if (f.metallic == 1)
+        {
+            worn = conductor(f.base, f.roughness);
+        }
+        else
+        {
+            worn = coat(f.base, f.roughness);
+        }
+        parts.meshes.push_back({.generated = &pbr_sphere, .material = std::move(worn), .placement = pbr_place(i)});
+    }
+    const color texel{srgb_to_linear(pbr_texel[0]), srgb_to_linear(pbr_texel[1]), srgb_to_linear(pbr_texel[2])};
+    parts.meshes.push_back({.generated = &pbr_textured_sphere,
+                            .material = conductor(texel, pbr_textured_roughness),
+                            .placement = pbr_place(pbr_spheres.size())});
     return parts;
 }

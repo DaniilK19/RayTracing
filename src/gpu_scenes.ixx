@@ -2,7 +2,9 @@
 // and with their names, built by the CPU's own code; then come the GPU's own scenes, which RayTracing doesn't have:
 // scenes.ixx is the frozen CPU renderer's, and its scene_list stays the CPU program's. A scene of the GPU's own is
 // still built from the CPU's classes (spheres, quads, materials, the camera's settings), so the GPU programs translate
-// and show it like any other, and the window's double-click finds its objects.
+// and show it like any other, and the window's double-click finds its spheres and quads in the CPU's world. A scene's
+// triangle meshes aren't in that world (the CPU builds no triangle): only the GPU's pick, session::pick_distance, sees
+// them.
 export module gpu_scenes;
 
 export import :parts;
@@ -87,6 +89,10 @@ consteval auto make_scene_list(std::index_sequence<I...>)
                         "photo studio (OptiX)", scene_role::test, &instances, strategy::mis},
         gpu_scene_entry{"instances-baked", "the same four moved into the world on the CPU: the reference of "
                         "instances (OptiX)", scene_role::test, &instances_baked, strategy::mis},
+        gpu_scene_entry{"pbr-test", "spheres of triangles in glTF's metallic-roughness materials, one textured, in a "
+                        "photo studio (OptiX)", scene_role::test, &pbr_test, strategy::mis},
+        gpu_scene_entry{"pbr-reference", "the same spheres, glTF's materials mapped to GGX: the reference of "
+                        "pbr-test (OptiX)", scene_role::test, &pbr_reference, strategy::mis},
     };
 }
 

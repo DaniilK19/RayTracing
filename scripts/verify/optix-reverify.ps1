@@ -7,12 +7,12 @@
 #      them all (CPU work, many seconds, counted in the step's GPU time and reported apart by gpu.ps1 -Report). If it
 #      fails, OptiX doesn't run with this driver and nothing else is tried;
 #   2. GpuTests optix-runtime optix-tracer optix-render --require-optix: the runtime's probes, the OptiX tracer against
-#      the BVH ray by ray, the same-seed survey of every GPU scene;
+#      the BVH ray by ray, the same-seed survey of every GPU scene (and the suites later steps add: see section 5);
 #   3. the white furnaces under --optix: furnace and env-furnace, -p material, 480x270, 64 samples, every value exactly
 #      1.0 (PfmStats stats --equal 1 --share 1);
 #   4. compare.ps1 on cornell, final and studio: mis@quality:ref (Step 85's references, which no driver changes)
 #      against mis@optix:3,4. A protocol that comes out VOID (a control failed: the comparison can't be trusted on
-#      that scene) runs once more, B's seeds +10 (A8.3); VOID again stops the script: nothing more is run, ask the user;
+#      that scene) runs once more, B's seeds +10; VOID again stops the script: nothing more is run, ask the user;
 #   5. what later steps add (Claude fills these sections in when integrating Steps 91, 92 and 94: see below).
 # Every run goes through gpu.ps1 into State\runs\stepNN\, each queued run's whole output in <label>.txt there.
 # All pass: Claude stamps the stamped entries anew (carry.ps1 -Restamp for the entries whose bytes the step's check run
@@ -98,11 +98,11 @@ try {
 
     # --- 2. the suites: the runtime, the tracer ray by ray, the same-seed survey --------------------------------------
     $run = Invoke-Queued "reverify-suites" @($tests, "optix-runtime", "optix-tracer", "optix-render", "optix-triangles",
-        "--require-optix")
+        "optix-pbr", "--require-optix")
     $run.lines | Where-Object { $_ -match '(: |, )(FAIL|SKIP)\b|^Error|^GpuTests: ' } | ForEach-Object { "  $_" }
     $detail = "exit code $($run.code)"
-    Write-Check "GpuTests optix-runtime optix-tracer optix-render optix-triangles --require-optix" ($run.code -eq 0) `
-        $detail
+    Write-Check "GpuTests optix-runtime optix-tracer optix-render optix-triangles optix-pbr --require-optix" `
+        ($run.code -eq 0) $detail
 
     # --- 3. the white furnaces under --optix: every value exactly 1.0 -------------------------------------------------
     foreach ($scene in @("furnace", "env-furnace", "mesh-furnace")) {
@@ -136,7 +136,7 @@ try {
             }
             $void = $code -eq 2 -and @($lines | Where-Object { $_ -match '^Protocol VOID' }).Count -gt 0
             if (-not $void -or $attempt -ge 2) { break }
-            Write-Output "compare.ps1 ${scene}: VOID (a control failed): once more, B's seeds +10 (A8.3)"
+            Write-Output "compare.ps1 ${scene}: VOID (a control failed): once more, B's seeds +10"
             $b = "mis@optix:13,14"
         }
         if ($void) {
@@ -156,26 +156,27 @@ try {
     # --- 5. the checks later steps add (empty until Claude integrates that step) --------------------------------------
     # Step 91: the triangles (the suite optix-triangles in section 2, mesh-furnace in section 3), and its protocols:
     # cornell's quads under the quality kernel against cornell-triangles under OptiX (the triangles' hierarchies and the
-    # origins moved off them under the new driver), and instances-baked against instances (the instance transforms)
+    # origins moved off them under the new driver), and instances-baked against instances (the instance transforms).
+    # Step 92: glTF's materials (the suite optix-pbr in section 2), and its protocol: pbr-test, its materials read texel
+    # by texel from glTF's tables and textures, against pbr-reference, the same materials as the scene's own; both sides
+    # OptiX's.
     foreach ($pair in @(@("cornell", "mis@quality:ref", "cornell-triangles", "mis@optix:3,4"),
-            @("instances-baked", "mis@optix:1,2", "instances", "mis@optix:3,4"))) {
+            @("instances-baked", "mis@optix:1,2", "instances", "mis@optix:3,4"),
+            @("pbr-reference", "mis@optix:1,2", "pbr-test", "mis@optix:3,4"))) {
         $arguments = @{ Step = $Step; Scene = $pair[0]; A = $pair[1]; SceneB = $pair[2]; B = $pair[3]; State = $State;
             Build = $Build }
         $lines = @(& $compareScript @arguments)
         $code = $LASTEXITCODE
         $lines | ForEach-Object { "  $_" }
         if ($code -eq 4) {
-            Write-Output ("optix-reverify: gpu.ps1 refused a render of compare.ps1 {0}: nothing re-verified" -f $pair[2])
+            Write-Output ("optix-reverify: gpu.ps1 refused a render of compare.ps1 {0}: nothing re-verified" -f
+                $pair[2])
             exit 2
         }
         $detail = if ($code -eq 2) { "VOID or an error, exit code 2" } else { "exit code $code" }
         Write-Check ("compare.ps1 {0} {1} against {2} {3}" -f $pair[0], $pair[1], $pair[2], $pair[3]) ($code -eq 0) `
             $detail
     }
-
-    # Step 92: pbr-test against pbr-reference, Step 92's protocol: compare.ps1 -Scene pbr-reference -A mis@optix:1,2
-    #          -SceneB pbr-test -B mis@optix:3,4 (glTF's materials texel by texel against the same materials as the
-    #          scene's own, both sides OptiX's).
 
     # Step 94: the denoiser's evaluation on cornell (denoise.ps1: the N16/D16 renders, PfmStats error, the thresholds),
     #          against its references State\ref\cornell-mis2048-s101.pfm and -s102.pfm: Step 85's renders, which a

@@ -107,7 +107,7 @@ private:
         float t_min = 0.001f; // the books' t_min; their intersection programs test it themselves too
         if (leaves_triangle(s))
         {
-            origin = offset_origin(r.origin, memo.facing); // off the face, on the side the ray goes to
+            origin = offset_origin(r.origin, memo.facing, memo.reach); // off the face, on the side the ray goes to
             t_min = 0.0f;
         }
         unsigned int w0 = static_cast<unsigned int>(s.from);

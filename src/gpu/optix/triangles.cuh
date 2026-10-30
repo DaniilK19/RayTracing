@@ -1,8 +1,8 @@
 // Triangles as the integrator sees them: a mesh hit's surface, the ray origin moved off a face, the absorber
 //
 // Track B's file. Step 91: triangle_surface for the scene's materials, offset_origin and absorber_surface; Step 92 adds
-// glTF's materials (wears_gltf, and the mapping into the pixel's scratch slot). No OptiX header: GpuTests' plain CUDA
-// kernels call these functions too. Every number here is a float, as the quality kernel's.
+// glTF's materials (wears_gltf, and the mapping into the pixel's scratch slot) and the offset's reach. No OptiX header:
+// GpuTests' plain CUDA kernels call these functions too. Every number here is a float, as the quality kernel's.
 #pragma once
 #include "camera.cuh"
 #include "optix_params.h"
@@ -20,6 +20,7 @@ struct triangle_memo
     float b2 = 0;
     float lobe = 0;             // closest(): the number a glTF material chooses its lobe with
     vec3<float> facing{};       // surface_of(): the face's unit normal on the side the ray came from
+    float reach = 0;            // surface_of(): the size of the coordinates the face is tested with (offset_origin)
 };
 
 // --- A triangle's numbers -------------------------------------------------------------------------------------------
@@ -50,6 +51,12 @@ __device__ inline vec3<float> place_normal(const float (&n)[9], const vec3<float
             n[6] * v.x + n[7] * v.y + n[8] * v.z};
 }
 
+// |v|∞, the largest of a vector's coordinates in size
+__device__ inline float largest_coordinate(const vec3<float>& v)
+{
+    return fmaxf(fmaxf(fabsf(v.x), fabsf(v.y)), fabsf(v.z));
+}
+
 // v made unit where it can be: false for a zero, an infinite or a NaN vector (NaN fails both comparisons)
 __device__ inline bool normalized(vec3<float>& v)
 {
@@ -62,11 +69,64 @@ __device__ inline bool normalized(vec3<float>& v)
     return true;
 }
 
-// The hit triangle wears a glTF material (its lobe needs a number). False until Step 92: the upload refuses glTF's
-// materials until then, so every triangle wears one of the scene's.
-__device__ inline bool wears_gltf(const mesh_tables& /*m*/, const triangle_memo& /*memo*/)
+// The material the memo's triangle wears
+__device__ inline const mesh_material& worn_material(const mesh_tables& m, const triangle_memo& memo)
 {
-    return false;
+    return m.materials[m.material_of[m.parts[m.instances[memo.instance].part].first_triangle + memo.primitive]];
+}
+
+// The hit triangle wears a glTF material, whose lobe needs a number (closest() draws it). A scene without glTF's
+// materials has no scratch slots: then no triangle does, and the tables aren't read.
+__device__ inline bool wears_gltf(const mesh_tables& m, const triangle_memo& memo)
+{
+    return m.scratch_base >= 0 && worn_material(m, memo).scene_material < 0;
+}
+
+// glTF 2.0's metallic-roughness material at a hit (the specification's Appendix B), written into the pixel's scratch
+// slot as a material and a side entry the integrator reads by index like any other (quality_path.cuh: the material at
+// once after surface_of, the side entry when it makes the lobe; no other thread writes this pixel's slot):
+//   base  = clamp(baseColorFactor ⊙ the base color texture, 0, 1)  (the texture hardware decodes its sRGB)
+//   metal = metallicFactor · the metallic-roughness texture's B,  rough = roughnessFactor · its G  (linear)
+// glTF's material is the mix (1 − metal)·dielectric + metal·conductor; the lobe is chosen with P(conductor) = metal
+// by the number closest() drew, which is unbiased for the mix (and certain where a texture says 0 or 1):
+// - the conductor: a metal of albedo F0 = base (milestone 4's way: make_bsdf takes F0 from the albedo), GGX of
+//   α = rough² (glTF's and milestone 4's convention), r = rough; below α 1e-3 make_bsdf makes it the smooth mirror;
+// - the dielectric: a lambertian of albedo base under milestone 4's glossy coat (F0 0.04), α = max(rough², 1e-3) and
+//   r = max(rough, 0.0317), the coat's floor (validate()'s rule for a gloss side entry).
+// Texture coordinates come from the mesh (0 without them: the loader drops a texture a mesh has no coordinates for).
+__device__ inline void fill_gltf_slot(const mesh_tables& m, const mesh_material& worn, float u, float v, float lobe,
+                                      int slot)
+{
+    color<float> base{worn.base_color[0], worn.base_color[1], worn.base_color[2]};
+    if (worn.has_base_color_texture != 0u)
+    {
+        const float4 texel = tex2D<float4>(worn.base_color_texture, u, v);
+        base = base * color<float>{texel.x, texel.y, texel.z};
+    }
+    base = {fminf(fmaxf(base.x, 0.0f), 1.0f), fminf(fmaxf(base.y, 0.0f), 1.0f), fminf(fmaxf(base.z, 0.0f), 1.0f)};
+    float metallic = worn.metallic;
+    float roughness = worn.roughness;
+    if (worn.has_metal_rough_texture != 0u)
+    {
+        const float4 texel = tex2D<float4>(worn.metal_rough_texture, u, v);
+        roughness *= texel.y;
+        metallic *= texel.z;
+    }
+    if (lobe < metallic)
+    {
+        m.scratch_materials[slot] = {
+            .kind = material_kind::metal, .albedo = base, .fuzz = 0.0f, .refraction_index = 1.0f};
+        m.scratch_microfacets[slot] = {
+            .kind = microfacet_kind::conductor, .alpha = roughness * roughness, .roughness = roughness};
+    }
+    else
+    {
+        m.scratch_materials[slot] = {
+            .kind = material_kind::lambertian, .albedo = base, .fuzz = 0.0f, .refraction_index = 1.0f};
+        m.scratch_microfacets[slot] = {.kind = microfacet_kind::gloss,
+                                       .alpha = fmaxf(roughness * roughness, 1e-3f),
+                                       .roughness = fmaxf(roughness, 0.0317f)};
+    }
 }
 
 // A triangle's surface, from closest()'s memo (instance, primitive, barycentrics) and the ray that hit it:
@@ -83,10 +143,15 @@ __device__ inline bool wears_gltf(const mesh_tables& /*m*/, const triangle_memo&
 //   (ns·d ≥ 0), which no lobe could shade;
 // - outward = facing, so that the integrator's `inward` (the next direction · outward < 0) means "through the face the
 //   ray came from", the through-rule's case (optix_tracer.cuh); and memo.facing = facing, the face the next rays leave;
-// - the texture coordinates interpolated (0 without them), the material the triangle wears, from = the hit's id.
+// - memo.reach, what offset_origin sizes those rays' step off the face by: the largest coordinate of the triangle's
+//   corners in the world, and of its corners in the mesh's own coordinates, where OptiX tests it, at the world's scale
+//   (times ‖A‖∞, the largest row sum of the instance's linear part A: |A·e|∞ ≤ ‖A‖∞·|e|∞ for a rounding error e there,
+//   of the size of those coordinates for the transforms offset_origin's limit names);
+// - the texture coordinates interpolated (0 without them), the material the triangle wears (one of the scene's, or
+//   glTF's written into the pixel's scratch slot `slot`), from = the hit's id.
 // An instance's M is its object_to_world, M⁻ᵀ its normal_to_world (meshes.cu computes both in double).
 __device__ inline surface<float> triangle_surface(const optix_params& p, const ray<float>& r, const bvh_hit<float>& h,
-                                                  triangle_memo& memo, int /*slot*/)
+                                                  triangle_memo& memo, int slot)
 {
     const mesh_tables& m = p.meshes;
     const mesh_instance& instance = m.instances[memo.instance];
@@ -138,6 +203,14 @@ __device__ inline surface<float> triangle_surface(const optix_params& p, const r
     s.outward = facing;
     memo.facing = facing;
 
+    const float (&a)[12] = instance.object_to_world;
+    const float row_sum = fmaxf(fmaxf(fabsf(a[0]) + fabsf(a[1]) + fabsf(a[2]), fabsf(a[4]) + fabsf(a[5]) + fabsf(a[6])),
+                                fabsf(a[8]) + fabsf(a[9]) + fabsf(a[10]));
+    const float in_mesh = fmaxf(fmaxf(largest_coordinate(p0), largest_coordinate(p1)), largest_coordinate(p2));
+    const float in_world = fmaxf(fmaxf(largest_coordinate(place_point(a, p0)), largest_coordinate(place_point(a, p1))),
+                                 largest_coordinate(place_point(a, p2)));
+    memo.reach = fmaxf(in_world, row_sum * in_mesh);
+
     if (part.has_uvs != 0u)
     {
         const float2 t0 = m.uvs[i0];
@@ -147,10 +220,20 @@ __device__ inline surface<float> triangle_surface(const optix_params& p, const r
         s.v = b0 * t0.y + b1 * t1.y + b2 * t2.y;
     }
 
+    const mesh_material& worn = m.materials[m.material_of[triangle]];
+    if (worn.scene_material < 0)
+    {
+        // glTF's: the slot holds the material and its side entry, and the color is the material's albedo (texture -1:
+        // surface_color returns it, camera.cuh)
+        fill_gltf_slot(m, worn, s.u, s.v, memo.lobe, slot);
+        s.material = slot;
+        s.texture_index = -1;
+        return s;
+    }
     // One of the scene's materials, read as surface_at reads a primitive's: its texture's index from the books'
     // material_textures (-1 for one solid color, which the material's albedo then holds). A test's hand-made view may
     // have no such table: its materials are then taken as solid colors.
-    s.material = m.materials[m.material_of[triangle]].scene_material;
+    s.material = worn.scene_material;
     s.texture_index =
         p.view.base.material_textures != nullptr ? p.view.base.material_textures[s.material].texture_index : -1;
     return s;
@@ -177,28 +260,47 @@ __device__ inline surface<float> absorber_surface(const mesh_tables& m, const ra
 
 // The origin of a ray leaving a triangle, moved off the face toward n (the face's unit normal on the side the ray goes
 // to), so that the traversal, which starts there with tmin 0, can't meet the face again: p + δ·n, with
-// δ = 2⁻¹⁶·max(|p|∞, 1), the same δ for every coordinate.
+// δ = 2⁻¹⁶·max(reach, |p|∞, 1), the same δ for every coordinate. `reach` is triangle_surface's memo.reach, the size of
+// the coordinates the face is tested with; the form without it takes the point's alone.
 //
-// δ follows the point's largest coordinate, not each coordinate's own size, because the hardware's triangle test does:
-// it takes the corners relative to the ray's origin and shears them along the ray (Woop, Benthin and Wald,
-// "Watertight Ray/Triangle Intersection", JCGT 2013), in float, so the side of a face it finds the origin on is
-// rounded at the size of the largest of those coordinates, whichever axis the face looks along. Wächter and Binder's
-// offset ("A Fast and Robust Method for Avoiding Self-Intersection", Ray Tracing Gems, chapter 6, 2019), which this
-// function first followed, moves each coordinate by 256 of its own float steps, or by nᵢ/65536 below 1/32. On
-// cornell-triangles' floor (y = 0, x and z up to 555, whose float steps are 6·10⁻⁵) that put the origin 1.5·10⁻⁵ above
-// the floor, inside the test's rounding: the test found the floor again, or the tall block's bottom lying in the same
-// plane, at t of 10⁻⁶ to 10⁻⁵, from below, and 15% of the paths started inside the closed block left it under the
-// floor.
+// δ follows the largest coordinate, not each coordinate's own size, because the hardware's triangle test does: it
+// takes the corners relative to the ray's origin and shears them along the ray (Woop, Benthin and Wald, "Watertight
+// Ray/Triangle Intersection", JCGT 2013), in float, so the side of a face it finds the origin on is rounded at the size
+// of the largest of those coordinates, whichever axis the face looks along. Wächter and Binder's offset ("A Fast and
+// Robust Method for Avoiding Self-Intersection", Ray Tracing Gems, chapter 6, 2019), which this function first
+// followed, moves each coordinate by 256 of its own float steps, or by nᵢ/65536 below 1/32. On cornell-triangles' floor
+// (y = 0, x and z up to 555, whose float steps are 6·10⁻⁵) that put the origin 1.5·10⁻⁵ above the floor, inside the
+// test's rounding: the test found the floor again, or the tall block's bottom lying in the same plane, at t of 10⁻⁶ to
+// 10⁻⁵, from below, and 15% of the paths started inside the closed block left it under the floor.
 //
-// 2⁻¹⁶·|p|∞ is 128 to 256 float steps of the largest coordinate (the old offset gave a coordinate 256 of its own). Each
-// coordinate moves toward the side nᵢ points to or not at all (a sum that rounds back), and the largest component of
-// a unit n, at least 1/√3, moves by more than 70 float steps of its coordinate: the result lies strictly on n's side of
-// the face's plane. A coordinate moves by at most δ and half a float step, under 2⁻¹⁵·|p|∞ + 2⁻¹⁵. The price is a
-// blind zone of δ along n: geometry closer than that to a face isn't seen from it. (A triangle far larger than |p|∞, a
-// ground of 10⁴ under a point near the origin, would round at its own size: no scene has one.)
+// Those coordinates aren't the point's alone. The corners count: near the floor's corner (0, 0, 0), where |p|∞ is about
+// 1, its triangles still reach 555 and are tested at that size. And OptiX tests a triangle in its mesh's coordinates,
+// where it moves the ray with the instance's inverse transform: a triangle near the world's origin may lie far from its
+// mesh's. meshes.cu centres every mesh on its bounds, which keeps those coordinates at the mesh's own size, and
+// triangle_surface's reach takes the corners in both spaces.
+//
+// The reach covers the transforms whose |A|·|A⁻¹| is small, and only those. OptiX moves the ray into the mesh's frame
+// with the float inverse of the instance's transform, o' = A⁻¹·(o − t), whose rounding is about ε·|A⁻¹|·(|o| + |t|)
+// there and ‖|A|·|A⁻¹|‖∞ times that in the world, about 3ε·‖|A|·|A⁻¹|‖∞·reach (ε = 2⁻²⁴). A rotation, a uniform scale
+// and one node's T·R·S (A = R·S) keep every entry of |A|·|A⁻¹| at most 1, so δ = 256ε·reach is some 85 times that
+// error. A non-uniform scale applied after a rotation (A = S·R: a scaled glTF parent over a turned child, or a shear)
+// raises the entries to its scales' ratio Sᵢ/Sⱼ: beyond about 100 the rounding passes δ, and a ray may start on the
+// wrong side of the face it leaves, hit it again and end its path early.
+//
+// 2⁻¹⁶·|p|∞ is 128 to 256 float steps of the point's largest coordinate (the old offset gave a coordinate 256 of its
+// own), and δ is at least that. Each coordinate moves toward the side nᵢ points to or not at all (a sum that rounds
+// back), and the largest component of a unit n, at least 1/√3, moves by more than 70 float steps of its coordinate:
+// the result lies strictly on n's side of the face's plane. A coordinate moves by at most δ and half a float step:
+// without a reach, under 2⁻¹⁵·|p|∞ + 2⁻¹⁵. The price is a blind zone of δ along n: geometry closer than that to a face
+// isn't seen from it (2⁻¹⁶·555 ≈ 0.0085 on cornell-triangles' walls, wherever on them a path bounces).
+__device__ inline point3<float> offset_origin(const point3<float>& p, const vec3<float>& n, float reach)
+{
+    const float delta = 0x1p-16f * fmaxf(fmaxf(reach, largest_coordinate(p)), 1.0f);
+    return {p.x + delta * n.x, p.y + delta * n.y, p.z + delta * n.z};
+}
+
 __device__ inline point3<float> offset_origin(const point3<float>& p, const vec3<float>& n)
 {
-    const float delta = 0x1p-16f * fmaxf(fmaxf(fabsf(p.x), fabsf(p.y)), fmaxf(fabsf(p.z), 1.0f));
-    return {p.x + delta * n.x, p.y + delta * n.y, p.z + delta * n.z};
+    return offset_origin(p, n, 0.0f);
 }
 }

@@ -1,63 +1,111 @@
-// Suite optix-triangles (Step 91): triangle meshes on the GPU, tested from their specification alone. The
-// implementation's files were not read (meshes.cu, the bodies of triangles.cuh, accel.cpp's meshes region,
-// raygen_pick.cuh, gpu_scene's mesh translation, gpu_scenes_meshes.ixx), and every reference here is the test's
-// own, in double:
+// Suite optix-triangles (Step 91): triangle meshes on the GPU, tested against their specification: every reference
+// here is the test's own, in double, written from the interfaces (mesh_tables.h's layout, the rules the comments of
+// triangles.cuh, optix_tracer.cuh, mesh_scene.cuh and meshes.cu state) rather than from the code behind them; the
+// two suites' refusals alone name the causes in meshes.cu's messages:
 //   offset-origin   offset_origin on 10^6 (point, normal) pairs at scales 10^-3 to 10^4, in a plain CUDA kernel: the
 //                   point moved strictly onto the normal's side of the plane through p (evaluated in double), each
-//                   coordinate by at most 2^-15·|p|∞ + 2^-15 (the offset's bound); planted: the same check on
-//                   offset_origin(p, -n), whose every point it must refuse;
-//   surface         triangle_surface at 10^4 random hits (eight instances: mirrors, non-uniform scales, 10^-3 and 10^2
-//                   scales; smooth, flat and wild normals) on tables laid out by the test as mesh_tables.h describes
-//                   them, against the surface rules recomputed in double: p within 10^-5 of the coordinates' size, the
-//                   face normal and the shading normal within 10^-5, the side, u and v, the material, its texture and
-//                   the id; each rule of the shading normal on a case of its own; the outside of a closed mesh under
-//                   mirroring instances; absorber_surface's fields;
+//                   coordinate by at most 2^-15·|p|∞ + 2^-15 (the offset's bound without a reach); planted: the same
+//                   check on offset_origin(p, -n), whose every point it must refuse;
+//   surface         triangle_surface at 10^4 random hits (nine instances: mirrors, non-uniform scales, 10^-3 and 10^2
+//                   scales, one untranslated; smooth, flat and wild normals) on tables laid out by the test as
+//                   mesh_tables.h describes them, against the surface rules recomputed in double: p within 10^-5 of the
+//                   coordinates' size, the face normal and the shading normal within 10^-5, the side, u and v, the
+//                   material, its texture and the id; each rule of the shading normal on a case of its own; the outside
+//                   of a closed mesh under mirroring instances; memo.reach within 10^-6 of its reference, each of its
+//                   two terms deciding somewhere (decision 14); absorber_surface's fields;
 //   baked-twin      a mesh baked by module meshes (world vertices, corners 1 and 2 swapped under a mirror) against the
 //                   same mesh under the instance: the same point, face side and front, and the same shading normal;
-//   brute-force     OptiX: 10^5 rays at a level-3 icosphere and 10^5 at a 24×12 torus (each under an instance, the
-//                   torus's mirrored and stretched) against every triangle in double: the same triangle for every ray
-//                   farther than 10^-4 (barycentrically) from an edge, t within 10^-6 relative, barycentrics within
-//                   10^-5, the id triangle_base + 1 + primitive; the near-edge rays INFO;
+//   brute-force     OptiX: 10^5 rays at each of three meshes (a level-3 icosphere under a turning, scaling instance and
+//                   under the identity, a 24×12 torus mirrored and stretched) against every triangle in double: the
+//                   same answer for every ray not near an edge (decision 1), a hit where the reference misses
+//                   included; t within 10^-6 relative and barycentrics within 10^-5, or float precision (decision 8);
+//                   the id triangle_base + 1 + primitive; the near-edge rays INFO;
 //   coplanar        OptiX: rays leaving random triangles of a tilted plane that has a parallel neighbour at a gap of
 //                   4·2^-15·|p|∞, at |p|∞ = 1, 8 and 555, 0.01° to 90° off the plane, through optix_tracer (its offset
 //                   origin, hardware tmin 0): no hit of the plane left, no miss of the neighbour, in both directions;
 //                   the through-rule's absorber for rays going into the face; planted: the face's side reversed, so
-//                   that the rays start behind it and must hit it;
+//                   that the rays start behind it and must hit it; and at |p|∞ = 8 the step sized by a reach given
+//                   (memo.reach, as traverse passes it): 4·|p|∞, half the gap, changes nothing, 16·|p|∞, twice the gap,
+//                   starts every ray beyond the neighbour, going away from both planes, so that it must meet nothing;
 //   surface-upload  OptiX: triangle_surface on the tables meshes.cu uploads (the instances' ids, parts, transforms and
-//                   inverse transposes, the materials) against the same double reference;
+//                   inverse transposes, the materials; two meshes off their origins, whose centres the upload moves
+//                   into turning, mirroring, non-uniform placements) against the same double reference, which keeps
+//                   every mesh's own coordinates; memo.reach as in surface, from the upload's centred corners
+//                   (decision 14);
 //   world-ray       P7: the world ray __intersection__probe reads under an identity instance (cornell, the IAS root
 //                   forced) is the ray traced, bit for bit, -0 included;
 //   pick            session::pick_distance on a triangle mesh's front and back and on a books' sphere: t within 10^-6
 //                   (relative) of the host's, ∞ on a miss;
 //   closed-block    gpu::render (__raygen__render's loop, the session's upload) from a camera inside cornell-triangles'
 //                   tall block, a closed box of 12 triangles, under -p material and -p mis: every path traces its
-//                   max_depth rays, since none can leave the block, and the image is black.
+//                   max_depth rays, since none can leave the block, and the image is black (decision 9);
+//   closed-corner   the same inside a closed cube of 555 near its corner (0, 0, 0), where the paths start on floor
+//                   triangles that reach 555 at points where |p|∞ < 1: offset_origin's reach (decision 12);
+//   refusals        the upload's refusals, each a std::runtime_error naming its cause, before any launch: glass, a lamp
+//                   and smoke worn by a triangle, an index past the vertices, a material past the set, a corner that
+//                   isn't finite, a NaN and a singular placement; and a NaN in a vertex no triangle uses, accepted.
+// Suite optix-pbr (Step 92): glTF's metallic-roughness materials, from the same specification:
+//   mapping         triangle_surface's glTF branch in a plain CUDA kernel, on hand-made materials (factors alone, past
+//                   [0, 1], at the coat's floors, half metal on both sides of the lobe, lobe = metallic, and textures
+//                   made here as meshes.cu makes them): the slot's material and side entry equal the mapping's table
+//                   computed in float, bit for bit; the slot is scratch_base + the pixel, the texture -1, wears_gltf
+//                   true; a scene material's hit leaves its slot alone; and the hardware's sRGB decode against
+//                   IEC 61966-2-1, within half a byte's step (decision 13);
+//   lobe-comparison the mapping's comparison lobe < metal in a plain CUDA kernel, the lobe drawn by the test: P(metal)
+//                   = metallic over 10^6 numbers at metallic 0.3, binomial |z| <= 4; planted: the same count against
+//                   0.31, which must be rejected;
+//   lobe-draw       OptiX: the draw itself, closest() through the probe's mode 0: 2^18 rays straight down at a glTF
+//                   triangle of metallic 0.3, one per launch index and generator, every one a hit of it, its lobe the
+//                   generator's first number bit for bit, the share below 0.3f binomial |z| <= 4, planted 0.31 rejected
+//                   (decision 15); a ray at a triangle wearing a scene material and a ray that misses: lobe exactly 0;
+//   textures        OptiX: the texture objects meshes.cu makes, read through its upload and surface_of: every byte of
+//                   a base color decoded within half a byte's step of IEC 61966-2-1 (the largest INFO),
+//                   metallic-roughness read linearly, bilinear at texel centres equal to the texel within 10^-6 (and to
+//                   NEAREST's), (0, 0) the top-left texel, the wrap modes (repeat, mirrored repeat, clamp) at u and
+//                   v = -0.25 and 1.25, glTF's NEAREST; the mapping end to end on mesh_material_descs, bit for bit;
+//                   and, once the probe has grown the tables past the 8×8 camera's 64 slots, a triangle wearing a
+//                   scene material reads that material and its side entry, and the absorber (the probe's mode 2) its
+//                   black lamp and no side entry;
+//   refusals        the upload's refusals of glTF's materials and textures, each a std::runtime_error naming its cause,
+//                   before any launch: a base color below 0 and NaN, metallic 1.5, roughness -0.1, a texture index
+//                   past the set and one of -2, a scene material of -2, a base color texture that isn't sRGB and a
+//                   metallic-roughness one that is; a texture missing, 0 texels wide, past the GPU's width, with a
+//                   wrap mode glTF doesn't have, or with 12 bytes for 2×2 texels; and the scene they come from,
+//                   accepted.
 // The OptiX checks reach the GPU through the fixture's runtime (optix_fixture.h): an upload of a scene_desc the test
 // makes (a gpu::mesh_set of meshes from module meshes, through tests/mesh_services.h), and launch_test of the check
-// module's __raygen__probe_mesh. Its creation and first compiles are left out of the 10 s budget. closed-block renders
-// through the program's own raygen instead: the probe traces one ray per launch, where the paths of a raygen's loop can
-// go wrong in ways one ray can't show (decision 9).
+// module's __raygen__probe_mesh. Its creation and first compiles are left out of the 10 s budget. closed-block and
+// closed-corner render through the program's own raygen instead: the probe traces one ray per launch, where the paths
+// of a raygen's loop can go wrong in ways one ray can't show (decision 9).
 //
 // The probe of meshes, __raygen__probe_mesh (tests/optix_check_programs.cu, the probes' block): one sample per launch
 // index k = y·width + x of a launch of n = width·height, 20 words in at params.test.values[20k] (floats; an int as its
-// float's bits), 40 out at values[20n + 40k]:
+// float's bits), 41 out at values[20n + 41k]:
 //   in   0-2 the ray's origin, 3-5 its direction, 6 its time, 7 spawn.from, 8 spawn.inward (0 or 1), 9-11 memo.facing,
 //        12 the mode: 0 traces the ray with optix_tracer::closest (sample_generator(test.seed, k, 0)); 1 traces
 //        nothing and asks optix_tracer::surface_of for the triangle hit of 13 the instance, 14 the primitive, 15-16 b1
-//        and b2, 17 memo.lobe, in scratch slot scratch_base + k;
+//        and b2, 17 memo.lobe, in scratch slot scratch_base + k; 2 traces nothing and asks surface_of for the
+//        absorber's id; 18 memo.reach, the reach of the face a ray of mode 0 leaves;
 //   out  0 the hit's index, 1 its t, 2 entering (0 or 1); the side record: 3 instance, 4 primitive, 5-6 b1, b2,
-//        7 lobe; mode 1: 8-10 rec.p, 11-13 rec.normal, 14 front_face, 15-17 outward, 18-20 texture_point, 21 u, 22 v,
-//        23 material, 24 texture_index, 25 from, 26-28 memo.facing, 29 = 1; then what the integrator reads at
+//        7 lobe; modes 1 and 2: 8-10 rec.p, 11-13 rec.normal, 14 front_face, 15-17 outward, 18-20 texture_point, 21 u,
+//        22 v, 23 material, 24 texture_index, 25 from, 26-28 memo.facing, 29 = 1; then what the integrator reads at
 //        s.material: 30 the material's kind, 31-33 albedo, 34 fuzz, 35 refraction index, 36 its side entry's kind
-//        (-1: no side entries), 37 alpha, 38 roughness. (39: the CUDA twin's wears_gltf.)
-// The surface checks' plain kernel writes the same 40 words from the same 20 (mode 1 only), so one decoder reads both.
+//        (-1: no side entries), 37 alpha, 38 roughness. (39: the CUDA twin's wears_gltf.) 40 memo.reach (mode 1:
+//        triangle_surface's).
+// The surface checks' plain kernel writes the same 41 words from the same 20 (mode 1 only), so one decoder reads both.
+// The probe's memo.reach is 0 but in coplanar's reach passes: a ray it traces from a triangle then starts off the face
+// by its point's size alone (the offset-origin check's form), which the coplanar planes, about as large as their
+// points' coordinates, allow.
 // Under P7's probe_intersections the probe intersection program keeps 16 words of params.test.counts per sample (its
 // own block of optix_check_programs.cu says which).
 //
 // Decisions where the specification leaves room:
-//   1. "Farther than 10^-4 (relative) from an edge" is barycentric: a ray is near an edge when the reference finds any
-//      triangle crossed at t > t_min, in front of the nearest hit (or anywhere, for a miss), whose smallest barycentric
-//      coordinate is within 10^-4 of 0 on either side. t's 10^-6 is relative to t, and for grazing hits (|cos θ| < 0.1
+//   1. "Farther than 10^-4 (relative) from an edge" is barycentric: a ray is near an edge when the reference finds a
+//      triangle crossed at t > t_min, no farther than the nearest hit (anywhere, for a miss), whose smallest
+//      barycentric coordinate is within max(10^-4, δ/altitude) of 0 on either side, δ decision 8's float allowance at
+//      that crossing and the altitude the triangle's smallest: the band the barycentrics themselves are held to, so a
+//      ray that rounding may carry across an edge isn't compared. A miss without such a crossing is compared as any
+//      ray is: the hardware must miss too. t's 10^-6 is relative to t, and for grazing hits (|cos θ| < 0.1
 //      between the ray and the face) 10^-6·0.1/|cos θ|: the hardware's t loses digits as the ray turns parallel to the
 //      face, its barycentrics don't. The brute force runs in double on the GPU (10^5 rays × 1280 triangles would take a
 //      CPU second).
@@ -78,9 +126,10 @@
 //      rounding); the elevation is log-uniform in [0.01°, 90°]. 10^5 rays per scale, half each way. The planted
 //      fault: 10^4 rays at |p|∞ = 8 with memo.facing reversed; at least 99% must hit the plane they leave.
 //   6. P7: 4096 rays from random points inside the box toward its back half (the box is open on the camera's side, so
-//      a ray toward it could meet no box), 64 from its centre and corners with ±0 coordinates in the origin and the
-//      direction, and 8 with subnormal direction coordinates (INFO: a driver that flushes them to 0 reconstructs no
-//      other ray). Every ray from inside must reach the probe.
+//      a ray toward it could meet no box), 60 from its centre and from points on the planes x = 0, y = 0 and z = 0 (5
+//      origins, 12 directions) with ±0 coordinates in the origin and the direction, and 8 with subnormal direction
+//      coordinates (INFO: a driver that flushes them to 0 reconstructs no other ray). Every ray from inside must reach
+//      the probe.
 //   7. The pick: directions given as unit vectors (session::pick_distance's distance along a unit direction); the
 //      sphere is a books' primitive, so the pick sees the books' GAS too.
 //   8. The brute force's t and barycentrics are held to float precision as well as to 10^-6 and 10^-5, whichever is
@@ -91,7 +140,8 @@
 //      corner, triangle or convention is off by tenths. (The first run, held to 10^-5 alone, found barycentrics up to
 //      2.8·10^-4 off, rays coming from 10 units away, while every ray met the reference's triangle and t agreed to
 //      9·10^-7; in float steps over the altitude the differences reached 23 under the identity (the third mesh), 38
-//      under a turning, scaling instance and 67 on the torus's thin triangles under a mirroring one.)
+//      under a turning, scaling instance and 67 on the torus's thin triangles under a mirroring one.) The near-edge
+//      band of decision 1 takes the same δ at each crossing.
 //   9. The closed block: the camera at (355, 278, 278), 7 units inside the tall block's face, looking along +x; 8×8
 //      pixels, 16 samples each, max_depth 50. It was added for two defects the probe's single rays passed: nvcc hoisted
 //      the barycentrics' read out of __raygen__render's loop, before any traversal (optix_tracer.cuh's decode_hit), and
@@ -99,10 +149,44 @@
 //      (triangles.cuh), so paths met the floor again from below. Paths then traced 3.5 and 46.5 of their 50 rays, and
 //      the first found the lamp. A path may still slip through an edge where the hit point rounds outside its face,
 //      which the books' quads allow too: the rays may fall short of the full count by 1% (a path ending at its first
-//      bounce costs 49 of the 51200 rays of a strategy), and one value of the 192 may be above 0.
-// Seeds: 9101-9113.
+//      bounce costs 49 of the 51200 rays of a strategy), and one of the 64 pixels may be lit (a channel above 0).
+//  10. "Bit for bit" covers what the mapping's table names: the material's kind and albedo, a metal's fuzz 0, the side
+//      entry's kind, α and r, each computed in float as the table writes it (clamp(factor·texel), metallic·B,
+//      roughness·G, rough·rough, max(rough², 1e-3f), max(rough, 0.0317f)); a lambertian's fuzz and the refraction
+//      indices aren't in it (INFO). The texels the expectation multiplies are the hardware's own: read back by a
+//      kernel (mapping) or through a material of factors 1 on the same texture (textures).
+//  11. Texture reads land exactly on the point asked for: each point is corner 0 of a triangle of its own, hit at
+//      (b1, b2) = (0, 0). The wrap points sit halfway between two texels (texel coordinates -1.5 and 4.5), where the
+//      hardware's 8-bit filter weight 1/2 is exact: the expected value is the two texels' mean, within 2·10^-3.
+//  12. The closed corner: a cube of 555 (8 shared corners, 12 triangles, one mesh under the identity), the camera at
+//      (0.9, 0.9, 0.9) looking down at the floor's points x 0.48 to 0.8, z 0.09 to 0.25 (off its diagonal and its
+//      edges), 8×8 pixels, 16 samples each, max_depth 50, the sky lit so that a path leaving the cube shows, and a
+//      lamp above the cube for -p mis's shadow rays. Sized by the point alone (2^-16 there), the step off the floor
+//      would lie inside the rounding of its 555-unit triangles, as in decision 9's second defect; offset_origin's
+//      reach sizes it by the triangle (2^-16·555). Decision 9's allowances.
+//  13. The hardware's sRGB decode is held to half the step of the byte it decodes, the step taken through
+//      IEC 61966-2-1's curve: a byte stands for every sRGB value within half a step of it, so a decode inside that
+//      interval is as close to the image as the byte itself. The texture hardware keeps about 8 significant bits of
+//      the linear value (measured: 0.00375 off at byte 251, 0.86 of its half step), so a bound of 10^-3 fails 40 of the
+//      bytes from 184 up.
+//  14. memo.reach's reference is computed in double from the floats the GPU holds: the corners in the mesh's frame and
+//      the instance's 3×4. On the hand-built tables those are the tables' own; on an upload, meshes.cu's frame as its
+//      comments describe it: c, the centre of the bounds of the vertices the mesh's triangles use, computed in double
+//      and rounded to float; the corners x − c, in double, rounded to float; the placement's A rounded to float and
+//      its translation t + A·c, in double, rounded to float. The GPU's reach is within 10^-6 of it (relative): each
+//      world coordinate takes at most 4 roundings of terms whose sizes add up to at most 3·reach (|t|∞ ≤ in_world +
+//      ‖A‖∞·in_mesh), 7.2·10^-7 of the reach, and ‖A‖∞·in_mesh takes 3, 1.8·10^-7. A term dropped, a row sum taken
+//      along a column, or a centre folded in wrong moves it by percents. The mesh term is the larger on the surface
+//      tables' untranslated instance and on surface-upload's icosphere moved back over the world's origin.
+//  15. lobe-draw: 2^18 rays in one launch, since a launch's sample k draws from sample_generator(seed, k, 0) and a
+//      second launch would repeat the first one's numbers. The share's standard error is then 9·10^-4: the planted
+//      0.31 lies 11 of them from the 0.3f the draws are compared with, and is rejected (|z| ≥ 4.9) unless the share
+//      strays by 6. The lobe is the generator's first number bit for bit: closest() draws it after the media's
+//      numbers, and the scene has no media.
+// Seeds: 9101-9111, 9113, 9114, 9120, 9122.
 //
-// Step criteria: $GT optix-triangles --require-optix exits 0 (≈ 3 s, the check module's cold compile apart).
+// Step criteria: $GT optix-triangles --require-optix and $GT optix-pbr --require-optix exit 0 (≈ 3 s and ≈ 1 s, the
+// check module's cold compile apart).
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -114,6 +198,7 @@
 #include <limits>
 #include <memory>
 #include <numbers>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -464,6 +549,8 @@ public:
         return p;
     }
     int absorber() const { return scene_count_; }
+    int scratch_base() const { return slots_ > 0 ? scene_count_ + 1 : -1; }
+    std::vector<gpu::material<float>> materials() const { return view_materials_.download(); }
 
 private:
     static std::vector<gpu::material<float>> with_slots(std::span<const gpu::material<float>> scene, int slots)
@@ -500,8 +587,8 @@ private:
 // --- The probe's words (the layout in the file's header) -----------------------------------------------------------
 
 constexpr int probe_in_words = 20;
-constexpr int probe_out_words = 40;
-constexpr int probe_batch = 1 << 15; // samples per launch: 7.9 MB of words
+constexpr int probe_out_words = 41;
+constexpr int probe_batch = 1 << 15; // samples per launch: 8 MB of words
 
 struct probe_sample
 {
@@ -510,12 +597,13 @@ struct probe_sample
     int from = -1;
     bool inward = false;
     std::array<float, 3> facing{};
-    int mode = 0; // 0: closest; 1: surface_of the triangle hit below
+    int mode = 0; // 0: closest; 1: surface_of the triangle hit below; 2: surface_of the absorber's id
     int instance = 0;
     unsigned int primitive = 0;
     float b1 = 0;
     float b2 = 0;
     float lobe = 0;
+    float reach = 0; // memo.reach of the face a ray leaves (mode 0)
 };
 
 struct probe_answer
@@ -548,6 +636,7 @@ struct probe_answer
     float alpha = 0;
     float roughness = 0;
     bool wears_gltf = false; // the CUDA twin's word 39
+    float reach = 0;         // memo.reach: triangle_surface's in mode 1
 };
 
 float word(int i) { return std::bit_cast<float>(i); }
@@ -574,6 +663,7 @@ void encode(const probe_sample& s, float* w)
     w[15] = s.b1;
     w[16] = s.b2;
     w[17] = s.lobe;
+    w[18] = s.reach;
 }
 
 probe_answer decode(const float* w)
@@ -607,12 +697,13 @@ probe_answer decode(const float* w)
     a.alpha = w[37];
     a.roughness = w[38];
     a.wears_gltf = int_of(w[39]) == 1;
+    a.reach = w[40];
     return a;
 }
 
 // --- Device code ---------------------------------------------------------------------------------------------------
 
-// The 40 words of a surface (the probe's mode 1), as the CUDA twin writes them
+// The 41 words of a surface (the probe's mode 1), as the CUDA twin writes them
 __device__ void write_surface(const gpu::optix_params& p, const gpu::bvh_hit<float>& hit,
                               const gpu::triangle_memo& memo, const gpu::surface<float>& s, bool gltf, float* out)
 {
@@ -665,6 +756,7 @@ __device__ void write_surface(const gpu::optix_params& p, const gpu::bvh_hit<flo
         out[36] = __int_as_float(-1);
     }
     out[39] = __int_as_float(gltf ? 1 : 0);
+    out[40] = memo.reach;
 }
 
 // triangles.cuh's triangle_surface in a plain CUDA kernel, on tables the test lays out: the probe's mode 1 without
@@ -823,8 +915,10 @@ __global__ void offset_kernel(std::uint64_t seed, int count, unsigned long long*
 }
 
 // Every world triangle (9 doubles each) against rays in the probe's input layout, in double: Möller and Trumbore's
-// test (1997), the nearest crossing beyond t_min. near_edge: some triangle crossed in front of it (anywhere, for a
-// miss) has its smallest barycentric coordinate within 10^-4 of 0, on either side.
+// test (1997), the nearest crossing beyond t_min. near_edge (decision 1): some triangle crossed no farther than it
+// (anywhere, for a miss) has its smallest barycentric coordinate within max(10^-4, δ/altitude) of 0, on either side,
+// with δ = 2^-16·(|o|∞ + t·|d|∞) at that crossing (decision 8) and the triangle's smallest altitude; a miss without
+// such a crossing isn't near an edge.
 struct brute_answer
 {
     int triangle;
@@ -836,8 +930,8 @@ struct brute_answer
 };
 
 template <int Unused>
-__global__ void brute_force_kernel(const double* corners, int triangles, const float* rays, int n, double t_min,
-                                   brute_answer* answers)
+__global__ void brute_force_kernel(const double* corners, const double* altitudes, int triangles, const float* rays,
+                                   int n, double t_min, brute_answer* answers)
 {
     const int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= n)
@@ -847,6 +941,8 @@ __global__ void brute_force_kernel(const double* corners, int triangles, const f
     const float* const r = rays + static_cast<std::size_t>(probe_in_words) * k;
     const double o[3] = {r[0], r[1], r[2]};
     const double d[3] = {r[3], r[4], r[5]};
+    const double o_size = ::fmax(::fabs(o[0]), ::fmax(::fabs(o[1]), ::fabs(o[2])));
+    const double d_size = ::fmax(::fabs(d[0]), ::fmax(::fabs(d[1]), ::fabs(d[2])));
     brute_answer best{.triangle = -1, .near_edge = 0, .t = gpu::infinity<double>, .b1 = 0, .b2 = 0, .cosine = 0};
     double near_t = gpu::infinity<double>;
     for (int i = 0; i < triangles; ++i)
@@ -872,7 +968,8 @@ __global__ void brute_force_kernel(const double* corners, int triangles, const f
             continue;
         }
         const double margin = ::fmin(1 - u - v, ::fmin(u, v));
-        if (::fabs(margin) < 1e-4)
+        const double band = ::fmax(1e-4, 0x1p-16 * (o_size + t * d_size) / altitudes[i]);
+        if (::fabs(margin) < band)
         {
             near_t = ::fmin(near_t, t);
         }
@@ -890,7 +987,8 @@ __global__ void brute_force_kernel(const double* corners, int triangles, const f
                               (::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) * ::sqrt(nx * nx + ny * ny + nz * nz))};
         }
     }
-    best.near_edge = near_t <= best.t * (1 + 1e-9) ? 1 : 0;
+    // A miss is near an edge only where some crossing was: without one near_t stays ∞, which ∞·(1 + 10^-9) would pass
+    best.near_edge = ::isfinite(near_t) && near_t <= best.t * (1 + 1e-9) ? 1 : 0;
     answers[k] = best;
 }
 
@@ -984,17 +1082,18 @@ struct optix_upload
 // probe in their place) compiles the check module and makes the pipeline: left out of the budget
 bool probe_pipeline_made[2] = {false, false};
 
-// Every sample through __raygen__probe_mesh, in launches of at most probe_batch; `words`, when given, receives the
+// Every sample through __raygen__probe_mesh, in launches of at most `batch` (sample k of a launch draws from
+// sample_generator(seed, k, 0), so samples of different launches share streams); `words`, when given, receives the
 // probe intersection program's 16 words per sample (P7)
 std::vector<probe_answer> probe(gpu_test::context& ctx, gpu::detail::optix_scene& scene,
                                 std::span<const probe_sample> samples, std::uint64_t seed, bool probing = false,
-                                std::vector<unsigned long long>* words = nullptr)
+                                std::vector<unsigned long long>* words = nullptr, std::size_t batch = probe_batch)
 {
     std::vector<probe_answer> answers;
     answers.reserve(samples.size());
-    for (std::size_t first = 0; first < samples.size(); first += probe_batch)
+    for (std::size_t first = 0; first < samples.size(); first += batch)
     {
-        const std::size_t n = std::min<std::size_t>(probe_batch, samples.size() - first);
+        const std::size_t n = std::min<std::size_t>(batch, samples.size() - first);
         std::vector<float> host(static_cast<std::size_t>(probe_in_words + probe_out_words) * n, 0.0f);
         for (std::size_t k = 0; k < n; ++k)
         {
@@ -1056,6 +1155,47 @@ void guarded(gpu_test::context& ctx, std::string_view check, F&& body)
     {
         ctx.fail(check, std::format("threw: {}", error.what()));
     }
+}
+
+// An upload the runtime must refuse, before anything is launched: a std::runtime_error whose message names `cause`
+void expect_refusal(gpu_test::context& ctx, gpu::optix_runtime& runtime, std::string_view name,
+                    const gpu::scene_desc& scene, std::string_view cause)
+{
+    std::string message = "no exception";
+    bool right = false;
+    try
+    {
+        [[maybe_unused]] const optix_upload upload(runtime, scene);
+    }
+    catch (const std::runtime_error& error)
+    {
+        message = error.what();
+        right = message.find(cause) != std::string::npos;
+    }
+    catch (const std::exception& error)
+    {
+        message = std::format("not a std::runtime_error: {}", error.what());
+    }
+    const std::string check = std::format("refused-{}", name);
+    ctx.count(check, right ? 0 : 1, 0, 1);
+    if (!right)
+    {
+        ctx.info(check, std::format("expected a std::runtime_error naming \"{}\"; got {}", cause, message));
+    }
+}
+
+// An upload the runtime must accept: the message of what it threw, empty for none
+std::string upload_error(gpu::optix_runtime& runtime, const gpu::scene_desc& scene)
+{
+    try
+    {
+        [[maybe_unused]] const optix_upload upload(runtime, scene);
+    }
+    catch (const std::exception& error)
+    {
+        return error.what();
+    }
+    return {};
 }
 
 // --- triangle_surface's rules, recomputed in double -------------------------------------------------------------
@@ -1231,6 +1371,123 @@ struct surface_tally
     }
 };
 
+// --- memo.reach, recomputed in double (decision 14) -------------------------------------------------------------
+
+// The reach triangle_surface gives a triangle of corners p (in the mesh's frame, as the GPU holds them) under the 3×4
+// m (as the GPU holds it): the larger of the corners' largest coordinate in the world and their largest coordinate
+// times ‖A‖∞, the largest row sum of m's linear part; by_mesh when the second is the larger
+struct reach_reference
+{
+    double reach = 0;
+    bool by_mesh = false;
+};
+
+reach_reference reach_of(const std::array<dvec, 3>& p, const matrix& m)
+{
+    double in_world = 0;
+    double in_mesh = 0;
+    for (const dvec& corner : p)
+    {
+        in_world = std::max(in_world, max_abs(point(m, corner)));
+        in_mesh = std::max(in_mesh, max_abs(corner));
+    }
+    double row_sum = 0;
+    for (std::size_t r = 0; r < 3; ++r)
+    {
+        row_sum = std::max(row_sum, std::abs(m[4 * r]) + std::abs(m[4 * r + 1]) + std::abs(m[4 * r + 2]));
+    }
+    return {.reach = std::max(in_world, row_sum * in_mesh), .by_mesh = row_sum * in_mesh > in_world};
+}
+
+// The reach of instance `instance`'s triangle `primitive` on the hand-built tables: their own corners and 3×4
+reach_reference held_reach(const host_tables& t, int instance, unsigned int primitive)
+{
+    const gpu::mesh_instance& in = t.instances[static_cast<std::size_t>(instance)];
+    const gpu::mesh_part& part = t.parts[static_cast<std::size_t>(in.part)];
+    const uint3 tri = t.triangles[part.first_triangle + primitive];
+    const std::array<dvec, 3> p{of(t.positions[part.first_vertex + tri.x]), of(t.positions[part.first_vertex + tri.y]),
+                                of(t.positions[part.first_vertex + tri.z])};
+    matrix m{};
+    for (std::size_t i = 0; i < 12; ++i)
+    {
+        m[i] = in.object_to_world[i];
+    }
+    return reach_of(p, m);
+}
+
+// A mesh's centre in an upload (meshes.cu, mesh_frame): the centre of the bounds of the vertices its triangles use,
+// computed in double and rounded to float
+dvec upload_centre(const gpu::mesh_desc& mesh)
+{
+    dvec lower{infinite, infinite, infinite};
+    dvec upper{-infinite, -infinite, -infinite};
+    for (const std::uint32_t v : mesh.indices)
+    {
+        for (std::size_t a = 0; a < 3; ++a)
+        {
+            lower[a] = std::min(lower[a], static_cast<double>(mesh.positions[3 * static_cast<std::size_t>(v) + a]));
+            upper[a] = std::max(upper[a], static_cast<double>(mesh.positions[3 * static_cast<std::size_t>(v) + a]));
+        }
+    }
+    dvec c{};
+    for (std::size_t a = 0; a < 3; ++a)
+    {
+        c[a] = static_cast<float>((lower[a] + upper[a]) / 2);
+    }
+    return c;
+}
+
+// The reach of a placed mesh's triangle `primitive` in an upload, whose centre is c: the corners x − c (in double)
+// rounded to float; the placement's linear part A in float, its translation t + A·c (in double) in float
+reach_reference upload_reach(const gpu::mesh_desc& mesh, const dvec& c, const matrix& placement,
+                             unsigned int primitive)
+{
+    std::array<dvec, 3> p{};
+    for (std::size_t k = 0; k < 3; ++k)
+    {
+        const std::size_t v = mesh.indices[3 * static_cast<std::size_t>(primitive) + k];
+        for (std::size_t a = 0; a < 3; ++a)
+        {
+            p[k][a] = static_cast<float>(static_cast<double>(mesh.positions[3 * v + a]) - c[a]);
+        }
+    }
+    matrix m = placement;
+    for (std::size_t r = 0; r < 3; ++r)
+    {
+        m[4 * r + 3] += m[4 * r] * c[0] + m[4 * r + 1] * c[1] + m[4 * r + 2] * c[2];
+    }
+    return reach_of(p, in_float(m));
+}
+
+// The reaches of a set of hits against their references: within 10^-6 (relative), and each term the larger somewhere,
+// so that both are seen
+struct reach_tally
+{
+    std::int64_t samples = 0;
+    std::int64_t wrong = 0;
+    std::int64_t by_mesh = 0;
+    double worst = 0;
+
+    void add(const reach_reference& e, float reach)
+    {
+        ++samples;
+        by_mesh += e.by_mesh ? 1 : 0;
+        const double off = std::abs(reach - e.reach) / e.reach;
+        worst = std::isnan(off) ? off : std::max(worst, off);
+        wrong += off <= 1e-6 ? 0 : 1;
+    }
+
+    void report(gpu_test::context& ctx, const std::string& prefix) const
+    {
+        ctx.count(prefix + "-reach", wrong, 0, samples);
+        ctx.count(prefix + "-reach-both-terms", by_mesh > 0 && by_mesh < samples ? 0 : 1, 0, 1);
+        ctx.info(prefix + "-reach", std::format("at most {:.3g} of the reference off (<= 1e-6); the corners in the "
+                                                "mesh's frame times ||A|| decided {} of {}, those in the world the "
+                                                "rest",
+                                                worst, by_mesh, samples));
+    }
+};
+
 // A random hit of the tables: an instance, a triangle of its part, uniform barycentrics, a direction from either side
 probe_sample random_hit(host_random& random, const host_tables& t, int instance)
 {
@@ -1387,7 +1644,9 @@ GPU_TEST(optix_triangles, surface)
         t.add_instance(wild, compose(translation(1, 1, 1), scaling(1, -0.7, 1.3), rotation({2, 1, 0}, 15))),
         t.add_instance(ring, compose(translation(400, -250, 555), rotation({0, 0, 1}, 33), scaling(100, 100, 100))),
         t.add_instance(wild, compose(translation(1e-3, 0, 0), scaling(1e-3, 1e-3, 1e-3))),
-        t.add_instance(ring, scaling(-1, 1, 1))};
+        t.add_instance(ring, scaling(-1, 1, 1)),
+        // Untranslated, turned and stretched: |A·p|∞ < ‖A‖∞·|p|∞ for most corners, so the reach's mesh term decides
+        t.add_instance(wild, compose(rotation({1, 2, 3}, 40), scaling(1.5, -0.5, 2)))};
     // The shading normal's rules, each on the triangle of one_triangle() hit at (1/4, 1/4)
     const float nan = std::numeric_limits<float>::quiet_NaN();
     const std::array<float, 9> zero{};
@@ -1516,6 +1775,14 @@ GPU_TEST(optix_triangles, surface)
         inside_out += a.front && dot(of(a.outward), out) > 0 && dot(of(a.normal), out) > 0 ? 0 : 1;
     }
     ctx.count("mirror-outside", inside_out, 0, outside_tested);
+
+    // memo.reach of every hit, from the tables' own corners and transforms (decision 14)
+    reach_tally reach;
+    for (std::size_t k = 0; k < samples.size(); ++k)
+    {
+        reach.add(held_reach(t, samples[k].instance, samples[k].primitive), answers[k].reach);
+    }
+    reach.report(ctx, "surface");
 
     // absorber_surface: diffuse_light black (the absorber's entry M), front_face false, from -1, normal -unit(d), p
     // the ray's origin
@@ -1683,12 +1950,19 @@ GPU_TEST(optix_triangles, brute_force)
             {
                 encode(samples[k], rays.data() + probe_in_words * k);
             }
+            std::vector<double> altitudes(triangles);
+            for (std::size_t i = 0; i < triangles; ++i)
+            {
+                altitudes[i] = smallest_altitude(corners, static_cast<int>(i));
+            }
             const gpu_test::device_buffer<float> device_rays(rays);
             const gpu_test::device_buffer<double> device_corners(corners);
+            const gpu_test::device_buffer<double> device_altitudes(altitudes);
             const gpu_test::device_buffer<brute_answer> device_answers(samples.size());
             const auto n = static_cast<int>(samples.size());
-            brute_force_kernel<0><<<(n + 127) / 128, 128>>>(device_corners.get(), static_cast<int>(triangles),
-                                                            device_rays.get(), n, 0.001, device_answers.get());
+            brute_force_kernel<0><<<(n + 127) / 128, 128>>>(device_corners.get(), device_altitudes.get(),
+                                                            static_cast<int>(triangles), device_rays.get(), n, 0.001,
+                                                            device_answers.get());
             gpu_test::finish_launch("the brute-force kernel");
             const std::vector<brute_answer> reference = device_answers.download();
 
@@ -1989,6 +2263,45 @@ GPU_TEST(optix_triangles, coplanar)
         ctx.info("planted-reversed-face", std::format("{} of {} rays started behind the face hit the plane they leave "
                                                       "(at least 99% must)",
                                                       self, rays));
+
+        // The reach traverse sizes the step with (memo.reach, the probe's word 18): δ = 2^-16·reach once the reach is
+        // above |p|∞. 4·|p|∞ moves the origins half the gap off their faces, which changes nothing; 16·|p|∞ moves
+        // them twice the gap, beyond the neighbour, and the rays, going away from both planes, must meet nothing.
+        const auto step = static_cast<std::size_t>(ctx.samples(10'000));
+        for (const bool beyond : {false, true})
+        {
+            std::vector<probe_sample> reached = leaving_rays(c, upload.triangle_base, step, random);
+            for (probe_sample& s : reached)
+            {
+                s.reach = static_cast<float>((beyond ? 16 : 4) * c.size);
+            }
+            const std::vector<probe_answer> met = probe(ctx, *upload.scene, reached, 9107);
+            const int first = upload.triangle_base + 1;
+            std::int64_t own_plane = 0; // a triangle of the plane left
+            std::int64_t missed = 0;    // anything but the neighbour
+            std::int64_t anything = 0;  // any hit at all
+            for (std::size_t k = 0; k < reached.size(); ++k)
+            {
+                const int layer = static_cast<int>(k % 2);
+                const int index = met[k].index;
+                const int other_first = first + (1 - layer) * coplanar_planes::layer_triangles;
+                own_plane += index >= first + layer * coplanar_planes::layer_triangles &&
+                                     index < first + (layer + 1) * coplanar_planes::layer_triangles
+                                 ? 1
+                                 : 0;
+                missed += index >= other_first && index < other_first + coplanar_planes::layer_triangles ? 0 : 1;
+                anything += index >= 0 ? 1 : 0;
+            }
+            if (!beyond)
+            {
+                ctx.count("coplanar-reach-half-gap-plane-left", own_plane, 0, std::ssize(reached));
+                ctx.count("coplanar-reach-half-gap-neighbour-missed", missed, 0, std::ssize(reached));
+            }
+            else
+            {
+                ctx.count("coplanar-reach-beyond-the-neighbour-met", anything, 0, std::ssize(reached));
+            }
+        }
     });
 }
 
@@ -2008,14 +2321,32 @@ GPU_TEST(optix_triangles, surface_upload)
                             .material_of = {0, 1}};
         gpu::mesh_desc flat = gpu_test::mesh_host::icosphere(1, false);
         std::ranges::fill(flat.material_of, 1u);
+        // Meshes off their own origins, whose centres the upload moves into their placements (t + A·c): the quad 300
+        // units off, and the flat icosphere 1.8 units off
+        const auto shifted = [](gpu::mesh_desc m, const dvec& by) {
+            for (std::size_t k = 0; k < m.positions.size(); ++k)
+            {
+                m.positions[k] = static_cast<float>(m.positions[k] + by[k % 3]);
+            }
+            return m;
+        };
         const std::vector<gpu::mesh_desc> meshes{gpu_test::mesh_host::icosphere(2, true),
-                                                 alternating(gpu_test::mesh_host::torus(1, 0.35, 16, 8)), quad, flat};
+                                                 alternating(gpu_test::mesh_host::torus(1, 0.35, 16, 8)),
+                                                 quad,
+                                                 flat,
+                                                 shifted(quad, {300, -200, 50}),
+                                                 shifted(flat, {1.5, -1, 0.25})};
         const std::vector<std::pair<int, matrix>> placements{
             {0, compose(translation(-3, 0, 1), rotation({0, 1, 1}, 25), scaling(-1.5, 1.5, 1.5))},
             {1, compose(translation(0, 4, -2), rotation({1, 0, 1}, 70), scaling(0.5, 2, 1))},
             {2, compose(translation(2, -1, 0.5), rotation({1, 2, 3}, 40))},
             {3, translation(0, -3, 0)},
-            {0, compose(translation(3, 3, 3), scaling(0.6, -1.4, 1), rotation({1, 1, 0}, 50))}};
+            {0, compose(translation(3, 3, 3), scaling(0.6, -1.4, 1), rotation({1, 1, 0}, 50))},
+            // Turning, mirroring, non-uniform: a fold of t + c, or of A transposed, moves the quad by hundreds
+            {4, compose(translation(-2, 1, 3), rotation({1, -2, 1}, 35), scaling(-0.8, 1.3, 0.6))},
+            // The icosphere's centre taken back to the world's origin: its triangles lie near it, about 1 from their
+            // mesh's centre, so the reach's mesh term decides
+            {5, compose(rotation({2, -1, 1}, 50), scaling(1.2, -0.7, 2), translation(-1.5, 1, -0.25))}};
         const optix_upload upload(*runtime, mesh_scene(meshes, placements));
         // The reference's view of the same meshes: the upload's ids; device_scene folds every texture to a color
         host_tables t;
@@ -2046,6 +2377,21 @@ GPU_TEST(optix_triangles, surface_upload)
             tally.add(expected(t, folded, s.instance, s.primitive, s.b1, s.b2, of(s.direction)), answers[k], true);
         }
         tally.report(ctx, "upload");
+
+        // memo.reach, from the corners and placements as the upload holds them (decision 14)
+        std::vector<dvec> centres;
+        for (const gpu::mesh_desc& m : meshes)
+        {
+            centres.push_back(upload_centre(m));
+        }
+        reach_tally reach;
+        for (std::size_t k = 0; k < samples.size(); ++k)
+        {
+            const auto& [mesh, m] = placements[static_cast<std::size_t>(samples[k].instance)];
+            const auto i = static_cast<std::size_t>(mesh);
+            reach.add(upload_reach(meshes[i], centres[i], m, samples[k].primitive), answers[k].reach);
+        }
+        reach.report(ctx, "upload");
     });
 }
 
@@ -2272,10 +2618,41 @@ GPU_TEST(optix_triangles, pick)
     });
 }
 
-// The render path inside a closed mesh: cornell-triangles' tall block seen from inside through gpu::render, as
-// RayTracingGPU renders it (decision 9). No ray leaves the block and no light enters it, so every path traces max_depth
-// rays and finds nothing: -p material only bounces, -p mis also aims shadow rays at the lamp, which the block's faces
-// (or the through-rule, for one aimed through the face it leaves) must stop.
+// A closed room seen from inside through gpu::render, as RayTracingGPU renders it (decision 9), under -p material and
+// -p mis: no ray leaves the room and no light enters it, so every path traces max_depth rays and finds nothing. The
+// rays may fall short of the full count by 1%, and one pixel may be lit (any channel above 0, or NaN).
+void closed_room(gpu_test::context& ctx, const std::shared_ptr<gpu::optix_runtime>& runtime, gpu::scene_desc scene,
+                 std::string_view check, std::uint64_t seed)
+{
+    const gpu::camera_desc& cam = scene.camera;
+    const std::int64_t samples = std::int64_t{cam.image_width} * cam.image_height * cam.sqrt_spp * cam.sqrt_spp;
+    const std::int64_t full = samples * cam.max_depth;
+    const std::array<std::pair<std::string_view, gpu::light_combination>, 2> strategies{
+        {{"material", gpu::light_combination::bsdf_only}, {"mis", gpu::light_combination::power_heuristic}}};
+    for (const auto& [strategy, combination] : strategies)
+    {
+        scene.quality.combination = combination;
+        const gpu::render_result r = gpu::render(scene, {.seed = seed, .optix_tracer = true, .optix = runtime});
+        const auto rays = static_cast<std::int64_t>(r.rays);
+        const std::int64_t pixels = std::ssize(r.pixels) / 3;
+        std::int64_t lit = 0;
+        for (std::size_t i = 0; i + 2 < r.pixels.size(); i += 3)
+        {
+            lit += r.pixels[i] != 0 || r.pixels[i + 1] != 0 || r.pixels[i + 2] != 0 ? 1 : 0; // NaN too
+        }
+        const std::string name = std::format("{}.{}", check, strategy);
+        ctx.info(name, std::format("{} of the {} rays of full paths ({:.3f} per sample), {} shadow rays; {} of {} "
+                                   "pixels lit, the largest value {:.3g}",
+                                   rays, full, static_cast<double>(rays) / static_cast<double>(samples),
+                                   r.shadow_rays, lit, pixels, *std::ranges::max_element(r.pixels)));
+        ctx.count(name + ".rays-missing", full - rays, full / 100, full);
+        ctx.count(name + ".lit", lit, 1, pixels);
+    }
+}
+
+// The render path inside a closed mesh: cornell-triangles' tall block seen from inside (decision 9). -p material only
+// bounces, -p mis also aims shadow rays at the lamp, which the block's faces (or the through-rule, for one aimed
+// through the face it leaves) must stop.
 GPU_TEST(optix_triangles, closed_block)
 {
     const std::shared_ptr<gpu::optix_runtime> runtime = optix_for(ctx, "closed-block");
@@ -2295,23 +2672,1015 @@ GPU_TEST(optix_triangles, closed_block)
         cam.pixel_delta_u = {0, 0, 0.02};
         cam.pixel_delta_v = {0, -0.02, 0};
         cam.defocus = false;
-        const std::int64_t full = std::int64_t{8} * 8 * 16 * 50;
-        const std::array<std::pair<std::string_view, gpu::light_combination>, 2> strategies{
-            {{"material", gpu::light_combination::bsdf_only}, {"mis", gpu::light_combination::power_heuristic}}};
-        for (const auto& [strategy, combination] : strategies)
+        closed_room(ctx, runtime, scene, "closed-block", 9113);
+    });
+}
+
+// A closed cube of 555 made of 12 triangles, seen from inside near its corner (0, 0, 0) (decision 12): the paths
+// start on the floor where |p|∞ < 1, on triangles that reach 555, and bounce near the corner's three faces; a lamp
+// above the cube, outside it, draws -p mis's shadow rays through the ceiling
+GPU_TEST(optix_triangles, closed_corner)
+{
+    const std::shared_ptr<gpu::optix_runtime> runtime = optix_for(ctx, "closed-corner");
+    if (!runtime)
+    {
+        return;
+    }
+    guarded(ctx, "closed-corner", [&] {
+        // The cube's 8 corners (x, y, z each 0 or 555) and its 6 faces, each two triangles sharing the corners
+        gpu::mesh_desc cube;
+        for (std::uint32_t k = 0; k < 8; ++k)
         {
-            scene.quality.combination = combination;
-            const gpu::render_result r = gpu::render(scene, {.seed = 9113, .optix_tracer = true, .optix = runtime});
-            const auto rays = static_cast<std::int64_t>(r.rays);
-            const std::int64_t lit = std::ranges::count_if(r.pixels, [](double v) { return v != 0; }); // NaN too
-            const std::string name = std::format("closed-block.{}", strategy);
-            ctx.info(name, std::format("{} of the {} rays of full paths ({:.3f} per sample), {} shadow rays; {} of {} "
-                                       "values above 0, the largest {:.3g}",
-                                       rays, full, static_cast<double>(rays) / (8 * 8 * 16), r.shadow_rays, lit,
-                                       r.pixels.size(), *std::ranges::max_element(r.pixels)));
-            ctx.count(name + ".rays-missing", full - rays, full / 100, full);
-            ctx.count(name + ".lit", lit, 1, static_cast<std::int64_t>(r.pixels.size()));
+            const auto side = [k](std::uint32_t bit) { return (k & bit) != 0 ? 555.0f : 0.0f; };
+            cube.positions.insert(cube.positions.end(), {side(1), side(2), side(4)});
+        }
+        const std::array<std::array<std::uint32_t, 4>, 6> faces{{{0, 4, 6, 2},   // x = 0
+                                                                 {1, 3, 7, 5},   // x = 555
+                                                                 {0, 1, 5, 4},   // y = 0, the floor
+                                                                 {2, 6, 7, 3},   // y = 555
+                                                                 {0, 2, 3, 1},   // z = 0
+                                                                 {4, 5, 7, 6}}}; // z = 555
+        for (const auto& f : faces)
+        {
+            cube.indices.insert(cube.indices.end(), {f[0], f[1], f[2], f[0], f[2], f[3]});
+            cube.material_of.insert(cube.material_of.end(), {0u, 0u});
+        }
+        gpu::scene_desc scene = mesh_scene({cube}, {{0, identity}});
+        scene.textures.push_back({.kind = gpu::texture_kind::solid, .rgb = {15, 15, 15}});
+        scene.materials.push_back({.kind = gpu::material_kind::diffuse_light, .texture = 1});
+        scene.quads = {{.q = {200, 600, 200}, .u = {155, 0, 0}, .v = {0, 0, 155}, .material = 2}}; // facing down
+        // From (0.9, 0.9, 0.9) down to the floor's points x 0.48 to 0.8, z 0.09 to 0.25 (the pixels lie halfway): off
+        // the floor's diagonal x = z and its edges; the sky stays lit, so a path that leaves the cube shows
+        gpu::camera_desc& cam = scene.camera;
+        cam.sqrt_spp = 4;
+        cam.max_depth = 50;
+        cam.center = {0.9, 0.9, 0.9};
+        cam.pixel00_loc = {0.7, 0.45, 0.5};
+        cam.pixel_delta_u = {0.02, 0, 0};
+        cam.pixel_delta_v = {0, 0, 0.01};
+        cam.defocus = false;
+        closed_room(ctx, runtime, scene, "closed-corner", 9114);
+    });
+}
+
+// The upload's refusals (meshes.cu), each a std::runtime_error naming its cause, before anything is launched: the
+// materials a triangle can't wear (glass, a lamp, smoke), an index past the mesh's vertices, a material past the set,
+// a triangle's corner that isn't finite, and placements that aren't finite or can't be inverted. And what it must
+// accept: a vertex no triangle uses may hold a NaN, as the glTF loader leaves one when it drops a triangle.
+GPU_TEST(optix_triangles, refusals)
+{
+    const std::shared_ptr<gpu::optix_runtime> runtime = optix_for(ctx, "refusals");
+    if (!runtime)
+    {
+        return;
+    }
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const auto refused = [&](std::string_view name, const gpu::scene_desc& scene, std::string_view cause) {
+        expect_refusal(ctx, *runtime, name, scene, cause);
+    };
+    // A triangle wearing each of the three kinds a triangle can't: the scene's material 2
+    const std::array<std::pair<std::string_view, gpu::material_desc>, 3> worn{
+        {{"glass", {.kind = gpu::material_kind::dielectric, .refraction_index = 1.5}},
+         {"lamp", {.kind = gpu::material_kind::diffuse_light, .texture = 0}},
+         {"smoke", {.kind = gpu::material_kind::isotropic, .texture = 0}}}};
+    const std::array<std::string_view, 3> causes{"is glass", "is a lamp", "particles of smoke"};
+    for (std::size_t i = 0; i < worn.size(); ++i)
+    {
+        gpu::mesh_desc m = one_triangle();
+        m.material_of = {2};
+        gpu::scene_desc scene = mesh_scene({m}, {{0, identity}});
+        scene.materials.push_back(worn[i].second);
+        scene.meshes.materials.push_back({.scene_material = 2});
+        refused(worn[i].first, scene, causes[i]);
+    }
+    // The mesh's own arrays
+    gpu::mesh_desc past = one_triangle();
+    past.indices = {0, 1, 3};
+    refused("index-past-the-vertices", mesh_scene({past}, {{0, identity}}), "of a vertex it doesn't have");
+    gpu::mesh_desc unworn = one_triangle();
+    unworn.material_of = {2};
+    refused("material-past-the-set", mesh_scene({unworn}, {{0, identity}}), "a material the set doesn't have");
+    gpu::mesh_desc corner = one_triangle();
+    corner.positions[4] = nan;
+    refused("corner-not-finite", mesh_scene({corner}, {{0, identity}}), "isn't finite");
+    // The placements: a NaN, and a matrix that flattens the mesh onto a plane (determinant 0)
+    matrix with_nan = translation(1, 2, 3);
+    with_nan[5] = std::numeric_limits<double>::quiet_NaN();
+    refused("transform-nan", mesh_scene({one_triangle()}, {{0, with_nan}}), "can't be inverted");
+    refused("transform-singular", mesh_scene({one_triangle()}, {{0, scaling(1, 1, 0)}}), "can't be inverted");
+
+    // Accepted: a NaN and an infinity in vertices that no triangle uses
+    gpu::mesh_desc spare = one_triangle();
+    spare.positions.insert(spare.positions.end(), {nan, 0, 0, 0, std::numeric_limits<float>::infinity(), 0});
+    spare.uvs.insert(spare.uvs.end(), {0, 0, 0, 0});
+    const std::string message = upload_error(*runtime, mesh_scene({spare}, {{0, identity}}));
+    ctx.count("unused-vertex-not-finite", message.empty() ? 0 : 1, 0, 1);
+    if (!message.empty())
+    {
+        ctx.info("unused-vertex-not-finite", std::format("the upload threw: {}", message));
+    }
+}
+
+// =====================================================================================================================
+// Suite optix-pbr
+// =====================================================================================================================
+
+// --- glTF's materials: the mapping in float, and textures ------------------------------------------------------------
+
+// A glTF material of the hand-built tables (mesh_tables.h's mesh_material): factors in float, textures by handle
+gpu::mesh_material gltf_material(const std::array<double, 3>& base, double metallic, double roughness,
+                                 const cudaTextureObject_t* base_texture = nullptr,
+                                 const cudaTextureObject_t* metal_rough_texture = nullptr)
+{
+    gpu::mesh_material m{};
+    m.scene_material = -1;
+    for (std::size_t c = 0; c < 3; ++c)
+    {
+        m.base_color[c] = static_cast<float>(base[c]);
+    }
+    m.metallic = static_cast<float>(metallic);
+    m.roughness = static_cast<float>(roughness);
+    m.base_color_texture = base_texture ? *base_texture : 0;
+    m.metal_rough_texture = metal_rough_texture ? *metal_rough_texture : 0;
+    m.has_base_color_texture = base_texture ? 1u : 0u;
+    m.has_metal_rough_texture = metal_rough_texture ? 1u : 0u;
+    return m;
+}
+
+// What the mapping of glTF's metallic-roughness model (its Appendix B, onto milestone 4's GGX metal and glossy coat)
+// writes into a hit's slot, in float: base = clamp(factor ⊙ texel, 0, 1), metal = metallic · texel.b, rough =
+// roughness · texel.g (a missing texture reads 1); lobe < metal: the GGX metal (fuzz 0, α = rough², r = rough),
+// otherwise the coat over a matte base (α = max(rough², 10^-3), r = max(rough, 0.0317))
+struct slot_contents
+{
+    gpu::material<float> material;
+    gpu::microfacet facet;
+};
+
+slot_contents mapped_slot(const std::array<float, 3>& factor, float metallic, float roughness,
+                          const std::array<float, 3>& base_texel, float texel_g, float texel_b, float lobe)
+{
+    slot_contents s{};
+    std::array<float, 3> base{};
+    for (std::size_t c = 0; c < 3; ++c)
+    {
+        base[c] = std::clamp(factor[c] * base_texel[c], 0.0f, 1.0f);
+    }
+    const float metal = metallic * texel_b;
+    const float rough = roughness * texel_g;
+    s.material.albedo = {base[0], base[1], base[2]};
+    if (lobe < metal)
+    {
+        s.material.kind = gpu::material_kind::metal;
+        s.material.fuzz = 0;
+        s.facet = {.kind = gpu::microfacet_kind::conductor, .alpha = rough * rough, .roughness = rough};
+    }
+    else
+    {
+        s.material.kind = gpu::material_kind::lambertian;
+        s.facet = {.kind = gpu::microfacet_kind::gloss,
+                   .alpha = std::max(rough * rough, 1e-3f),
+                   .roughness = std::max(rough, 0.0317f)};
+    }
+    return s;
+}
+
+bool same_bits(float a, float b) { return std::bit_cast<std::uint32_t>(a) == std::bit_cast<std::uint32_t>(b); }
+
+// The slot as the integrator reads it against the mapping's: kind and albedo bit for bit, fuzz 0 on a metal, the side
+// entry bit for bit (a lambertian's fuzz and every refraction index are no part of the mapping's table)
+bool slot_matches(const probe_answer& a, const slot_contents& e)
+{
+    const bool metal = e.material.kind == gpu::material_kind::metal;
+    return a.kind == static_cast<int>(e.material.kind) && same_bits(a.albedo[0], e.material.albedo.x) &&
+           same_bits(a.albedo[1], e.material.albedo.y) && same_bits(a.albedo[2], e.material.albedo.z) &&
+           (!metal || same_bits(a.fuzz, 0.0f)) && a.facet_kind == static_cast<int>(e.facet.kind) &&
+           same_bits(a.alpha, e.facet.alpha) && same_bits(a.roughness, e.facet.roughness);
+}
+
+std::string describe(const probe_answer& a)
+{
+    return std::format("kind {}, albedo ({:.9g}, {:.9g}, {:.9g}), fuzz {:.9g}, side entry {} alpha {:.9g} r {:.9g}",
+                       a.kind, a.albedo[0], a.albedo[1], a.albedo[2], a.fuzz, a.facet_kind, a.alpha, a.roughness);
+}
+std::string describe(const slot_contents& e)
+{
+    return std::format("kind {}, albedo ({:.9g}, {:.9g}, {:.9g}), side entry {} alpha {:.9g} r {:.9g}",
+                       static_cast<int>(e.material.kind), e.material.albedo.x, e.material.albedo.y,
+                       e.material.albedo.z, static_cast<int>(e.facet.kind), e.facet.alpha, e.facet.roughness);
+}
+
+// IEC 61966-2-1's decoding of an sRGB value c in [0, 1] to linear light
+double srgb_to_linear(double c) { return c <= 0.04045 ? c / 12.92 : std::pow((c + 0.055) / 1.055, 2.4); }
+
+// |linear - IEC 61966-2-1's decoding of byte b| in halves of the byte's step, decoded (the larger of its two halves):
+// at most 1 for a decode as close to the image as the byte itself (decision 13)
+double srgb_steps_off(double linear, int b)
+{
+    const double c = b / 255.0;
+    const double half = std::max(srgb_to_linear(c + 0.5 / 255) - srgb_to_linear(c),
+                                 srgb_to_linear(c) - srgb_to_linear(c - 0.5 / 255));
+    return std::abs(linear - srgb_to_linear(c)) / half;
+}
+
+// A texture object as meshes.cu says it makes them: one uchar4 cudaArray, read as normalized floats at normalized
+// coordinates, glTF's wrap per axis, bilinear or nearest, sRGB-decoded or not. Freed when it goes.
+class test_texture
+{
+public:
+    test_texture(int width, int height, std::span<const std::uint8_t> rgba, bool srgb, bool nearest)
+    {
+        const cudaChannelFormatDesc format = cudaCreateChannelDesc<uchar4>();
+        gpu_test::cuda_check(
+            cudaMallocArray(&array_, &format, static_cast<std::size_t>(width), static_cast<std::size_t>(height)),
+            "cudaMallocArray");
+        try
+        {
+            const std::size_t row = 4 * static_cast<std::size_t>(width);
+            gpu_test::cuda_check(cudaMemcpy2DToArray(array_, 0, 0, rgba.data(), row, row,
+                                                     static_cast<std::size_t>(height), cudaMemcpyHostToDevice),
+                                 "copying a texture to the GPU");
+            cudaResourceDesc resource{};
+            resource.resType = cudaResourceTypeArray;
+            resource.res.array.array = array_;
+            cudaTextureDesc desc{};
+            desc.addressMode[0] = cudaAddressModeWrap;
+            desc.addressMode[1] = cudaAddressModeWrap;
+            desc.filterMode = nearest ? cudaFilterModePoint : cudaFilterModeLinear;
+            desc.readMode = cudaReadModeNormalizedFloat;
+            desc.normalizedCoords = 1;
+            desc.sRGB = srgb ? 1 : 0;
+            gpu_test::cuda_check(cudaCreateTextureObject(&object_, &resource, &desc, nullptr),
+                                 "cudaCreateTextureObject");
+        }
+        catch (...)
+        {
+            cudaFreeArray(array_);
+            throw;
+        }
+    }
+    ~test_texture()
+    {
+        cudaDestroyTextureObject(object_);
+        cudaFreeArray(array_);
+    }
+    test_texture(const test_texture&) = delete;
+    test_texture& operator=(const test_texture&) = delete;
+
+    const cudaTextureObject_t* object() const { return &object_; }
+
+private:
+    cudaArray_t array_ = nullptr;
+    cudaTextureObject_t object_ = 0;
+};
+
+// tex2D at n points: what the hardware returns there
+template <int Unused>
+__global__ void texel_kernel(cudaTextureObject_t texture, const float2* at, float4* out, int n)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k < n)
+    {
+        out[k] = tex2D<float4>(texture, at[k].x, at[k].y);
+    }
+}
+
+std::vector<float4> texels(const test_texture& texture, const std::vector<float2>& at)
+{
+    const gpu_test::device_buffer<float2> points(at);
+    const gpu_test::device_buffer<float4> out(at.size());
+    const auto n = static_cast<int>(at.size());
+    texel_kernel<0><<<(n + 127) / 128, 128>>>(*texture.object(), points.get(), out.get(), n);
+    gpu_test::finish_launch("the texel kernel");
+    return out.download();
+}
+
+// One small triangle per point of a texture to read: corner 0 carries the point's (u, v), corners 1 and 2 one unit
+// further in u and in v, so the hit (b1, b2) = (0, 0) reads exactly that point (u = 1·u0 + 0·u1 + 0·u2, whatever the
+// order of the sum); flat, counter-clockwise from +z; the triangle wears the point's material
+struct uv_point
+{
+    double u;
+    double v;
+    std::uint32_t material;
+    float lobe;
+};
+
+gpu::mesh_desc uv_points(std::span<const uv_point> points)
+{
+    gpu::mesh_desc m;
+    for (std::size_t j = 0; j < points.size(); ++j)
+    {
+        const auto x = static_cast<float>(j);
+        const auto u = static_cast<float>(points[j].u);
+        const auto v = static_cast<float>(points[j].v);
+        m.positions.insert(m.positions.end(), {x, 0, 0, x + 1, 0, 0, x, 1, 0});
+        m.uvs.insert(m.uvs.end(), {u, v, u + 1, v, u, v + 1});
+        const auto first = static_cast<std::uint32_t>(3 * j);
+        m.indices.insert(m.indices.end(), {first, first + 1, first + 2});
+        m.material_of.push_back(points[j].material);
+    }
+    return m;
+}
+
+// The probe's samples of the points: triangle j of instance 0 at (0, 0), hit from +z, with the point's lobe
+std::vector<probe_sample> point_samples(std::span<const uv_point> points)
+{
+    std::vector<probe_sample> samples;
+    for (std::size_t j = 0; j < points.size(); ++j)
+    {
+        probe_sample s;
+        s.mode = 1;
+        s.instance = 0;
+        s.primitive = static_cast<unsigned int>(j);
+        s.origin = {static_cast<float>(j) + 0.25f, 0.25f, 1.0f};
+        s.direction = {0, 0, -1};
+        s.lobe = points[j].lobe;
+        samples.push_back(s);
+    }
+    return samples;
+}
+
+// The mapping's comparison: n numbers drawn here as memo.lobe on a glTF triangle of metallic 0.3, each thread in its
+// own slot
+template <int Unused>
+__global__ void lobe_kernel(gpu::optix_params p, std::uint64_t seed, int count, unsigned long long* metals)
+{
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    gpu::pcg32 rng = gpu::sample_generator(seed, static_cast<std::uint64_t>(t), 0);
+    unsigned long long local = 0;
+    const gpu::ray<float> r{.origin = {0.25f, 0.25f, 1.0f}, .direction = {0.0f, 0.0f, -1.0f}, .time = 0.0f};
+    const gpu::bvh_hit<float> hit{.index = p.meshes.instances[0].first_id, .t = 1.0f, .entering = false};
+    for (int i = 0; i < count; ++i)
+    {
+        gpu::triangle_memo memo;
+        memo.instance = 0;
+        memo.primitive = 0;
+        memo.b1 = 0.25f;
+        memo.b2 = 0.25f;
+        memo.lobe = gpu::random_real<float>(rng);
+        const gpu::surface<float> s = gpu::triangle_surface(p, r, hit, memo, p.meshes.scratch_base + t);
+        local += p.view.base.materials[s.material].kind == gpu::material_kind::metal ? 1 : 0;
+    }
+    atomicAdd(metals, local);
+}
+
+// The first number of sample_generator(seed, k, 0) for k < n: the generator of the probe's sample k
+template <int Unused>
+__global__ void first_number_kernel(std::uint64_t seed, float* out, int n)
+{
+    const int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k < n)
+    {
+        gpu::pcg32 rng = gpu::sample_generator(seed, static_cast<std::uint64_t>(k), 0);
+        out[k] = gpu::random_real<float>(rng);
+    }
+}
+
+// The mapping in a plain CUDA kernel, on hand-made materials and hand-built tables (textures made here the way
+// meshes.cu says it makes them): each slot against the expected structs bit for bit, the slot's index, texture -1,
+// wears_gltf; a scene material's hit leaves its slot alone. And the hardware's sRGB decode against IEC 61966-2-1.
+GPU_TEST(optix_pbr, mapping)
+{
+    // 2×2 textures read nearest: a base color in sRGB and a metallic-roughness map in linear (G roughness, B metallic)
+    const std::array<std::uint8_t, 16> color_bytes{200, 40,  90,  255, 10, 250, 128, 255,
+                                                   255, 255, 255, 255, 0,  0,   0,   255};
+    const std::array<std::uint8_t, 16> rough_bytes{0, 51, 255, 255, 0, 102, 0, 255, 0, 153, 255, 255, 0, 204, 0, 255};
+    const test_texture color(2, 2, color_bytes, true, true);
+    const test_texture rough(2, 2, rough_bytes, false, true);
+    const std::vector<gpu::mesh_material> gltf{
+        gltf_material({0.9, 0.6, 0.3}, 1, 0.1),                                // 1: a metal, r 0.1
+        gltf_material({0.9, 0.6, 0.3}, 1, 0.5),                                // 2: a rough metal
+        gltf_material({0.2, 0.5, 0.8}, 0, 0.3),                                // 3: a coat over matte
+        gltf_material({0.2, 0.5, 0.8}, 0, 0.8),                                // 4: a rough coat
+        gltf_material({0.2, 0.5, 0.8}, 0, 0.01),                               // 5: the coat's floors
+        gltf_material({0.2, 0.5, 0.8}, 0, 0),                                  // 6: roughness 0 on the coat
+        gltf_material({0.9, 0.6, 0.3}, 1, 0),                                  // 7: a smooth metal (α 0)
+        gltf_material({0.7, 0.7, 0.7}, 0.5, 0.4),                              // 8: half metal
+        gltf_material({1.5, -0.25, 0.5}, 1, 0.5),                              // 9: a factor past [0, 1], metal
+        gltf_material({1.5, -0.25, 0.5}, 0, 0.5),                              // 10: the same on the coat
+        gltf_material({0.5, 0.3, 0.3}, 0.3f, 0.5),                             // 11: lobe = metallic: not a metal
+        gltf_material({0.5, 0.75, 1}, 0.9, 0.6, color.object(), rough.object()), // 12: both textures
+        gltf_material({1, 1, 1}, 1, 1, color.object(), rough.object())};       // 13: the textures' own values
+    host_tables t;
+    t.materials = {scene_material(0)};
+    t.materials.insert(t.materials.end(), gltf.begin(), gltf.end());
+    std::vector<uv_point> points{{0.5, 0.5, 1, 0.5f},  {0.5, 0.5, 2, 0.5f},  {0.5, 0.5, 3, 0.5f},  {0.5, 0.5, 4, 0.5f},
+                                 {0.5, 0.5, 5, 0.5f},  {0.5, 0.5, 6, 0.5f},  {0.5, 0.5, 7, 0.5f},  {0.5, 0.5, 8, 0.25f},
+                                 {0.5, 0.5, 8, 0.75f}, {0.5, 0.5, 9, 0.5f},  {0.5, 0.5, 10, 0.5f}, {0.5, 0.5, 11, 0.3f},
+                                 {0.5, 0.5, 0, 0.5f}}; // the last: a scene material
+    const std::size_t scene_point = points.size() - 1;
+    std::vector<float2> centres;
+    for (int y = 0; y < 2; ++y)
+    {
+        for (int x = 0; x < 2; ++x)
+        {
+            const double u = (x + 0.5) / 2;
+            const double v = (y + 0.5) / 2;
+            points.push_back({u, v, 12, 0.5f});
+            points.push_back({u, v, 13, 0.5f});
+            centres.push_back(make_float2(static_cast<float>(u), static_cast<float>(v)));
+        }
+    }
+    t.add_instance(t.add_part(uv_points(points)), identity);
+    const std::vector<probe_sample> samples = point_samples(points);
+    const device_tables tables(t, hand_materials, hand_textures, static_cast<int>(samples.size()));
+    const std::vector<probe_answer> answers = surfaces_in_cuda(tables, samples);
+    const std::vector<float4> color_texels = texels(color, centres);
+    const std::vector<float4> rough_texels = texels(rough, centres);
+
+    std::int64_t wrong = 0;
+    std::int64_t gltf_hits = 0;
+    std::string first_wrong;
+    std::int64_t slot_index = 0;
+    std::set<std::uint32_t> refraction_indices;
+    for (std::size_t k = 0; k < points.size(); ++k)
+    {
+        if (k == scene_point)
+        {
+            continue;
+        }
+        ++gltf_hits;
+        const gpu::mesh_material& m = t.materials[points[k].material];
+        std::array<float, 3> base_texel{1, 1, 1};
+        float texel_g = 1;
+        float texel_b = 1;
+        if (m.has_base_color_texture != 0)
+        {
+            const float4 c = color_texels[(k - scene_point - 1) / 2];
+            base_texel = {c.x, c.y, c.z};
+        }
+        if (m.has_metal_rough_texture != 0)
+        {
+            const float4 c = rough_texels[(k - scene_point - 1) / 2];
+            texel_g = c.y;
+            texel_b = c.z;
+        }
+        const slot_contents e = mapped_slot({m.base_color[0], m.base_color[1], m.base_color[2]}, m.metallic,
+                                            m.roughness, base_texel, texel_g, texel_b, points[k].lobe);
+        const probe_answer& a = answers[k];
+        const bool right = slot_matches(a, e) && a.wears_gltf && a.texture_index == -1;
+        if (!right && first_wrong.empty())
+        {
+            first_wrong = std::format("point {}: {}; expected {}", k, describe(a), describe(e));
+        }
+        wrong += right ? 0 : 1;
+        slot_index += a.material == tables.scratch_base() + static_cast<int>(k) ? 0 : 1;
+        refraction_indices.insert(std::bit_cast<std::uint32_t>(a.refraction_index));
+    }
+    ctx.count("mapping", wrong, 0, gltf_hits);
+    if (!first_wrong.empty())
+    {
+        ctx.info("mapping", first_wrong);
+    }
+    ctx.count("mapping-slot-index", slot_index, 0, gltf_hits); // s.material = scratch_base + the pixel
+    std::string indices;
+    for (const std::uint32_t r : refraction_indices)
+    {
+        indices += std::format("{}{}", indices.empty() ? "" : ", ", std::bit_cast<float>(r));
+    }
+    ctx.info("mapping-refraction-index", std::format("{} (no part of the mapping's table)", indices));
+    // A scene material's hit: wears_gltf false, its own material, and its slot left as it was
+    const probe_answer& s = answers[scene_point];
+    const std::vector<gpu::material<float>> after = tables.materials();
+    const gpu::material<float>& slot = after[static_cast<std::size_t>(tables.scratch_base()) + scene_point];
+    const bool untouched = slot.kind == slot_sentinel.kind && same_bits(slot.albedo.x, slot_sentinel.albedo.x) &&
+                           same_bits(slot.fuzz, slot_sentinel.fuzz);
+    ctx.count("scene-material-hit", !s.wears_gltf && s.material == 0 && untouched ? 0 : 1, 0, 1);
+
+    // The hardware's sRGB decode: byte i of a 256×1 texture at its texel's centre, against IEC 61966-2-1
+    std::vector<std::uint8_t> ramp;
+    std::vector<float2> ramp_centres;
+    for (int i = 0; i < 256; ++i)
+    {
+        const auto b = static_cast<std::uint8_t>(i);
+        ramp.insert(ramp.end(), {b, b, b, 255});
+        ramp_centres.push_back(make_float2((i + 0.5f) / 256, 0.5f));
+    }
+    const test_texture srgb(256, 1, ramp, true, false);
+    const std::vector<float4> decoded = texels(srgb, ramp_centres);
+    double largest = 0;
+    double largest_off = 0;
+    int at = 0;
+    for (int i = 0; i < 256; ++i)
+    {
+        const float4 d = decoded[static_cast<std::size_t>(i)];
+        const double steps = std::max({srgb_steps_off(d.x, i), srgb_steps_off(d.y, i), srgb_steps_off(d.z, i)});
+        largest_off = std::max(largest_off, std::abs(d.x - srgb_to_linear(i / 255.0)));
+        if (!(steps <= largest))
+        {
+            largest = steps;
+            at = i;
+        }
+    }
+    ctx.exact("srgb-decode-hardware", largest, 0, 1);
+    ctx.info("srgb-decode-hardware", std::format("over the 256 bytes the decode is at most {:.3g} of a byte's half "
+                                                 "step from IEC 61966-2-1, at byte {}; the largest |difference| {:.3g}",
+                                                 largest, at, largest_off));
+}
+
+// The mapping's comparison lobe < metal, on numbers the kernel draws itself (closest()'s draw is lobe-draw's): P(metal)
+// = metallic (glTF's mix of metal and dielectric) over 10^6 numbers at metallic 0.3, binomial |z| <= 4; planted: the
+// same count against 0.31 must be rejected
+GPU_TEST(optix_pbr, lobe_comparison)
+{
+    host_tables t;
+    t.materials = {gltf_material({0.5, 0.5, 0.5}, 0.3, 0.5)};
+    t.add_instance(t.add_part(one_triangle()), identity);
+    const device_tables tables(t, hand_materials, hand_textures, gpu_test::test_threads);
+    const std::int64_t n = ctx.samples(1'000'000);
+    gpu_test::device_buffer<unsigned long long> metals(1);
+    lobe_kernel<0><<<gpu_test::test_blocks, gpu_test::test_block_size>>>(tables.params(), 9120,
+                                                                         gpu_test::per_thread(n), metals.get());
+    gpu_test::finish_launch("the lobe kernel");
+    const auto drawn = static_cast<double>(gpu_test::drawn(n));
+    const double share = static_cast<double>(metals.download()[0]) / drawn;
+    // P(lobe < 0.3f) for lobe = k·2^-24 is exactly 0.3f: 0.3f = 5033165·2^-24
+    const double p = 0.3f;
+    ctx.mean("comparison-metal-share", share, std::sqrt(p * (1 - p) / drawn), p);
+    const double wrong = 0.31;
+    const double z = (share - wrong) / std::sqrt(wrong * (1 - wrong) / drawn);
+    ctx.must_reject("planted-comparison-share", z, 0, gpu_test::normal_two_sided_p(z));
+}
+
+// closest()'s draw of the lobe number, through the probe's mode 0 (decision 15): rays straight down at a glTF triangle
+// of metallic 0.3, one per launch index and generator, each lobe the generator's first number and below 0.3f with
+// P = 0.3f; planted: the same count against 0.31 must be rejected. A ray at a triangle wearing a scene material and a
+// ray that misses draw nothing: their lobe stays 0.
+GPU_TEST(optix_pbr, lobe_draw)
+{
+    const std::shared_ptr<gpu::optix_runtime> runtime = optix_for(ctx, "lobe-draw");
+    if (!runtime)
+    {
+        return;
+    }
+    guarded(ctx, "lobe-draw", [&] {
+        // Triangle 0 wears glTF's material (mesh material 2), triangle 1, two units along x, the scene's matte
+        gpu::mesh_desc pair{.positions = {0, 0, 0, 1, 0, 0, 0, 1, 0, 2, 0, 0, 3, 0, 0, 2, 1, 0},
+                            .normals = {},
+                            .uvs = {},
+                            .indices = {0, 1, 2, 3, 4, 5},
+                            .material_of = {2, 0}};
+        gpu::scene_desc scene = mesh_scene({pair}, {{0, identity}});
+        scene.meshes.materials.push_back(
+            {.scene_material = -1, .base_color = {0.5, 0.5, 0.5}, .metallic = 0.3, .roughness = 0.5});
+        const optix_upload upload(*runtime, scene);
+        const auto down_at = [](float x) {
+            probe_sample s;
+            s.origin = {x, 0.25f, 1.0f};
+            s.direction = {0.0f, 0.0f, -1.0f};
+            return s;
+        };
+        const auto n = static_cast<std::size_t>(ctx.samples(1 << 18));
+        std::vector<probe_sample> samples(n, down_at(0.25f));
+        samples.push_back(down_at(2.25f)); // the scene material's triangle
+        samples.push_back(down_at(5.0f));  // nothing there
+        const std::vector<probe_answer> answers =
+            probe(ctx, *upload.scene, samples, 9111, false, nullptr, samples.size()); // one launch
+        const gpu_test::device_buffer<float> first(n);
+        first_number_kernel<0><<<static_cast<unsigned int>((n + 127) / 128), 128>>>(9111, first.get(),
+                                                                                     static_cast<int>(n));
+        gpu_test::finish_launch("the first-number kernel");
+        const std::vector<float> numbers = first.download();
+
+        std::int64_t not_hit = 0;
+        std::int64_t other_number = 0;
+        std::int64_t metals = 0;
+        for (std::size_t k = 0; k < n; ++k)
+        {
+            not_hit += answers[k].index == upload.triangle_base + 1 ? 0 : 1;
+            other_number += same_bits(answers[k].lobe, numbers[k]) ? 0 : 1;
+            metals += answers[k].lobe < 0.3f ? 1 : 0;
+        }
+        const auto rays = static_cast<std::int64_t>(n);
+        ctx.count("draw-gltf-hits", not_hit, 0, rays);
+        ctx.count("draw-first-number", other_number, 0, rays);
+        const double share = static_cast<double>(metals) / static_cast<double>(n);
+        const double p = 0.3f; // as lobe-comparison: exactly the share of the numbers k·2^-24 below 0.3f
+        ctx.mean("draw-metal-share", share, std::sqrt(p * (1 - p) / static_cast<double>(n)), p);
+        const double wrong = 0.31;
+        const double z = (share - wrong) / std::sqrt(wrong * (1 - wrong) / static_cast<double>(n));
+        ctx.must_reject("planted-draw-share", z, 0, gpu_test::normal_two_sided_p(z));
+        const probe_answer& matte = answers[n];
+        ctx.count("draw-scene-material",
+                  matte.index == upload.triangle_base + 2 && same_bits(matte.lobe, 0.0f) ? 0 : 1, 0, 1);
+        const probe_answer& sky = answers[n + 1];
+        ctx.count("draw-miss", sky.index == -1 && same_bits(sky.lobe, 0.0f) ? 0 : 1, 0, 1);
+    });
+}
+
+// The texture objects meshes.cu makes, through its upload and optix_tracer::surface_of (the probe's mode 1): IEC's
+// sRGB curve for every byte of a base color, linear metallic-roughness, bilinear reads at texel centres equal the
+// texel, (0, 0) the top-left texel, the wrap modes at u and v = -0.25 and 1.25, glTF's NEAREST; and the mapping end to
+// end on materials given as mesh_material_descs (their doubles become the floats of the expected structs). The probe
+// grows the tables past the 8×8 camera's 64 slots first (prepare_view): a triangle wearing a scene material, and the
+// absorber (the probe's mode 2), then read what the longer tables copied of the scene's materials and side entries.
+GPU_TEST(optix_pbr, textures)
+{
+    const std::shared_ptr<gpu::optix_runtime> runtime = optix_for(ctx, "textures");
+    if (!runtime)
+    {
+        return;
+    }
+    guarded(ctx, "textures", [&] {
+        gpu::scene_desc scene = mesh_scene({}, {});
+        // A side entry of the scene's own on its matte, a glossy coat, so that a copy of the side entries shows
+        scene.quality.microfacets = {{.kind = gpu::microfacet_kind::gloss, .roughness = 0.5}, {}};
+        std::vector<gpu::mesh_texture_desc> textures;
+        const auto add_texture = [&textures](int width, int height, std::vector<std::uint8_t> rgba, bool srgb,
+                                             gpu::texture_wrap s = gpu::texture_wrap::repeat,
+                                             gpu::texture_wrap t = gpu::texture_wrap::repeat, bool nearest = false) {
+            textures.push_back({.width = width,
+                                .height = height,
+                                .rgba = std::move(rgba),
+                                .srgb = srgb,
+                                .wrap_s = s,
+                                .wrap_t = t,
+                                .nearest = nearest});
+            return static_cast<int>(textures.size()) - 1;
+        };
+        std::vector<gpu::mesh_material_desc> materials;
+        const auto add_material = [&materials](std::array<double, 3> base, double metallic, double roughness,
+                                               int base_texture = -1, int metal_rough_texture = -1) {
+            materials.push_back({.scene_material = -1,
+                                 .base_color = base,
+                                 .metallic = metallic,
+                                 .roughness = roughness,
+                                 .base_color_texture = base_texture,
+                                 .metal_rough_texture = metal_rough_texture});
+            return static_cast<std::uint32_t>(materials.size()) - 1;
+        };
+        // Every byte of a base color in sRGB (R = G = B = i), on a metal: the slot's albedo is the decoded byte
+        std::vector<std::uint8_t> ramp;
+        for (int i = 0; i < 256; ++i)
+        {
+            const auto b = static_cast<std::uint8_t>(i);
+            ramp.insert(ramp.end(), {b, b, b, 255});
+        }
+        const std::uint32_t srgb_metal = add_material({1, 1, 1}, 1, 0.5, add_texture(256, 1, ramp, true));
+        // A 4×4 metallic-roughness map, G = 16·(4y + x) + 8 at texel (x, y) of rows from the top, B = 255 (metal):
+        // roughness 1 reads G itself into the side entry's r
+        const auto grid_g = [](int x, int y) { return static_cast<std::uint8_t>(16 * (4 * y + x) + 8); };
+        std::vector<std::uint8_t> grid;
+        std::vector<std::uint8_t> grey_grid;
+        for (int y = 0; y < 4; ++y)
+        {
+            for (int x = 0; x < 4; ++x)
+            {
+                grid.insert(grid.end(), {0, grid_g(x, y), 255, 255});
+                grey_grid.insert(grey_grid.end(), {grid_g(x, y), grid_g(x, y), grid_g(x, y), 255});
+            }
+        }
+        const std::uint32_t grid_metal = add_material({1, 1, 1}, 1, 1, -1, add_texture(4, 4, grid, false));
+        // The same bytes as a base color, bilinear and nearest: at a texel's centre the two read the same
+        const std::uint32_t grey_linear = add_material({1, 1, 1}, 1, 0.5, add_texture(4, 4, grey_grid, true));
+        const std::uint32_t grey_nearest = add_material(
+            {1, 1, 1}, 1, 0.5,
+            add_texture(4, 4, grey_grid, true, gpu::texture_wrap::repeat, gpu::texture_wrap::repeat, true));
+        // 4×1 and 1×4 maps of G = 20, 80, 160, 240 under each wrap mode, bilinear; and 4×1 nearest
+        const std::array<std::uint8_t, 4> strip{20, 80, 160, 240};
+        std::vector<std::uint8_t> strip_bytes;
+        for (const std::uint8_t g : strip)
+        {
+            strip_bytes.insert(strip_bytes.end(), {0, g, 255, 255});
+        }
+        const std::array<gpu::texture_wrap, 3> wraps{gpu::texture_wrap::repeat, gpu::texture_wrap::mirrored_repeat,
+                                                     gpu::texture_wrap::clamp};
+        std::array<std::uint32_t, 3> along_u{};
+        std::array<std::uint32_t, 3> along_v{};
+        for (std::size_t w = 0; w < 3; ++w)
+        {
+            along_u[w] = add_material({1, 1, 1}, 1, 1, -1,
+                                      add_texture(4, 1, strip_bytes, false, wraps[w], gpu::texture_wrap::repeat));
+            along_v[w] = add_material({1, 1, 1}, 1, 1, -1,
+                                      add_texture(1, 4, strip_bytes, false, gpu::texture_wrap::repeat, wraps[w]));
+        }
+        const std::uint32_t strip_nearest =
+            add_material({1, 1, 1}, 1, 1, -1,
+                         add_texture(4, 1, strip_bytes, false, gpu::texture_wrap::repeat, gpu::texture_wrap::repeat,
+                                     true));
+        // Both textures with factors, and the same textures with factors 1 (their own values): the mapping end to end
+        const int color = add_texture(2, 2, {200, 40, 90, 255, 10, 250, 128, 255, 255, 255, 255, 255, 0, 0, 0, 255},
+                                      true, gpu::texture_wrap::repeat, gpu::texture_wrap::repeat, true);
+        const int rough = add_texture(2, 2, {0, 51, 255, 255, 0, 102, 0, 255, 0, 153, 255, 255, 0, 204, 0, 255}, false,
+                                      gpu::texture_wrap::repeat, gpu::texture_wrap::repeat, true);
+        const std::uint32_t textured = add_material({0.5, 0.75, 1}, 0.9, 0.6, color, rough);
+        const std::uint32_t textured_plain = add_material({1, 1, 1}, 1, 1, color, rough);
+        // Factors alone
+        const std::array<std::uint32_t, 4> factor_only{add_material({0.9, 0.6, 0.3}, 1, 0.1),
+                                                       add_material({0.2, 0.5, 0.8}, 0, 0.3),
+                                                       add_material({0.2, 0.5, 0.8}, 0, 0.01),
+                                                       add_material({0.7, 0.7, 0.7}, 0.5, 0.4)};
+
+        std::vector<uv_point> points;
+        for (int i = 0; i < 256; ++i)
+        {
+            points.push_back({(i + 0.5) / 256, 0.5, srgb_metal, 0.0f});
+        }
+        const std::size_t first_grid = points.size();
+        for (int y = 0; y < 4; ++y)
+        {
+            for (int x = 0; x < 4; ++x)
+            {
+                const double u = (x + 0.5) / 4;
+                const double v = (y + 0.5) / 4;
+                points.push_back({u, v, grid_metal, 0.5f});
+                points.push_back({u, v, grey_linear, 0.0f});
+                points.push_back({u, v, grey_nearest, 0.0f});
+            }
+        }
+        const std::size_t first_wrap = points.size();
+        for (std::size_t w = 0; w < 3; ++w)
+        {
+            for (const double at : {-0.25, 1.25})
+            {
+                points.push_back({at, 0.5, along_u[w], 0.5f});
+                points.push_back({0.5, at, along_v[w], 0.5f});
+            }
+        }
+        const std::size_t first_nearest = points.size();
+        points.push_back({0.4, 0.5, strip_nearest, 0.5f}); // texel 1.6 → texel 1
+        points.push_back({0.6, 0.5, strip_nearest, 0.5f}); // texel 2.4 → texel 2
+        const std::size_t first_textured = points.size();
+        for (int y = 0; y < 2; ++y)
+        {
+            for (int x = 0; x < 2; ++x)
+            {
+                points.push_back({(x + 0.5) / 2, (y + 0.5) / 2, textured, 0.5f});
+                points.push_back({(x + 0.5) / 2, (y + 0.5) / 2, textured_plain, 0.5f});
+            }
+        }
+        const std::size_t first_factor = points.size();
+        for (const std::uint32_t m : factor_only)
+        {
+            points.push_back({0.5, 0.5, m, 0.25f});
+        }
+        points.push_back({0.5, 0.5, factor_only[3], 0.75f});
+        // Then a triangle wearing the scene's matte, and (a sample of its own, after the points') the absorber
+        const std::size_t gltf_points = points.size();
+        materials.push_back({.scene_material = 0});
+        points.push_back({0.5, 0.5, static_cast<std::uint32_t>(materials.size() - 1), 0.5f});
+
+        scene.meshes.meshes = {std::make_shared<const gpu::mesh_desc>(uv_points(points))};
+        scene.meshes.instances = {{.mesh = 0, .object_to_world = identity}};
+        scene.meshes.materials = materials;
+        for (gpu::mesh_texture_desc& d : textures)
+        {
+            scene.meshes.textures.push_back(std::make_shared<const gpu::mesh_texture_desc>(std::move(d)));
+        }
+        const optix_upload upload(*runtime, scene);
+        std::vector<probe_sample> samples = point_samples(points);
+        probe_sample absorber;
+        absorber.mode = 2;
+        absorber.origin = {0.5f, 0.5f, 1.0f};
+        absorber.direction = {0.0f, 0.0f, -1.0f};
+        samples.push_back(absorber);
+        const std::vector<probe_answer> answers = probe(ctx, *upload.scene, samples, 9122);
+
+        // The slot of sample k is entry M + 1 + k (M scene materials, then the absorber); its texture -1
+        const int scratch_base = static_cast<int>(scene.materials.size()) + 1;
+        std::int64_t slot_index = 0;
+        for (std::size_t k = 0; k < gltf_points; ++k)
+        {
+            slot_index += answers[k].material == scratch_base + static_cast<int>(k) && answers[k].texture_index == -1
+                              ? 0
+                              : 1;
+        }
+        ctx.count("slot-index", slot_index, 0, static_cast<std::int64_t>(gltf_points));
+
+        // The tables grew from 64 slots to one per sample: what they copied of the scene's own entries. The matte's
+        // triangle reads the matte (the solid 0.5 its texture folds to) and its coat (α = 0.5², r = 0.5); the
+        // absorber, entry M, a black diffuse_light without a side entry, from -1
+        const probe_answer& matte = answers[gltf_points];
+        const bool matte_right =
+            matte.material == 0 && matte.kind == static_cast<int>(gpu::material_kind::lambertian) &&
+            same_bits(matte.albedo[0], 0.5f) && same_bits(matte.albedo[1], 0.5f) && same_bits(matte.albedo[2], 0.5f) &&
+            matte.facet_kind == static_cast<int>(gpu::microfacet_kind::gloss) && same_bits(matte.alpha, 0.25f) &&
+            same_bits(matte.roughness, 0.5f);
+        ctx.count("grown-tables-scene-material", matte_right ? 0 : 1, 0, 1);
+        if (!matte_right)
+        {
+            ctx.info("grown-tables-scene-material", std::format("material {}: {}", matte.material, describe(matte)));
+        }
+        const probe_answer& black = answers.back();
+        const bool absorber_right =
+            black.material == static_cast<int>(scene.materials.size()) &&
+            black.kind == static_cast<int>(gpu::material_kind::diffuse_light) && same_bits(black.albedo[0], 0.0f) &&
+            same_bits(black.albedo[1], 0.0f) && same_bits(black.albedo[2], 0.0f) &&
+            black.facet_kind == static_cast<int>(gpu::microfacet_kind::none) && same_bits(black.alpha, 0.0f) &&
+            same_bits(black.roughness, 0.0f) && black.from == -1 && black.surfaced;
+        ctx.count("grown-tables-absorber", absorber_right ? 0 : 1, 0, 1);
+        if (!absorber_right)
+        {
+            ctx.info("grown-tables-absorber", std::format("material {}: {}", black.material, describe(black)));
+        }
+
+        // sRGB: every byte against IEC 61966-2-1, through meshes.cu's base color texture
+        double largest = 0;
+        double largest_off = 0;
+        int at = 0;
+        std::int64_t not_metal = 0;
+        for (int i = 0; i < 256; ++i)
+        {
+            const probe_answer& a = answers[static_cast<std::size_t>(i)];
+            const double steps = std::max(
+                {srgb_steps_off(a.albedo[0], i), srgb_steps_off(a.albedo[1], i), srgb_steps_off(a.albedo[2], i)});
+            largest_off = std::max(largest_off, std::abs(a.albedo[0] - srgb_to_linear(i / 255.0)));
+            not_metal += a.kind == static_cast<int>(gpu::material_kind::metal) ? 0 : 1;
+            if (!(steps <= largest))
+            {
+                largest = steps;
+                at = i;
+            }
+        }
+        ctx.count("srgb-on-a-metal", not_metal, 0, 256);
+        ctx.exact("srgb-decode", largest, 0, 1);
+        ctx.info("srgb-decode", std::format("over the 256 bytes the decode is at most {:.3g} of a byte's half step "
+                                            "from IEC 61966-2-1, at byte {}; the largest |difference| {:.3g}",
+                                            largest, at, largest_off));
+
+        // Bilinear at texel centres, linear and from the top-left: r = G(x, y)/255
+        double grid_off = 0;
+        double grey_apart = 0;
+        double grey_off = 0;
+        for (int y = 0; y < 4; ++y)
+        {
+            for (int x = 0; x < 4; ++x)
+            {
+                const std::size_t k = first_grid + 3 * static_cast<std::size_t>(4 * y + x);
+                const int level = grid_g(x, y);
+                const double g = level / 255.0;
+                const probe_answer& metal = answers[k];
+                grid_off = std::max(grid_off, metal.kind == static_cast<int>(gpu::material_kind::metal)
+                                                  ? std::abs(metal.roughness - g)
+                                                  : infinite);
+                const probe_answer& linear = answers[k + 1];
+                const probe_answer& nearest = answers[k + 2];
+                grey_apart = std::max(grey_apart, apart(of(linear.albedo), of(nearest.albedo)));
+                grey_off = std::max(grey_off, srgb_steps_off(linear.albedo[0], level));
+            }
+        }
+        ctx.exact("linear-texel-centres", grid_off, 0, 1e-6); // the top-left origin: row y is the y-th from the top
+        ctx.exact("bilinear-equals-nearest-at-centres", grey_apart, 0, 1e-6);
+        ctx.exact("bilinear-srgb-at-centres", grey_off, 0, 1); // in halves of a byte's step (decision 13)
+
+        // Wrap: bilinear halfway between two texels at -0.25 and 1.25 (texel coordinates -1.5 and 4.5)
+        const auto g = [&strip](std::size_t i) { return strip[i] / 255.0; };
+        const std::array<std::array<double, 2>, 3> wrapped{{{(g(2) + g(3)) / 2, (g(0) + g(1)) / 2},  // repeat
+                                                            {(g(0) + g(1)) / 2, (g(2) + g(3)) / 2},  // mirrored repeat
+                                                            {g(0), g(3)}}};                          // clamp
+        const std::array<std::string_view, 3> wrap_names{"repeat", "mirrored-repeat", "clamp"};
+        for (std::size_t w = 0; w < 3; ++w)
+        {
+            for (std::size_t side = 0; side < 2; ++side)
+            {
+                const std::size_t k = first_wrap + 4 * w + 2 * side;
+                const std::string where = side == 0 ? "-0.25" : "1.25";
+                ctx.exact(std::format("wrap-{}-u-at-{}", wrap_names[w], where), answers[k].roughness,
+                          wrapped[w][side], 2e-3);
+                ctx.exact(std::format("wrap-{}-v-at-{}", wrap_names[w], where), answers[k + 1].roughness,
+                          wrapped[w][side], 2e-3);
+            }
+        }
+        ctx.exact("nearest-u-0.4", answers[first_nearest].roughness, g(1), 1e-6);
+        ctx.exact("nearest-u-0.6", answers[first_nearest + 1].roughness, g(2), 1e-6);
+
+        // The mapping end to end: the factors' floats (the descs' doubles rounded) times the texels the plain material
+        // reads
+        std::int64_t wrong = 0;
+        std::string first_wrong;
+        const auto expect = [&](std::size_t k, const gpu::mesh_material_desc& d, const std::array<float, 3>& texel,
+                                float texel_g, float texel_b) {
+            const slot_contents e =
+                mapped_slot({static_cast<float>(d.base_color[0]), static_cast<float>(d.base_color[1]),
+                             static_cast<float>(d.base_color[2])},
+                            static_cast<float>(d.metallic), static_cast<float>(d.roughness), texel, texel_g, texel_b,
+                            points[k].lobe);
+            const bool right = slot_matches(answers[k], e);
+            if (!right && first_wrong.empty())
+            {
+                first_wrong = std::format("point {}: {}; expected {}", k, describe(answers[k]), describe(e));
+            }
+            wrong += right ? 0 : 1;
+        };
+        const std::array<std::uint8_t, 4> rough_b{255, 0, 255, 0};
+        for (std::size_t c = 0; c < 4; ++c)
+        {
+            const std::size_t k = first_textured + 2 * c;
+            const probe_answer& plain = answers[k + 1]; // factors 1: albedo = the decoded texel, r = G, B 0 or 1
+            expect(k, materials[textured], plain.albedo, plain.roughness, rough_b[c] / 255.0f);
+        }
+        for (std::size_t k = first_factor; k < gltf_points; ++k)
+        {
+            expect(k, materials[points[k].material], {1, 1, 1}, 1, 1);
+        }
+        ctx.count("mapping-end-to-end", wrong, 0, static_cast<std::int64_t>(4 + gltf_points - first_factor));
+        if (!first_wrong.empty())
+        {
+            ctx.info("mapping-end-to-end", first_wrong);
         }
     });
+}
+
+// A texture of `bytes` bytes, each 128, as the upload takes it
+std::shared_ptr<const gpu::mesh_texture_desc> grey_texture(int width, int height, std::size_t bytes, bool srgb)
+{
+    return std::make_shared<const gpu::mesh_texture_desc>(
+        gpu::mesh_texture_desc{.width = width, .height = height, .rgba = std::vector<std::uint8_t>(bytes, 128),
+                               .srgb = srgb});
+}
+
+// The upload's refusals of glTF's materials and textures (meshes.cu), each a std::runtime_error naming its cause,
+// before anything is allocated or launched, each made from one scene the upload accepts: a triangle wearing glTF's
+// material 2, a base color texture 0 in sRGB and a metallic-roughness texture 1 read linearly
+GPU_TEST(optix_pbr, refusals)
+{
+    const std::shared_ptr<gpu::optix_runtime> runtime = optix_for(ctx, "refusals");
+    if (!runtime)
+    {
+        return;
+    }
+    const auto accepted = [] {
+        gpu::mesh_desc m = one_triangle();
+        m.material_of = {2};
+        gpu::scene_desc scene = mesh_scene({m}, {{0, identity}});
+        scene.meshes.materials.push_back({.scene_material = -1,
+                                          .base_color = {0.5, 0.5, 0.5},
+                                          .metallic = 0.5,
+                                          .roughness = 0.5,
+                                          .base_color_texture = 0,
+                                          .metal_rough_texture = 1});
+        scene.meshes.textures = {grey_texture(2, 2, 16, true), grey_texture(2, 2, 16, false)};
+        return scene;
+    };
+    const std::string message = upload_error(*runtime, accepted());
+    ctx.count("accepted", message.empty() ? 0 : 1, 0, 1);
+    if (!message.empty())
+    {
+        ctx.info("accepted", std::format("the upload threw: {}", message));
+    }
+    // `change` made to the accepted scene's glTF material (mesh material 2) or its textures
+    const auto refused = [&](std::string_view name, const auto& change, std::string_view cause) {
+        gpu::scene_desc scene = accepted();
+        change(scene.meshes.materials[2], scene.meshes.textures);
+        expect_refusal(ctx, *runtime, name, scene, cause);
+    };
+    using textures = std::vector<std::shared_ptr<const gpu::mesh_texture_desc>>;
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    // The factors, the texture indices and their uses, the scene material's index
+    refused("base-color-negative", [](gpu::mesh_material_desc& m, textures&) { m.base_color[1] = -0.1; },
+            "has the base color");
+    refused("base-color-nan", [nan](gpu::mesh_material_desc& m, textures&) { m.base_color[0] = nan; },
+            "has the base color");
+    refused("metallic-past-1", [](gpu::mesh_material_desc& m, textures&) { m.metallic = 1.5; },
+            "the metallic factor 1.5");
+    refused("roughness-below-0", [](gpu::mesh_material_desc& m, textures&) { m.roughness = -0.1; },
+            "the roughness factor -0.1");
+    refused("base-color-texture-past-the-set", [](gpu::mesh_material_desc& m, textures&) { m.base_color_texture = 2; },
+            "the texture 2 for its base color");
+    refused("metal-rough-texture-minus-2", [](gpu::mesh_material_desc& m, textures&) { m.metal_rough_texture = -2; },
+            "the texture -2 for its metallic-roughness");
+    refused("base-color-texture-linear",
+            [](gpu::mesh_material_desc&, textures& t) { t[0] = grey_texture(2, 2, 16, false); },
+            "reads textures[0] as its base color, which must be decoded from sRGB");
+    refused("metal-rough-texture-srgb",
+            [](gpu::mesh_material_desc&, textures& t) { t[1] = grey_texture(2, 2, 16, true); },
+            "reads textures[1] as its metallic-roughness, which must be read linearly");
+    refused("scene-material-minus-2", [](gpu::mesh_material_desc& m, textures&) { m.scene_material = -2; },
+            "names the scene's material -2");
+
+    // The textures themselves
+    refused("texture-missing", [](gpu::mesh_material_desc&, textures& t) { t[1] = nullptr; }, "textures[1] is missing");
+    refused("texture-bytes", [](gpu::mesh_material_desc&, textures& t) { t[0] = grey_texture(2, 2, 12, true); },
+            "textures[0] has 12 bytes for its 2 by 2 texels");
+    refused("texture-zero-wide", [](gpu::mesh_material_desc&, textures& t) { t[0] = grey_texture(0, 2, 0, true); },
+            "textures[0] is 0 by 2 texels");
+    refused("texture-wrap-unknown",
+            [](gpu::mesh_material_desc&, textures& t) {
+                gpu::mesh_texture_desc d = *t[0];
+                d.wrap_t = static_cast<gpu::texture_wrap>(7);
+                t[0] = std::make_shared<const gpu::mesh_texture_desc>(std::move(d));
+            },
+            "textures[0] has an unknown wrap mode");
+    // One texel wider than the GPU's 2D textures may be (cudaDevAttrMaxTexture2DWidth), a row of them
+    int device = 0;
+    int widest = 0;
+    gpu_test::cuda_check(cudaGetDevice(&device), "cudaGetDevice");
+    gpu_test::cuda_check(cudaDeviceGetAttribute(&widest, cudaDevAttrMaxTexture2DWidth, device),
+                         "cudaDeviceGetAttribute");
+    if (widest > 0 && widest < (1 << 24))
+    {
+        const int width = widest + 1;
+        refused("texture-past-the-gpu",
+                [width](gpu::mesh_material_desc&, textures& t) {
+                    t[0] = grey_texture(width, 1, 4 * static_cast<std::size_t>(width), true);
+                },
+                std::format("textures[0] is {} by 1 texels", width));
+    }
+    else
+    {
+        ctx.info("refused-texture-past-the-gpu", std::format("not tried: the GPU's widest texture is {}", widest));
+    }
 }
 }

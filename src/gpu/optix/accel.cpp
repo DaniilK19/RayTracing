@@ -220,6 +220,25 @@ std::vector<OptixAccelBufferSizes> mesh_sizes(core& c, std::span<const triangle_
     }
     return sizes;
 }
+
+// The IAS's build: traced for the scene's whole life, so for the fastest trace; built once, never updated
+OptixAccelBuildOptions instance_build_options()
+{
+    OptixAccelBuildOptions options = {};
+    options.buildFlags = static_cast<unsigned int>(OPTIX_BUILD_FLAG_PREFER_FAST_TRACE);
+    options.operation = OPTIX_BUILD_OPERATION_BUILD;
+    return options;
+}
+
+// `count` OptixInstance records at `records` as the IAS's one build input
+OptixBuildInput instance_input(CUdeviceptr records, unsigned int count)
+{
+    OptixBuildInput input = {};
+    input.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
+    input.instanceArray.instances = records;
+    input.instanceArray.numInstances = count;
+    return input;
+}
 }
 
 // The most the builds hold at once: every mesh's structure at its planned size, and the larger of the shared temp
@@ -237,6 +256,38 @@ std::size_t triangles_bytes(core& c, std::span<const triangle_mesh> meshes)
         temp = std::max(temp, sizes.tempSizeInBytes);
     }
     return outputs + std::max(temp, largest_output) + meshes.size() * sizeof(std::uint64_t);
+}
+
+namespace
+{
+// The sizes of build_instances' IAS of `count` instances, from optixAccelComputeMemoryUsage on an input of records
+// that don't exist yet (it reads no device memory): they depend on the count alone
+OptixAccelBufferSizes instance_sizes(core& c, unsigned int count)
+{
+    const OptixAccelBuildOptions options = instance_build_options();
+    const OptixBuildInput input = instance_input(0, count);
+    OptixAccelBufferSizes sizes = {};
+    check_mesh_build(optixAccelComputeMemoryUsage(c.context, &options, &input, 1, &sizes),
+                     "planning the instances' acceleration structure");
+    return sizes;
+}
+}
+
+// What build_instances holds at once: the records' device copy, the structure and its temp
+std::size_t instances_bytes(core& c, unsigned int count)
+{
+    if (count == 0)
+    {
+        return 0;
+    }
+    const OptixAccelBufferSizes sizes = instance_sizes(c, count);
+    return sizes.outputSizeInBytes + sizes.tempSizeInBytes + std::size_t{count} * sizeof(OptixInstance);
+}
+
+// What stays once build_instances returns: the structure alone (its records and temp freed)
+std::size_t instance_structure_bytes(core& c, unsigned int count)
+{
+    return count == 0 ? 0 : instance_sizes(c, count).outputSizeInBytes;
 }
 
 // The meshes' GASes, built back to back on stream 0 on one temp buffer as large as the largest needs (the builds run
@@ -328,13 +379,9 @@ accel build_instances(core& c, std::span<const instance> instances)
     }
     // cudaMalloc's 256-byte alignment covers the 16 OptiX asks of instances (OPTIX_INSTANCE_BYTE_ALIGNMENT)
     const device_array<OptixInstance> on_device(records);
-    OptixBuildInput input = {};
-    input.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
-    input.instanceArray.instances = reinterpret_cast<CUdeviceptr>(on_device.data());
-    input.instanceArray.numInstances = static_cast<unsigned int>(records.size());
-    OptixAccelBuildOptions options = {};
-    options.buildFlags = static_cast<unsigned int>(OPTIX_BUILD_FLAG_PREFER_FAST_TRACE);
-    options.operation = OPTIX_BUILD_OPERATION_BUILD;
+    const OptixBuildInput input =
+        instance_input(reinterpret_cast<CUdeviceptr>(on_device.data()), static_cast<unsigned int>(records.size()));
+    const OptixAccelBuildOptions options = instance_build_options();
     OptixAccelBufferSizes sizes = {};
     check_mesh_build(optixAccelComputeMemoryUsage(c.context, &options, &input, 1, &sizes),
                      "planning the instances' acceleration structure");

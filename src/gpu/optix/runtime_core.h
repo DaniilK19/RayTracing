@@ -64,6 +64,8 @@ int continuation_stack_bytes(const core& c);
 // Planned sizes (optixAccelComputeMemoryUsage, no device work): output + temp bytes
 std::size_t custom_bytes(core& c, unsigned int count);
 std::size_t triangles_bytes(core& c, std::span<const triangle_mesh> meshes);
+std::size_t instances_bytes(core& c, unsigned int count); // build_instances' IAS of `count`, their records included
+std::size_t instance_structure_bytes(core& c, unsigned int count); // that IAS alone, once built (what stays held)
 // Builds on stream 0 and waits; temp memory is freed before returning (stubs until 88 and 91)
 accel build_custom(core& c, const aabb* boxes, const std::uint8_t* kinds, unsigned int count); // device arrays (A)
 std::vector<accel> build_triangles(core& c, std::span<const triangle_mesh> meshes);            // compacted (B)

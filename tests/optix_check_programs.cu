@@ -58,13 +58,15 @@ extern "C" __global__ void __raygen__probe_energy()
 // The meshes' probe (suites optix-triangles and optix-pbr, tests/mesh_gpu_tests.cu): optix_tracer on samples the test
 // gives, one per launch index k = y·width + x of a launch of n = width·height. In: 20 words at params.test.values[20k]
 // (floats, an int as its float's bits): the ray (origin 0-2, direction 3-5, time 6), its spawn (from 7, inward 8: 0 or
-// 1), memo.facing 9-11, and a mode (12): 0 traces the ray with closest() (generator sample_generator(test.seed, k, 0));
-// 1 traces nothing and asks surface_of() for the triangle hit of instance 13, primitive 14, b1 15, b2 16 and memo.lobe
-// 17, in scratch slot scratch_base + k. Out: 40 words at values[20n + 40k]: the hit (index 0, t 1, entering 2), the
-// side record (instance 3, primitive 4, b1 5, b2 6, lobe 7) and in mode 1 the surface (rec.p 8-10, rec.normal 11-13,
-// front_face 14, outward 15-17, texture_point 18-20, u 21, v 22, material 23, texture_index 24, from 25, memo.facing
-// 26-28, 1 at 29), then what the integrator reads at s.material: the material (kind 30, albedo 31-33, fuzz 34,
-// refraction index 35) and its side entry (kind 36, -1 without side entries; alpha 37, roughness 38).
+// 1), memo.facing 9-11, memo.reach 18 (the reach of the face a ray leaves), and a mode (12): 0 traces the ray with
+// closest() (generator sample_generator(test.seed, k, 0)); 1 traces nothing and asks surface_of() for the triangle hit
+// of instance 13, primitive 14, b1 15, b2 16 and memo.lobe 17, in scratch slot scratch_base + k; 2 traces nothing and
+// asks surface_of() for the absorber's id (the through-rule's hit). Out: 41 words at values[20n + 41k]: the hit (index
+// 0, t 1, entering 2), the side record (instance 3, primitive 4, b1 5, b2 6, lobe 7) and in modes 1 and 2 the surface
+// (rec.p 8-10, rec.normal 11-13, front_face 14, outward 15-17, texture_point 18-20, u 21, v 22, material 23,
+// texture_index 24, from 25, memo.facing 26-28, 1 at 29), then what the integrator reads at s.material: the material
+// (kind 30, albedo 31-33, fuzz 34, refraction index 35) and its side entry (kind 36, -1 without side entries; alpha
+// 37, roughness 38); 39 untouched; memo.reach at 40 (in mode 1 triangle_surface's).
 extern "C" __global__ void __raygen__probe_mesh()
 {
     const uint3 index = optixGetLaunchIndex();
@@ -72,27 +74,36 @@ extern "C" __global__ void __raygen__probe_mesh()
     const std::uint64_t n = static_cast<std::uint64_t>(size.x) * size.y;
     const std::uint64_t k = static_cast<std::uint64_t>(index.y) * size.x + index.x;
     const float* const in = params.test.values + 20 * k;
-    float* const out = params.test.values + 20 * n + 40 * k;
+    float* const out = params.test.values + 20 * n + 41 * k;
     gpu::triangle_memo memo;
     memo.facing = {in[9], in[10], in[11]};
+    memo.reach = in[18];
     const gpu::optix_tracer tracer{params, memo, params.meshes.scratch_base + static_cast<int>(k)};
     const gpu::ray<float> r{.origin = {in[0], in[1], in[2]}, .direction = {in[3], in[4], in[5]}, .time = in[6]};
     gpu::bvh_hit<float> hit{.index = -1, .t = 0.0f, .entering = false};
-    if (__float_as_int(in[12]) == 0)
+    const int mode = __float_as_int(in[12]);
+    if (mode == 0)
     {
         gpu::pcg32 rng = gpu::sample_generator(params.test.seed, k, 0);
         hit = tracer.closest(r, {.from = __float_as_int(in[7]), .inward = in[8] != 0.0f}, rng);
     }
     else
     {
-        memo.instance = __float_as_int(in[13]);
-        memo.primitive = __float_as_uint(in[14]);
-        memo.b1 = in[15];
-        memo.b2 = in[16];
-        memo.lobe = in[17];
-        hit = {.index = params.meshes.instances[memo.instance].first_id + static_cast<int>(memo.primitive),
-               .t = 1.0f,
-               .entering = false};
+        if (mode == 2)
+        {
+            hit = {.index = params.meshes.triangle_base, .t = 0.0f, .entering = false};
+        }
+        else
+        {
+            memo.instance = __float_as_int(in[13]);
+            memo.primitive = __float_as_uint(in[14]);
+            memo.b1 = in[15];
+            memo.b2 = in[16];
+            memo.lobe = in[17];
+            hit = {.index = params.meshes.instances[memo.instance].first_id + static_cast<int>(memo.primitive),
+                   .t = 1.0f,
+                   .entering = false};
+        }
         const gpu::surface<float> s = tracer.surface_of(r, hit);
         const gpu::material<float> m = params.view.base.materials[s.material];
         const float surface[31] = {s.rec.p.x, s.rec.p.y, s.rec.p.z, s.rec.normal.x, s.rec.normal.y, s.rec.normal.z,
@@ -121,6 +132,7 @@ extern "C" __global__ void __raygen__probe_mesh()
     {
         out[i] = record[i];
     }
+    out[40] = memo.reach;
 }
 
 // --- The tracer check (track A, Step 88): optix_tracer's closest and visibility against the BVH's, ray by ray -------
