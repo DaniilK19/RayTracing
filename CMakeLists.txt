@@ -213,3 +213,4 @@ endif()
 
 # NVIDIA's OptiX for --optix, triangle meshes and the denoiser: a file of its own, after the lines above, which stay
 include(cmake/optix.cmake)
+include(cmake/meshes.cmake)
