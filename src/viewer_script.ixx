@@ -26,6 +26,15 @@ import viewer_camera;
 //                books' bytes take none): it doesn't change the image, so a frame after it may show the samples of
 //                the frame before through it. Without them each scene shows its own display, until one of them is
 //                given; then that one holds for every scene, as the window's T and exposure keys hold.
+//   denoise on|off   the window's N: the frames show the image denoised by OptiX's AI denoiser (float32 only), for
+//                every scene after it. A hold's frames are denoised as the window denoises a still view: the view's
+//                first frame, then a frame whose complete passes have doubled since the last denoise; the frames in
+//                between show the last denoised image again, through a display changed since (tonemap, exposure)
+//                re-toned with no denoise. A script has no "done": the window denoises a view once more when it is
+//                done or paused, but a hold has only its first frame and the doublings, so the last frame of a hold
+//                shows the last doubling's denoise unless it lands on a doubling itself (hold 16 +1 on a new view
+//                ends on 16 passes, denoised; hold 10 +1 ends on 10, showing the denoise of 8). A move's frames never
+//                are denoised (the camera is moving), and a frame line is when it says so (below).
 //   camera [lookfrom "X,Y,Z"] [lookat "X,Y,Z"] [vfov D] [defocus-angle D] [focus-dist D]   (the view, changed)
 //   focus-at X Y   the focus distance of the surface seen at pixel (X, Y) of the image, as a double-click sets it
 // The camera stays when another setting changes; a new scene starts at its own view.
@@ -38,10 +47,15 @@ import viewer_camera;
 //                (the same functions, viewer_camera): orbit and look turn by degrees, pan moves by pixels of the image
 //                at hand (so a script pans less at a larger size), dolly and zoom multiply the distance and the field
 //                of view, by a factor or by the wheel's notches (the very powers the wheel takes)
-//   frame N R gen G size W H lookfrom "X,Y,Z" lookat "X,Y,Z" vfov D defocus-angle D focus-dist D
+//   frame N R gen G size W H lookfrom "X,Y,Z" lookat "X,Y,Z" vfov D defocus-angle D focus-dist D [denoised]
 //                one frame: that view at N complete passes (from 1) and R rows of the next one (below H); G numbers
 //                the views, a new G starting the image over even for the same camera (what --record writes, one line
-//                per frame shown with new samples, or with the same ones through a new display)
+//                per frame shown with new samples, or with the same ones through a new display). denoised: the window
+//                denoised this frame's image, and the replay does; a frame without it shows the view's last denoised
+//                image again (re-toned when the display changed since, however far the image has refined since), or
+//                before the view's first denoise the image itself. So a recording replays the window's denoises
+//                exactly, whatever the clock decided live. The mark needs the denoiser on (--denoise, or denoise on
+//                before it): one under denoise off is an error when the script is read.
 // A script ends with a frame: lines after its last hold, move or frame would render nothing, and are an error.
 
 // The most passes a frame may have: as many as RayTracingGPU's -s
@@ -68,6 +82,7 @@ export struct set_kernel { kernel_choice kernel; };
 export struct set_sampling { std::optional<::strategy> strategy; };
 export struct set_tonemap { tone_map op; };
 export struct set_exposure { double exposure; };
+export struct set_denoise { bool on; };
 export struct set_camera { view_change view; };
 export struct focus_at { double x; double y; };
 export struct hold { int frames; std::int64_t passes; };
@@ -94,12 +109,13 @@ export struct frame
     std::uint64_t generation;
     int width;
     int height;
-    view_change view; // all set
+    view_change view;      // all set
+    bool denoised = false; // the window denoised it (under denoise on)
 };
 
 export using script_command =
     std::variant<set_scene, set_size, set_seed, set_strata, set_precision, set_kernel, set_sampling, set_tonemap,
-                 set_exposure, set_camera, focus_at, hold, move, frame>;
+                 set_exposure, set_denoise, set_camera, focus_at, hold, move, frame>;
 
 export struct script_line
 {
@@ -336,6 +352,14 @@ std::expected<script_command, std::string> command(std::span<const std::string_v
         }
         return set_exposure{*ev};
     }
+    if (verb == "denoise")
+    {
+        if (w.size() != 2 || (w[1] != "on" && w[1] != "off"))
+        {
+            return std::unexpected("denoise is on or off");
+        }
+        return set_denoise{w[1] == "on"};
+    }
     if (verb == "camera")
     {
         set_camera result;
@@ -454,7 +478,14 @@ std::expected<script_command, std::string> command(std::span<const std::string_v
         {
             return std::unexpected(end.error());
         }
-        if (*end != w.size())
+        // The mark of a denoised frame, the line's last word
+        std::size_t last = w.size();
+        if (*end + 1 == w.size() && w[*end] == "denoised")
+        {
+            result.denoised = true;
+            last = *end;
+        }
+        if (*end != last)
         {
             return std::unexpected(std::format("frame doesn't know '{}'", w[*end]));
         }
@@ -470,8 +501,10 @@ std::expected<script_command, std::string> command(std::span<const std::string_v
 }
 }
 
-// The commands of a script, or the first error with its line number
-export std::expected<std::vector<script_line>, std::string> parse_script(std::string_view text)
+// The commands of a script, or the first error with its line number. denoise: the denoiser on before the first line
+// (--denoise); the denoise lines turn it on and off from there, and a frame marked denoised under denoise off is an
+// error (the window marks only frames it denoised).
+export std::expected<std::vector<script_line>, std::string> parse_script(std::string_view text, bool denoise = false)
 {
     std::vector<script_line> result;
     int number = 0;
@@ -487,6 +520,15 @@ export std::expected<std::vector<script_line>, std::string> parse_script(std::st
         if (!parsed)
         {
             return std::unexpected(std::format("line {}: {}", number, parsed.error()));
+        }
+        if (const auto* d = std::get_if<set_denoise>(&*parsed))
+        {
+            denoise = d->on;
+        }
+        else if (const auto* f = std::get_if<frame>(&*parsed); f && f->denoised && !denoise)
+        {
+            return std::unexpected(
+                std::format("line {}: a frame marked denoised needs the denoiser: denoise on before it", number));
         }
         result.push_back({number, std::move(*parsed)});
     }
@@ -554,13 +596,21 @@ export std::string format_settings(std::string_view scene, bool fp64, kernel_cho
                        display ? format_display(*display) : std::string());
 }
 
-// One frame shown: its view (from the camera's settings) and how far it was rendered
-export std::string format_frame(std::int64_t passes, int rows, std::uint64_t generation, int width, int height,
-                                const camera_settings& view)
+// The denoiser's line, which a recording writes only once the window's N was used (or --denoise, or a script's denoise
+// line), so the recordings without it stay as they were
+export std::string format_denoise(bool on)
 {
-    return std::format("frame {} {} gen {} size {} {} lookfrom {} lookat {} vfov {} defocus-angle {} focus-dist {}\n",
+    return std::format("denoise {}\n", on ? "on" : "off");
+}
+
+// One frame shown: its view (from the camera's settings), how far it was rendered, and whether the window denoised it
+// (the mark comes only under denoise on)
+export std::string format_frame(std::int64_t passes, int rows, std::uint64_t generation, int width, int height,
+                                const camera_settings& view, bool denoised = false)
+{
+    return std::format("frame {} {} gen {} size {} {} lookfrom {} lookat {} vfov {} defocus-angle {} focus-dist {}{}\n",
                        passes, rows, generation, width, height, quoted(view.lookfrom), quoted(view.lookat), view.vfov,
-                       view.defocus_angle, view.focus_dist);
+                       view.defocus_angle, view.focus_dist, denoised ? " denoised" : "");
 }
 
 // --- Input files ---------------------------------------------------------------------------------------------------

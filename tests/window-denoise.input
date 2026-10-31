@@ -1,0 +1,82 @@
+# OptiX's AI denoiser in the window, driven by scripted input (see docs/viewer.md, "Scripted input"), recorded and
+# replayed. It quits by itself, 4.9 seconds after the window opened, so it runs without --exit-when-done:
+#   RayTracingViewer cornell -w 320 --height 180 --strata 4 -s 48 --input tests\window-denoise.input --record r.txt
+#                    --frames A --stats s.csv
+#   RayTracingViewer --headless --script r.txt --record r2.txt --frames B --stats s2.csv
+# Every frame in A equals the one in B of the same number (decoded), and r2.txt equals r.txt but for each frame line's
+# gen (where a new session starts, a replay counts two generations and the window one, as replays have always
+# recorded): the same denoise lines, and the same frames marked denoised. The marks are what the window denoised, so
+# the replay denoises exactly those frames, whatever the clock decided in the window (a view counts as moving for
+# 0.15 s after its last change, and its frames aren't denoised): s.csv's "# denoised" lines and s2.csv's name the same
+# passes and rows in the same order (their frame numbers differ: the window counts every iterate, and so do their
+# generations). P's printed command (with --denoise), run, renders P's PNG and PFM, and its -denoised.png equals P's
+# -denoised.png byte for byte where the denoiser gives the same bytes for the same input.
+#
+# Every event after the first comes from a timer, and each step that needs the view standing still, or the denoise
+# before it over, comes 0.3 s or more after the last change (twice the 0.15 s a view counts as moving), so what the
+# window does doesn't depend on the frames' pace. The run must show 12 frames (A's f00000 to f00011, r.txt's 12 frame
+# lines), 4 of them denoised: s.csv's "# denoised" lines, (passes, rows) = (1, 0), (1, 0), (48, 0), (64, 0):
+#   f00000          view 1 at its first pass, the image itself (the denoiser off)
+#   f00001          that pass denoised, (1, 0): N's, in generation 1 still (no new session)
+#   f00002, f00003  the orbit's two views at their first pass, the image itself (moving)
+#   f00004          the orbit's last view denoised at its pass, (1, 0): the timer's (below)
+#   f00005, f00006  T and ",": that pass's kept denoised floats re-toned, at 1 pass and 0 rows, no "# denoised" line
+#   f00007          48 passes denoised, (48, 0)
+#   f00008          64 passes denoised, (64, 0): due only as done, 64 being no doubling of 48
+#   f00009          N off: 64 passes, the image itself through none at -0.5 EV (r.txt: denoise off before it)
+#   f00010          Shift+T: its books' bytes
+#   f00011          F2: the float64 session's first pass
+# On the console, after the settings: "Denoiser: on"; "Note: OptiX's denoiser works in float32 only: N to turn it off
+# first"; "Display: none, +0 EV"; "Display: none, -0.5 EV"; the Done lines of 48 and 64 samples; P's two lines (below);
+# "Denoiser: off"; "Display: books, +0 EV"; the float64 session's Scene and View lines; "Note: OptiX's denoiser works in
+# float32 only: F2 first". A pause's denoise, the other half of "once more when done or paused", would fall on whatever
+# pass count the frames' pace had left the image at: this run checks the done half only (denoise_due takes both as one).
+#
+# The Cornell box under its own strategy (the books' kernel for all three books, the guides from the CUDA kernel),
+# paused before the first frame: a new view gets its first pass, and the image stays there.
+at 0 key Space
+# N once the start's 0.15 s of moving frames are over: OptiX starts, and the session takes its runtime (attach_optix)
+# with no new session; the paused view, standing still with no denoise yet, is denoised at once (its first still frame)
+after 400 key N
+# An orbit dragged in the paused window, 0.6 s later (OptiX has started): each move a new view at its first pass, the
+# image itself. After the mouse-up nothing comes until the F2 at 1650, so the window waits for an event, and the timer
+# it sets for the view's due denoise wakes it 0.15 s after the last move, when the view stands still: f00004's row in
+# s.csv has a time_ms a little over 1350 (without the timer, F2's event would have brought the same frame at 1650)
+after 1000 mouse-down left 160 90
+after 1100 mouse-move 170 90 10 0
+after 1200 mouse-move 180 92 10 2
+after 1250 mouse-up left 180 92
+# F2: a note ("OptiX's denoiser works in float32 only: N to turn it off first"), and no frame
+after 1650 key F2
+# T (books -> none), then -0.5 EV, on the paused image: each re-tones its kept denoised floats, with no denoise (frames
+# of the same passes and rows, unmarked)
+after 1950 key T
+after 2250 key ,
+# Space: refining again, to 48 samples, in one frame (47 passes take a few ms of a still frame's 50 here; a GPU more
+# than ten times slower would denoise once more on the way, at a doubling of 1): denoised, a doubling and done
+after 2550 key Space
+# Shift+Enter, Enter, Enter: 16 and 32 samples to refine to (the image has them), then 64. The image refines from 48
+# to 64, no doubling, so a frame of fewer passes isn't denoised (none here: one frame) and the one of 64 is, once more
+# when done
+after 2850 key-down Left Shift
+after 2860 key Return
+after 2870 key-up Left Shift
+after 2950 key Return
+after 3050 key Return
+# P on the done image, whose 64-pass denoise is on screen (no frame): cornell-view-NNN.png, .pfm and -denoised.png in
+# the current folder, "Saved ...\cornell-view-NNN.png, .pfm and -denoised.png (64 samples per pixel). The same image:",
+# and the RayTracingGPU command, ending "-s 64 --strata 4 --seed 0 --tonemap none --exposure -0.5 --denoise -o
+# cornell-view-NNN-gpu.png -o cornell-view-NNN-gpu.pfm" (its -denoised.png is the one to compare)
+after 3350 key P
+# N off: the image itself, through none at -0.5 EV, and what the denoiser kept on the GPU freed
+after 3650 key N
+# Paused, so that the float64 session renders its first pass only; Shift+T back to the books' bytes (a tone map
+# computes in float32 only); F2: float64, where N stays off and says so ("OptiX's denoiser works in float32 only: F2
+# first"), with no frame
+after 3950 key Space
+after 4000 key-down Left Shift
+after 4010 key T
+after 4020 key-up Left Shift
+after 4300 key F2
+after 4600 key N
+after 4900 quit

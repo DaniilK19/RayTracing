@@ -1,0 +1,7 @@
+# A frame marked denoised after denoise off, refused when the script is read (Step 96: the mark is a frame the window
+# denoised, which needs the denoiser on); the marked frame before it, under denoise on, is taken
+size 16 9
+denoise on
+frame 1 0 gen 1 size 16 9 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10 denoised
+denoise off
+frame 2 0 gen 1 size 16 9 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10 denoised

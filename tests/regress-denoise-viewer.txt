@@ -1,0 +1,84 @@
+# OptiX's AI denoiser in the window, for scripts/verify/hostgate.ps1's chained section regress-denoise-viewer (from
+# Step 96; chained.txt: kind V, stamped): tiny frames rendered with
+#   RayTracingViewer --headless --script tests\regress-denoise-viewer.txt --frames <folder> --record <file>
+# The denoiser is a network whose weights come with the graphics driver, and OptiX's programs are the driver's to
+# compile, so the kept lines (what the window prints, every frame's SHA-256 and the recording's) carry a stamp, the
+# driver's version and the programs' SHA-256: under the stamp of the last accepted lines a step's lines must equal
+# them, under another they wait for review (RE-VERIFY).
+#
+# 47 frames at 96x54 from rounds of 4x4, the denoiser on from the first, saved from f00000:
+#  1. cornell under mis (the quality kernel), as a recording replays it: frames to 64 passes, denoised where they say
+#     so and nowhere else, the marks a window's clock gave and no schedule could compute. The frames of 1 and 2 passes
+#     are the image itself (a view's first 0.15 s is moving: the window doesn't denoise its frames, where the doublings
+#     would have them denoised); marked at 3 (the view's first still frame), at 4 (P: not a doubling of 3), at 8 and 16
+#     (doublings), at 24 (a pause: not a doubling of 16) and at 64; the frames between show the last denoised image
+#     again, a pass in progress among them, and 32 passes, a doubling of 16 but not of 24, among them; then on the image
+#     of 64 passes, the tone map and the exposure changed, which only re-tone the kept denoised floats, and the books'
+#     bytes again, which are the 64-pass frame's
+#  2. cornell-bust (OptiX, the guides from its own programs) under holds, which the window's schedule denoises by
+#     itself: at passes 1, 2, 4, 8 and 16; a camera move, whose frames show the image itself; the still view after it
+#     denoised at its first frame (3 passes) and at 6; then a tone map chosen while the image refines past its last
+#     denoise: the frames of 7 and 8 passes show the 6-pass denoised floats through it, re-toned with no denoise, the
+#     books' bytes again at 9 to 11 passes are the 6-pass frame's, and 12 passes, the next doubling, are denoised
+#  3. weekend under its own strategy (the first book's kernel, its guides from the CUDA kernel without the quality
+#     kernel's scene), in the books' bytes still: denoised at passes 1, 2 and 4; then the denoiser off, and the image
+#     itself
+# Frames of the same bytes, group by group: f00003 and f00004; f00007 and f00008; f00009 and f00012; f00014 and
+# f00015; f00016 to f00019; f00020 to f00027; f00032 to f00034; f00035 and f00038 to f00040; f00036 and f00037; f00043
+# and f00044. f00000, f00001 and f00002 differ from each other and from f00003; f00010 and f00011 differ from f00009
+# and from each other, f00036 from f00035.
+# With --stats each denoise writes a line "# denoised: frame F, P passes and R rows, generation G, T ms" before its
+# frame's row, and a re-tone none: 17 lines, (F, P, R) = (2, 3, 0), (3, 4, 0), (5, 8, 0), (6, 16, 0), (7, 24, 0),
+# (9, 64, 0); (13, 1, 0), (14, 2, 0), (16, 4, 0), (20, 8, 0), (28, 16, 0), (32, 3, 0), (35, 6, 0), (41, 12, 0);
+# (42, 1, 0), (43, 2, 0), (45, 4, 0), and G this run's count of the views: 2 in part 1, 3 before the move and 6 after
+# it in part 2, 7 in part 3. (A replay that denoised part 1 by the schedule instead of the marks would denoise frames 0,
+# 1, 3, 5, 6, 8 and 9 at 1, 2, 4, 8, 16, 32 and 64 passes, and show other bytes in frames 0 to 2, 7 and 8.) The
+# recording says denoise on before its first frame and denoise off before its last, and marks those 17 frames denoised.
+# Replayed (--headless --script on it), it renders the same 47 frames and the same 17 lines' F, P and R, and records
+# the same lines but for the frame lines' gen (where a new session starts, a replay counts two generations, as replays
+# always have).
+size 96 54
+strata 4
+seed 0
+denoise on
+scene cornell
+sampling mis
+# 1. The window's first frames, its view moving: the image itself, at 1 and 2 passes
+frame 1 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+frame 2 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+# Denoised at 3 (the first still frame) and at 4 (P); 7 passes and 30 rows show the 4-pass denoise
+frame 3 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10 denoised
+frame 4 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10 denoised
+frame 7 30 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+# The doublings of 4 and 8; a pause at 24; refined on, 32 passes show the 24-pass denoise, and 64 are denoised
+frame 8 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10 denoised
+frame 16 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10 denoised
+frame 24 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10 denoised
+frame 32 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+frame 64 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10 denoised
+tonemap agx
+frame 64 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+exposure 1.5
+frame 64 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+tonemap books
+exposure 0
+frame 64 0 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+# 2. The schedule of a still view, under holds (no clock in it): denoised at 1, 2, 4, 8 and 16
+scene cornell-bust
+sampling scene
+hold 16 +1
+# A move: 3 new views of 2 passes each, the image itself; then the still view denoised at 3 and 6 passes
+orbit 3 +2 yaw 20
+hold 4 +1
+# A tone map chosen at 6 passes, while the image refines: 7 and 8 show the 6-pass denoised floats re-toned through it
+tonemap neutral
+hold 2 +1
+# The books' bytes again at 9, 10 and 11: the 6-pass frame's bytes; 12 passes, the next doubling, denoised
+tonemap books
+hold 4 +1
+# 3. The first book's kernel, in its own bytes (the books' still): denoised at 1, 2 and 4; then the denoiser off
+scene weekend
+sampling scene
+hold 4 +1
+denoise off
+hold 1 +1

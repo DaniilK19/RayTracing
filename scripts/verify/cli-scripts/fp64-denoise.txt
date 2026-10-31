@@ -1,0 +1,5 @@
+# A script asking for OptiX's denoiser in float64, refused before its first frame (Step 96: it computes in float32)
+size 16 9
+precision double
+denoise on
+hold 1 +1

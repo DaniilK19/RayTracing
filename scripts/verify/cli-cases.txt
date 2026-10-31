@@ -169,3 +169,14 @@ V still-life --fp64 --headless -w 16 -s 1
 V still-life --quality-kernel --headless -w 16 -s 1
 V still-life --all-books-kernel --headless -w 16 -s 1
 V mesh-furnace -p mixture --headless -w 16 -s 1
+
+# The denoiser in the window (Step 96): --denoise --fp64 refused first, in RayTracingGPU's words, before the window and
+# CUDA (also before a tone map's float64 refusal and a mesh scene's); a script's denoise on in float64, refused before
+# its first frame, a denoise line neither on nor off (line 3), and a frame marked denoised after denoise off, refused
+# when the script is read (line 7)
+V --denoise --fp64 --headless -w 16 -s 1
+V cornell -p mis --tonemap agx --denoise --fp64 --headless -w 16 -s 1
+V still-life --denoise --fp64 --headless -w 16 -s 1
+V --headless --script scripts\verify\cli-scripts\fp64-denoise.txt
+V --headless --script scripts\verify\cli-scripts\unknown-denoise.txt
+V --headless --script scripts\verify\cli-scripts\marked-without-denoise.txt

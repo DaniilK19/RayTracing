@@ -57,7 +57,8 @@ struct options
     bool fp64 = false;
     bool all_books_kernel = false;
     bool quality_kernel = false;
-    bool optix = false; // trace with OptiX (O switches it), as RayTracingGPU's --optix
+    bool optix = false;   // trace with OptiX (O switches it), as RayTracingGPU's --optix
+    bool denoise = false; // start with N on: the image denoised by OptiX's AI denoiser, as RayTracingGPU's --denoise
     std::vector<std::filesystem::path> outputs; // saved when the window closes
     display_choice display;                     // --tonemap, --exposure (tone_options.ixx)
     bool exit_when_done = false;
@@ -100,6 +101,8 @@ Options:
       --optix          trace with OptiX (on the ray tracing cores where the GPU has them): the
                        quality kernel's integrator in an OptiX program (float; -p material, nee or
                        mis); scenes with triangle meshes always use it
+      --denoise        start with N on: the window shows the image denoised by OptiX's AI denoiser
+                       (float; for the eye: it is biased), P and -o also save it as NAME-denoised
       --seed N         which random numbers to draw, from 0 (the default) to {}
   -o, --output FILE    save the image when the window closes: a .png or a .pfm; several -o save
                        several files
@@ -126,6 +129,8 @@ In the window:
   F2                   float32 or float64
   O                    OptiX on or off for the scene (see --optix); the scenes with triangle meshes
                        always use it
+  N                    denoised image, for the eye (biased; PFMs and statistics never use it):
+                       OptiX's AI denoiser on a still view at every doubling of its samples; float32
   T, Shift+T           the next or the previous tone map: books, none, agx, neutral
   , and .              exposure down or up by 0.5 EV (not with books)
   0                    exposure back to 0 EV
@@ -135,7 +140,8 @@ In the window:
   H, F1                this list in the window
   R                    back to the start view
   P                    save the image as <scene>-view-NNN.png and .pfm in the current folder,
-                       and print the RayTracingGPU command that renders it
+                       and print the RayTracingGPU command that renders it; with N on, also
+                       <scene>-view-NNN-denoised.png
   C                    copy that command
   Esc                  close the help, let the mouse go, or close the window
 
@@ -214,6 +220,15 @@ std::string scene_argument(std::string_view scene)
     return command_word(scene, is_model_path(scene));
 }
 
+// The denoised image's file for an output, as RayTracingGPU --denoise names it: <stem>-denoised.png or .pfm beside it
+std::filesystem::path denoised_name(const std::filesystem::path& output)
+{
+    std::filesystem::path name = output.stem();
+    name += "-denoised";
+    name += output.extension();
+    return output.parent_path() / name;
+}
+
 std::expected<options, std::string> parse_options(std::span<char* const> args)
 {
     options opts;
@@ -226,7 +241,7 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             continue;
         }
         if (arg == "--fp64" || arg == "--all-books-kernel" || arg == "--quality-kernel" || arg == "--exit-when-done" ||
-            arg == "--headless" || arg == "--frames-hud" || arg == "--optix")
+            arg == "--headless" || arg == "--frames-hud" || arg == "--optix" || arg == "--denoise")
         {
             (arg == "--fp64"               ? opts.fp64
              : arg == "--all-books-kernel" ? opts.all_books_kernel
@@ -234,6 +249,7 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
              : arg == "--headless"         ? opts.headless
              : arg == "--frames-hud"       ? opts.frames_hud
              : arg == "--optix"            ? opts.optix
+             : arg == "--denoise"          ? opts.denoise
                                            : opts.exit_when_done) = true;
             continue;
         }
@@ -556,6 +572,37 @@ private:
     bool redisplay_ = false;
     std::optional<gpu::display_options> recorded_display_; // what --record last wrote, if it ever wrote a display
 
+    // The denoiser (N, --denoise, a script's denoise on): a still view's frames show its image denoised by OptiX's AI
+    // denoiser (session::display_denoised), float32 only. The view is denoised at its first still frame, whenever its
+    // complete passes have doubled since its last denoise, and once more when it is done or paused (denoise_due; not in
+    // a script, which has neither); the frames in between show the last denoised bytes again, with no GPU work but the
+    // passes. A display changed in between (T, the exposure keys, a script's tonemap or exposure) shows the kept
+    // denoised floats through it, re-toned on the GPU with no denoise (session::retone_denoised), and the next denoise
+    // comes at the next doubling. --record marks the frames denoised, so a replay denoises exactly those, whatever the
+    // clock decided.
+    enum class denoise_rule
+    {
+        schedule, // a still view's frame: denoised when denoise_due says so
+        moving,   // a frame of a moving view: never denoised
+        marked,   // a frame denoised in any case (a recorded frame the window denoised, P's image)
+        unmarked, // a recorded frame the window didn't denoise
+    };
+    bool denoise_{opts_.denoise};
+    bool denoise_used_{opts_.denoise};      // N was used: --record writes the denoise lines and the marks
+    std::optional<bool> recorded_denoise_;  // what --record last wrote
+    // Why a failure turned the denoiser off (frame_bytes, N), until N or a script's denoise line sets it again: a run
+    // that ends by itself and saves -o fails for it (save_outputs), as RayTracingGPU --denoise does
+    std::optional<std::string> denoise_failure_;
+    bool session_optix_ = false;            // the session holds OptiX's runtime (session_options::optix, or
+                                            // attach_denoiser's session::attach_optix): it can denoise
+    std::uint64_t denoised_generation_ = 0; // the view the last denoise was of (0: none, or dropped since)
+    gpu::accumulation denoised_state_;      // how far its image had come
+    gpu::display_options denoised_display_; // the display denoised_bytes_ show it through
+    std::vector<std::uint8_t> denoised_bytes_;
+    bool frame_denoised_ = false;           // the frame being kept was denoised for it: --record marks it
+    bool shown_denoised_ = false;           // the frame shown is the denoised image (the HUD's tag)
+    std::uint64_t denoise_wake_ns_ = 0;     // when a timer wakes the loop for a denoise due once the view stands still
+
     // The last frame shown, as the session's display() gave it, and its size: what a device reset puts back
     std::vector<std::uint8_t> shown_;
     int shown_width_ = 0;
@@ -648,8 +695,9 @@ private:
     camera_settings settings_for(const camera_settings& view, int width, int height) const;
     std::expected<void, std::string> show_view(const camera_settings& view, int width, int height, bool restart);
     std::expected<void, std::string> size_window(int width, int height);
-    std::string gpu_command(std::int64_t passes) const;
+    std::string gpu_command(std::int64_t passes, bool denoised) const;
     std::expected<void, std::string> keep_frame(std::span<const std::uint8_t> bytes);
+    void show_kept_frame();
     std::expected<bool, std::string> play_next();
     bool make_texture(int width, int height);
     bool upload_shown();
@@ -674,6 +722,16 @@ private:
     SDL_AppResult switch_precision();
     SDL_AppResult switch_strategy(int step);
     SDL_AppResult switch_optix();
+    void switch_denoise();
+    std::expected<void, std::string> attach_denoiser();
+    void drop_denoiser();
+    bool denoising() const;
+    bool denoise_due(bool finished) const;
+    bool denoise_pending() const;
+    std::span<const std::uint8_t> frame_bytes(denoise_rule rule);
+    std::expected<void, std::string> show_denoised_now();
+    std::string denoise_tag() const;
+    std::expected<std::string, std::string> save_denoised(const std::vector<std::filesystem::path>& outputs);
     SDL_AppResult switched(const std::expected<void, std::string>& used, const std::string& what);
     void change_target(bool more);
     gpu::display_options scene_display() const;
@@ -723,10 +781,16 @@ SDL_AppResult viewer::fail(const std::string& message)
 // session of its own, its image started over; if even that fails, there is no session, and the caller ends.
 std::expected<void, std::string> viewer::use_settings(const render_settings& settings)
 {
-    // The display is checked also when the settings stay, for a script's tonemap line before its next frame
+    // The display is checked also when the settings stay, for a script's tonemap line before its next frame, and so is
+    // the denoiser: a script's denoise on after its first frames gives the session OptiX's runtime, its image kept
+    // (attach_denoiser), as N does
     if (session_ && settings == settings_)
     {
-        return check_display_for(settings);
+        if (const auto shown = check_display_for(settings); !shown)
+        {
+            return shown;
+        }
+        return attach_denoiser();
     }
     auto built = build_for(settings);
     if (!built)
@@ -736,7 +800,8 @@ std::expected<void, std::string> viewer::use_settings(const render_settings& set
     return use_build(settings, std::move(*built));
 }
 
-// The display these settings would show: a tone map beyond the books computes in float32 only (as T and F2 keep it)
+// The display these settings would show: a tone map beyond the books computes in float32 only (as T and F2 keep it),
+// and so does OptiX's denoiser (as N and F2 keep it)
 std::expected<void, std::string> viewer::check_display_for(const render_settings& settings) const
 {
     const gpu_scene_entry* entry = scene_entry(settings.scene); // a model's file: the model entry's (AgX)
@@ -745,6 +810,10 @@ std::expected<void, std::string> viewer::check_display_for(const render_settings
     {
         return std::unexpected(std::format("{} works in float32 only", tone_map_name(shown.op)));
     }
+    if (settings.fp64 && denoise_)
+    {
+        return std::unexpected("OptiX's denoiser works in float32 only");
+    }
     return {};
 }
 
@@ -752,7 +821,8 @@ std::expected<void, std::string> viewer::check_display_for(const render_settings
 // changes yet (M, Tab and O ask it of the settings they could go to): the display (check_display_for), the scene's own
 // errors, what the quality kernel can't render (the float-only rule, the books' strategies but the material's), and
 // what OptiX can't: a scene with triangle meshes refuses float64 and the other kernels (check_meshes), and a session
-// that traces with OptiX takes its rules and needs it started (open_optix). The glTF files the build read are reported
+// that traces with OptiX takes its rules and needs it started (open_optix), as one does under the denoiser, which is
+// OptiX's (the new session then has its runtime, see use_build). The glTF files the build read are reported
 // (report_models), also when the window then can't show the scene.
 std::expected<gpu_build, std::string> viewer::build_for(const render_settings& settings)
 {
@@ -788,7 +858,7 @@ std::expected<gpu_build, std::string> viewer::build_for(const render_settings& s
     {
         return std::unexpected(checked.error());
     }
-    if (const auto opened = optix ? open_optix() : std::expected<void, std::string>{}; !opened)
+    if (const auto opened = optix || denoise_ ? open_optix() : std::expected<void, std::string>{}; !opened)
     {
         return std::unexpected(std::format("OptiX can't run here: {}", opened.error()));
     }
@@ -884,7 +954,7 @@ std::expected<void, std::string> viewer::use_build(const render_settings& settin
     }
     // A new session: a new image, which the console reports when it is done, at a rate of its own, and the time the
     // session took to build is no frame's. One that traces with OptiX gets a copy of the runtime (build_for started
-    // it), which it keeps alive.
+    // it), which it keeps alive; so does every session once OptiX has started, which its denoiser runs on.
     const auto session_for = [&](const gpu_build& b, const camera_settings& v, const render_settings& s) {
         gpu::scene_desc desc = b.desc;
         desc.camera = to_gpu(camera(settings_for(v, width_, height_)).frame(), b.sampling);
@@ -897,6 +967,7 @@ std::expected<void, std::string> viewer::use_build(const render_settings& settin
                                                     .wait = gpu::wait_mode::sleep,
                                                     .optix_tracer = traces_with_optix(s, b),
                                                     .optix = optix_});
+        session_optix_ = optix_ != nullptr; // it can denoise (in float32)
         ++generation_;
         done_reported_ = false;
         samples_per_second_ = 0;
@@ -1015,8 +1086,9 @@ std::expected<void, std::string> viewer::size_window(int width, int height)
 }
 
 // The RayTracingGPU command that renders the image of `passes` samples of the view on screen again, bit for bit (a
-// model's file quoted; --optix where OptiX traces a scene without triangle meshes, which imply it)
-std::string viewer::gpu_command(std::int64_t passes) const
+// model's file quoted; --optix where OptiX traces a scene without triangle meshes, which imply it; --denoise when
+// `denoised`, for the denoised image beside it: under N, unless its denoise failed)
+std::string viewer::gpu_command(std::int64_t passes, bool denoised) const
 {
     std::string command =
         std::format("RayTracingGPU {} {} -s {} --strata {} --seed {}", scene_argument(settings_.scene),
@@ -1047,6 +1119,10 @@ std::string viewer::gpu_command(std::int64_t passes) const
     if (const gpu::display_options shown = shown_display(); names_display(shown, scene_display()))
     {
         command += std::format(" --tonemap {} --exposure {}", tone_map_name(shown.op), shown.exposure);
+    }
+    if (denoised)
+    {
+        command += " --denoise";
     }
     return command;
 }
@@ -1212,7 +1288,7 @@ camera_settings viewer::moved(const move& m, double t) const
 }
 
 // The view the events moved to, with its pass in progress finished (at least one pass): the image P saves and C's
-// command renders, shown in the window too
+// command renders, shown in the window too, at once (show_kept_frame)
 std::expected<gpu::accumulation, std::string> viewer::complete_pass()
 {
     if (const auto applied = apply_pending_view(); !applied)
@@ -1226,11 +1302,12 @@ std::expected<gpu::accumulation, std::string> viewer::complete_pass()
         {
             skip_interval_ = true;
             session_->render_to({state.passes + 1, 0});
-            if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
+            if (const auto kept = keep_frame(frame_bytes(denoise_rule::schedule)); !kept)
             {
                 return std::unexpected(kept.error());
             }
             present_needed_ = true;
+            show_kept_frame();
         }
         return session_->state();
     }
@@ -1242,6 +1319,9 @@ std::expected<gpu::accumulation, std::string> viewer::complete_pass()
 
 // P: the image of the view on screen saved in the current folder as <scene>-view-NNN.png and .pfm, NNN the first
 // number no file has yet (nothing earlier is overwritten), and the RayTracingGPU command that renders it again, printed
+// (with N on, also <scene>-view-NNN-denoised.png: the bytes of the denoised image of those passes, as RayTracingGPU
+// --denoise writes NAME-denoised.png, shown in the window first: unless the frame on screen is that image already, a
+// frame denoised now, which a recording marks)
 void viewer::save_view()
 {
     const auto state = complete_pass();
@@ -1249,6 +1329,18 @@ void viewer::save_view()
     {
         std::println("Error: {}", state.error());
         return;
+    }
+    // Under the denoiser, its image of those passes on screen first; a denoise that fails there leaves the plain files
+    // to save, as RayTracingGPU saves them, and the command without --denoise
+    bool denoised = denoising();
+    if (denoised)
+    {
+        if (const auto shown = show_denoised_now(); !shown)
+        {
+            std::println("Error: {}", shown.error());
+            return;
+        }
+        denoised = shown_denoised_;
     }
     const auto img = to_image(session_->pixels(), width_, height_);
     if (!img)
@@ -1272,27 +1364,51 @@ void viewer::save_view()
         std::println("Error: {}", error.what());
         return;
     }
+    // The denoised image's PNG: the bytes the window shows, as RayTracingGPU writes its -denoised.png
+    std::optional<image> denoised_png;
+    if (denoised)
+    {
+        try
+        {
+            denoised_png = bytes_to_image(denoised_bytes_, width_, height_);
+        }
+        catch (const std::exception& error)
+        {
+            std::println("Error: {}", error.what());
+            return;
+        }
+    }
     std::string name;
     do
     {
         name = std::format("{}-view-{:03}", scene_stem(settings_.scene), ++views_saved_);
-    } while (std::filesystem::exists(name + ".png") || std::filesystem::exists(name + ".pfm"));
-    for (const std::string_view extension : {".png", ".pfm"})
+    } while (std::filesystem::exists(name + ".png") || std::filesystem::exists(name + ".pfm") ||
+             (denoised_png && std::filesystem::exists(name + "-denoised.png")));
+    for (const std::string_view extension : {".png", ".pfm", "-denoised.png"})
     {
+        if (extension == "-denoised.png" && !denoised_png)
+        {
+            continue;
+        }
         const std::filesystem::path file = name + std::string(extension);
-        const image& source = toned && extension == ".png" ? *toned : *img;
+        const image& source = extension == "-denoised.png"       ? *denoised_png
+                              : toned && extension == ".png" ? *toned
+                                                             : *img;
         if (const auto saved = source.save(file); !saved)
         {
             std::println("Error: {} ({})", saved.error(), to_utf8(file));
             return;
         }
     }
-    std::println("Saved {} and .pfm ({} samples per pixel). The same image:",
-                 to_utf8(std::filesystem::absolute(name + ".png")), state->passes);
-    // With a tone map the command saves the PNG too, whose bytes it renders again. A model's file name may hold a space
-    // or parentheses ("model (1).glb"): the files' names are then quoted, as the scene's is.
-    std::println("{}{} -o {}", gpu_command(state->passes),
-                 toned ? std::format(" -o {}", command_word(name + "-gpu.png")) : "", command_word(name + "-gpu.pfm"));
+    std::println("Saved {}{} ({} samples per pixel). The same image:",
+                 to_utf8(std::filesystem::absolute(name + ".png")),
+                 denoised_png ? ", .pfm and -denoised.png" : " and .pfm", state->passes);
+    // With a tone map the command saves the PNG too, whose bytes it renders again; with N on as well, for the
+    // -denoised.png beside it (--denoise denoises each output). A model's file name may hold a space or parentheses
+    // ("model (1).glb"): the files' names are then quoted, as the scene's is.
+    std::println("{}{} -o {}", gpu_command(state->passes, denoised_png.has_value()),
+                 toned || denoised_png ? std::format(" -o {}", command_word(name + "-gpu.png")) : "",
+                 command_word(name + "-gpu.pfm"));
 }
 
 // A message on screen for two seconds. A loop waiting for events wouldn't take it off, so a timer wakes it then.
@@ -1341,6 +1457,11 @@ void viewer::print_settings() const
     if (const gpu::display_options shown = shown_display(); shown.op != gpu::tone_map::books)
     {
         std::println("Display: {}, {}", tone_map_name(shown.op), format_exposure(shown.exposure));
+    }
+    // The denoiser too, only when it is on, as at N: a run without it prints what it printed before
+    if (denoise_)
+    {
+        std::println("Denoiser: on");
     }
 }
 
@@ -1479,6 +1600,13 @@ SDL_AppResult viewer::switch_precision()
         say(note);
         return SDL_APP_CONTINUE;
     }
+    if (!settings_.fp64 && denoise_)
+    {
+        const std::string note = "OptiX's denoiser works in float32 only: N to turn it off first";
+        std::println("Note: {}", note);
+        say(note);
+        return SDL_APP_CONTINUE;
+    }
     if (const auto applied = apply_pending_view(); !applied)
     {
         return fail(applied.error());
@@ -1582,6 +1710,302 @@ SDL_AppResult viewer::switch_optix()
         say(on ? "OptiX on" : "OptiX off");
     }
     return result;
+}
+
+// N: the denoiser on or off, for every scene after it, as a display chosen holds. On, a still view's frames show its
+// image denoised by OptiX's AI denoiser (frame_bytes), which works in float32 only: in float64 N stays and says so, as
+// T does. OptiX starts at the first need, as for O, and a session made before it started takes its runtime
+// (attach_denoiser): no new session, the image goes on as it was, and its view's next still frame is denoised. Off, the
+// frames show the image itself again, the one on screen at once, and that frame frees what the denoiser kept on the
+// GPU (frame_bytes). On forgets a failure that turned the denoiser off before it; OptiX that can't start for it is
+// such a failure too (denoise_failure_: a run that ends by itself and saves -o fails for it, see save_outputs).
+void viewer::switch_denoise()
+{
+    if (denoise_)
+    {
+        denoise_ = false;
+        redisplay_ = true; // the image itself at once, also when it doesn't refine (done, or paused)
+        std::println("Denoiser: off");
+        say("denoiser off");
+        return;
+    }
+    const auto refused = [this](const std::string& note) {
+        std::println("Note: {}", note);
+        say(note);
+    };
+    if (settings_.fp64)
+    {
+        refused("OptiX's denoiser works in float32 only: F2 first");
+        return;
+    }
+    denoise_ = true;
+    if (const auto attached = attach_denoiser(); !attached)
+    {
+        denoise_ = false;
+        denoise_failure_ = attached.error();
+        refused(attached.error());
+        return;
+    }
+    denoise_failure_.reset();
+    denoise_used_ = true;
+    redisplay_ = true; // the image denoised as soon as its view stands still, also when it doesn't refine
+    std::println("Denoiser: on");
+    say("denoiser on");
+}
+
+// Under the denoiser, OptiX's runtime for the session shown when it was made without one (before OptiX started: N's
+// first press in a CUDA session, a script's denoise on after its first frames): OptiX started if it hasn't (open_optix,
+// the window's one runtime) and given to the session (session::attach_optix), which goes on with its image as it was.
+// Nothing to do with the denoiser off, or for a session that has the runtime already.
+std::expected<void, std::string> viewer::attach_denoiser()
+{
+    if (!denoise_ || !session_ || session_optix_)
+    {
+        return {};
+    }
+    if (const auto opened = open_optix(); !opened)
+    {
+        return std::unexpected(std::format("OptiX can't run here: {}", opened.error()));
+    }
+    try
+    {
+        session_->attach_optix(optix_);
+    }
+    catch (const std::exception& error)
+    {
+        return std::unexpected(error.what());
+    }
+    session_optix_ = true;
+    return {};
+}
+
+// What the denoiser keeps on the GPU freed, once it is off: the session's images of the last denoise and the
+// denoiser's state and scratch (session::drop_denoised; the next denoise makes them again, the guides too). The window
+// forgets its last denoised image with them, so that the view's frames show the image itself until its next denoise.
+void viewer::drop_denoiser()
+{
+    denoised_generation_ = 0;
+    if (session_)
+    {
+        session_->drop_denoised();
+    }
+}
+
+// Whether the frames show denoised images: N on, in a session that can denoise (float32, with OptiX's runtime)
+bool viewer::denoising() const
+{
+    return denoise_ && session_ && session_optix_ && !settings_.fp64;
+}
+
+// Whether a still view's frame shows its image denoised now: at the view's first still frame; when its complete
+// passes have doubled since its last denoise (1, 2, 4, 8...: a view refined to 1024 passes is denoised 11 times instead
+// of at each of its frames, about as often as its noise halves); and when the view is done or paused (`finished`: the
+// image stays, and is shown with all of its samples), once. A script's frames are never finished (it has no target and
+// no pause): a hold's last frame shows the last doubling's denoise unless it lands on a doubling (see viewer_script). A
+// display changed since is no reason: the kept floats are re-toned instead (frame_bytes), and the schedule goes on
+// from the last denoise. Nothing here reads the clock: the moving view's frames, which the clock decides, are the
+// caller's (denoise_rule::moving).
+bool viewer::denoise_due(bool finished) const
+{
+    if (!denoising())
+    {
+        return false;
+    }
+    if (denoised_generation_ != generation_)
+    {
+        return true;
+    }
+    const gpu::accumulation now = session_->state();
+    if (now == denoised_state_)
+    {
+        return false;
+    }
+    return now.passes >= 2 * denoised_state_.passes || finished;
+}
+
+// A denoise the schedule wants that no frame has shown: the view was moving when its last frame came (a camera moved
+// in a paused window, a target reached within the first frames), and the window shows it as a frame of its own once
+// the view stands still (iterate)
+bool viewer::denoise_pending() const
+{
+    if (!denoising())
+    {
+        return false;
+    }
+    const gpu::accumulation now = session_->state();
+    return now.passes > 0 && denoise_due(!opts_.script && (now.passes >= target_ || paused_));
+}
+
+// The bytes of the frame about to be kept (keep_frame), by the rule: without the denoiser, the image through the
+// display (session::display); with it, the image denoised now (frame_denoised_: --record marks the frame), else the
+// view's last denoised image again: its bytes as kept, or, through a display changed since, its kept floats re-toned
+// on the GPU with no denoise (session::retone_denoised), however far the image has refined since; before the view's
+// first denoise, the image itself. A denoise or a re-tone that fails turns the denoiser off and says why: the frame
+// shows the image, and the recording says denoise off before it. A window someone watches goes on so (N turns it on
+// again); a run that ends by itself keeps the reason (denoise_failure_), and with -o fails for it once the plain files
+// are saved (save_outputs), as RayTracingGPU --denoise does. A replay's frames after it show the image itself, marked
+// or not, up to its next denoise on.
+//
+// The first frame without the denoiser frees what it kept (drop_denoiser): the frame the recording writes denoise off
+// before, so a replay frees it at the same frame. N off and on again before a frame, which a recording doesn't see,
+// keeps it in the window as in the replay.
+std::span<const std::uint8_t> viewer::frame_bytes(denoise_rule rule)
+{
+    frame_denoised_ = false;
+    shown_denoised_ = false;
+    const gpu::display_options shown = shown_display();
+    if (!denoising())
+    {
+        if (denoised_generation_ != 0)
+        {
+            drop_denoiser();
+        }
+        return session_->display(shown);
+    }
+    const gpu::accumulation now = session_->state();
+    const bool kept = denoised_generation_ == generation_; // the session holds the view's last denoised floats
+    const bool finished = !opts_.script && (now.passes >= target_ || paused_);
+    const bool denoise = rule == denoise_rule::marked || (rule == denoise_rule::schedule && denoise_due(finished));
+    if (!denoise && !kept)
+    {
+        return session_->display(shown);
+    }
+    if (denoise || denoised_display_ != shown)
+    {
+        const std::uint64_t start = SDL_GetTicksNS();
+        try
+        {
+            const std::span<const std::uint8_t> bytes =
+                denoise ? session_->display_denoised(shown) : session_->retone_denoised(shown);
+            denoised_bytes_.assign(bytes.begin(), bytes.end());
+        }
+        catch (const std::exception& error)
+        {
+            const std::string why = error.what();
+            denoise_ = false;
+            denoise_failure_ = why;
+            drop_denoiser();
+            std::println("Error: {}; the denoiser is off", why);
+            say("denoiser off: it failed (the console says why)");
+            return session_->display(shown);
+        }
+        denoised_display_ = shown;
+        if (denoise)
+        {
+            denoised_generation_ = generation_;
+            denoised_state_ = now;
+            frame_denoised_ = true;
+            // --stats: a comment line per denoise, before its frame's row (a re-tone isn't one)
+            if (stats_.is_open())
+            {
+                stats_ << std::format("# denoised: frame {}, {} passes and {} rows, generation {}, {:.3f} ms\n",
+                                      frame_, now.passes, now.rows, generation_,
+                                      static_cast<double>(SDL_GetTicksNS() - start) / 1e6);
+                stats_.flush();
+            }
+        }
+    }
+    shown_denoised_ = true;
+    return denoised_bytes_;
+}
+
+// P's denoised image: the view as it is (its pass completed), shown as a frame of its own unless the frame on screen
+// is that image already: denoised now (a marked frame), or, when its last denoise was of this very image, its kept
+// floats shown again (re-toned for a display changed since). A denoise that fails turns the denoiser off (frame_bytes
+// says why), and the frame shows the image itself: shown_denoised_ says which.
+std::expected<void, std::string> viewer::show_denoised_now()
+{
+    const gpu::accumulation now = session_->state();
+    const bool same = denoised_generation_ == generation_ && denoised_state_ == now;
+    if (same && shown_denoised_ && denoised_display_ == shown_display())
+    {
+        return {};
+    }
+    try
+    {
+        if (const auto kept = keep_frame(frame_bytes(same ? denoise_rule::unmarked : denoise_rule::marked)); !kept)
+        {
+            return kept;
+        }
+    }
+    catch (const std::exception& error)
+    {
+        return std::unexpected(error.what());
+    }
+    present_needed_ = true;
+    show_kept_frame();
+    return {};
+}
+
+// The HUD's word on a denoised frame: "denoised", or "denoised at 64 of 100 passes" while the image has more passes
+// than its last denoise, whose bytes the frames show until the next one (without it they would look frozen)
+std::string viewer::denoise_tag() const
+{
+    if (!shown_denoised_ || !denoising() || denoised_generation_ != generation_)
+    {
+        return {};
+    }
+    const gpu::accumulation now = session_->state();
+    return denoised_state_.passes == now.passes
+               ? std::string("denoised")
+               : std::format("denoised at {} of {} passes", denoised_state_.passes, now.passes);
+}
+
+// -o under N: each output's denoised twin beside it, <stem>-denoised.png or .pfm, as RayTracingGPU --denoise writes
+// them: a PNG the display's bytes of the denoised image (through the window's display), a PFM its linear floats before
+// any exposure (session::denoised_pixels); one line names them. The image is the plain files' (its pass completed),
+// denoised now unless its last denoise was of it. A denoise that fails leaves the plain files as they were saved, and
+// no denoised one, as in RayTracingGPU. Returns the files that couldn't be saved, one a line (empty: none), or, when
+// there is no denoised image to save, why.
+std::expected<std::string, std::string> viewer::save_denoised(const std::vector<std::filesystem::path>& outputs)
+{
+    std::optional<image> png;
+    std::vector<double> linear;
+    try
+    {
+        const gpu::accumulation now = session_->state();
+        const bool same = denoised_generation_ == generation_ && denoised_state_ == now;
+        const std::uint64_t start = SDL_GetTicksNS();
+        const std::span<const std::uint8_t> bytes = session_->display_denoised(shown_display());
+        if (!same && stats_.is_open())
+        {
+            stats_ << std::format("# denoised: frame {}, {} passes and {} rows, generation {}, {:.3f} ms (for -o)\n",
+                                  frame_, now.passes, now.rows, generation_,
+                                  static_cast<double>(SDL_GetTicksNS() - start) / 1e6);
+            stats_.flush();
+        }
+        png = bytes_to_image(bytes, width_, height_);
+        const std::vector<float> floats = session_->denoised_pixels();
+        linear.assign(floats.begin(), floats.end());
+    }
+    catch (const std::exception& error)
+    {
+        return std::unexpected(std::format("--denoise: {}; no denoised file saved", error.what()));
+    }
+    const auto pfm = to_image(linear, width_, height_);
+    if (!pfm)
+    {
+        return std::unexpected(std::format("--denoise: {}; no denoised file saved", pfm.error()));
+    }
+    std::string errors;
+    std::vector<std::string> saved_files;
+    for (const std::filesystem::path& output : outputs)
+    {
+        const std::filesystem::path file = denoised_name(output);
+        const image& source = is_png(file) ? *png : *pfm;
+        if (const auto saved = source.save(file); !saved)
+        {
+            errors += std::format("{}{} ({})", errors.empty() ? "" : "\n", saved.error(), to_utf8(file));
+            continue;
+        }
+        saved_files.push_back(to_utf8(std::filesystem::absolute(file)));
+    }
+    if (!saved_files.empty())
+    {
+        std::println("Denoised: {}",
+                     saved_files | std::views::join_with(std::string(", ")) | std::ranges::to<std::string>());
+    }
+    return errors;
 }
 
 // After a switch: the new scene's line on the console; or the error, on the console and on screen, over the scene that
@@ -1705,6 +2129,7 @@ void viewer::draw_overlay()
         "M, Shift+M          the next or previous strategy",
         "F2                  float32 or float64",
         "O                   OptiX on or off",
+        "N                   denoised image, for the eye",
         "T, Shift+T          the next or previous tone map",
         ", .                 exposure -/+ 0.5 EV",
         "0                   exposure back to 0 EV",
@@ -1770,6 +2195,8 @@ void viewer::draw_overlay()
         const bool live = !opts_.script;
         std::string progress = live ? std::format("{} / {} samples", state.passes, target_)
                                     : std::format("{} samples", state.passes);
+        // A denoised frame says so, in place of the rate while the image refines ("denoised at 64 of 100 passes")
+        const std::string denoised = denoise_tag();
         if (live && paused_)
         {
             progress += "   paused (Space)";
@@ -1778,9 +2205,13 @@ void viewer::draw_overlay()
         {
             progress += "   done (Enter: more)";
         }
-        else if (samples_per_second_ > 0)
+        else if (denoised.empty() && samples_per_second_ > 0)
         {
             progress += std::format("   {:.1f} M samples/s   frame {:.1f} ms", samples_per_second_ / 1e6, frame_ms_);
+        }
+        if (!denoised.empty())
+        {
+            progress += std::format("   {}", denoised);
         }
         const std::string lines[] = {
             std::format("{}  {}x{}  {}  strata {}x{}{}{}", scene_label(settings_.scene), width_, height_,
@@ -1809,6 +2240,11 @@ void viewer::draw_overlay()
 
 SDL_AppResult viewer::init()
 {
+    // The denoiser is OptiX's, and works in float: refused before anything starts, in RayTracingGPU's words
+    if (opts_.denoise && opts_.fp64)
+    {
+        return fail("--denoise works in float only: drop --fp64");
+    }
     // The settings of the command line; a script's, up to its first frame, come first (so the session that starts is
     // the script's, and the window has the script's size from the start)
     render_settings settings{.scene = std::string(opts_.scene),
@@ -1825,7 +2261,7 @@ SDL_AppResult viewer::init()
         {
             return fail(text.error());
         }
-        auto parsed = parse_script(*text);
+        auto parsed = parse_script(*text, opts_.denoise); // a frame marked denoised needs the denoiser on
         if (!parsed)
         {
             return fail(std::format("{}: {}", to_utf8(*opts_.script), parsed.error()));
@@ -1882,6 +2318,11 @@ SDL_AppResult viewer::init()
             else if (const auto* exposure = std::get_if<set_exposure>(&c))
             {
                 display_.exposure = exposure->exposure;
+            }
+            else if (const auto* denoise = std::get_if<set_denoise>(&c))
+            {
+                denoise_ = denoise->on;
+                denoise_used_ = true;
             }
         }
     }
@@ -1943,17 +2384,24 @@ SDL_AppResult viewer::init()
     {
         return fail(std::format("{}: {} works in float32 only", to_utf8(*opts_.script), tone_map_name(shown.op)));
     }
-    // OptiX, for --optix (or a script's kernel optix) and for a scene with triangle meshes, and only for them, so that
-    // every other run is as before. It starts on the device CUDA starts, after query_device below; a build without
-    // OptiX's headers refuses here instead, before the window and CUDA, in RayTracingGPU's words (start_optix() says
-    // why, and starts nothing).
+    // and a script's denoise on, or precision double, before its first frame (--denoise --fp64 was refused first)
+    if (denoise_ && settings.fp64 && opts_.script)
+    {
+        return fail(std::format("{}: OptiX's denoiser works in float32 only", to_utf8(*opts_.script)));
+    }
+    // OptiX, for --optix (or a script's kernel optix), for a scene with triangle meshes and for the denoiser
+    // (--denoise, a script's denoise on), and only for them, so that every other run is as before. It starts on the
+    // device CUDA starts, after query_device below; a build without OptiX's headers refuses here instead, before the
+    // window and CUDA, in RayTracingGPU's words (start_optix() says why, and starts nothing), naming what asked for it.
+    const bool wants_optix = optix || denoise_;
     const auto optix_refused = [&](const std::string& reason) {
         return fail(opts_.optix ? std::format("--optix: {}", reason)
                     : has_meshes(*built)
                         ? std::format("'{}' has triangle meshes, which only OptiX renders: {}", settings.scene, reason)
-                        : std::format("OptiX can't run here: {}", reason));
+                    : opts_.denoise ? std::format("--denoise: {}", reason)
+                                    : std::format("OptiX can't run here: {}", reason));
     };
-    if (const auto opened = optix && !gpu::optix_built() ? open_optix() : std::expected<void, std::string>{};
+    if (const auto opened = wants_optix && !gpu::optix_built() ? open_optix() : std::expected<void, std::string>{};
         !opened)
     {
         return optix_refused(opened.error());
@@ -2090,7 +2538,7 @@ SDL_AppResult viewer::init()
     {
         return fail(error.what());
     }
-    if (const auto opened = optix ? open_optix() : std::expected<void, std::string>{}; !opened)
+    if (const auto opened = wants_optix ? open_optix() : std::expected<void, std::string>{}; !opened)
     {
         return optix_refused(opened.error());
     }
@@ -2237,7 +2685,11 @@ void viewer::update_title()
 }
 
 // The image of complete passes, as RayTracingGPU saves it: a pass in progress is finished first, so the file holds
-// exactly the samples of `passes` and matches RayTracingGPU's render of that many
+// exactly the samples of `passes` and matches RayTracingGPU's render of that many. With N on, each output's denoised
+// twin beside it too, as RayTracingGPU --denoise writes them (save_denoised); the plain files stay the image. A denoise
+// that failed, here or at a frame of a run that ends by itself (denoise_failure_), leaves the plain files saved, a
+// command without --denoise and, said last, the error, as RayTracingGPU --denoise does: the run fails. A window someone
+// watches said so when it happened, and turned N off (frame_bytes).
 bool viewer::save_outputs()
 {
     if (opts_.outputs.empty())
@@ -2276,7 +2728,20 @@ bool viewer::save_outputs()
             std::println("Image saved: {} ({} samples per pixel)", to_utf8(std::filesystem::absolute(output)),
                          state.passes);
         }
-        std::println("The same image: {}", gpu_command(state.passes));
+        bool denoised = false; // the image was denoised for the twins: the command names --denoise
+        std::string failed;
+        if (denoising())
+        {
+            const auto saved = save_denoised(opts_.outputs);
+            denoised = saved.has_value();
+            failed = saved ? *saved : saved.error();
+        }
+        else if (denoise_failure_ && !interactive())
+        {
+            failed = std::format("--denoise: {}; no denoised file saved", *denoise_failure_);
+        }
+        errors += std::format("{}{}", errors.empty() || failed.empty() ? "" : "\n", failed);
+        std::println("The same image: {}", gpu_command(state.passes, denoised));
         if (!errors.empty())
         {
             fail(errors);
@@ -2291,9 +2756,9 @@ bool viewer::save_outputs()
     }
 }
 
-// A frame with new samples, or with the same ones through another display, after display(): kept for the window, and
-// written by --record and by --frames (without a window, or with a minimized one, which presents nothing to read back:
-// from the bytes, which the window shows as they are)
+// A frame with new samples, or with the same ones through another display, after display() (frame_bytes): kept for the
+// window, and written by --record and by --frames (without a window, or with a minimized one, which presents nothing to
+// read back: from the bytes, which the window shows as they are)
 std::expected<void, std::string> viewer::keep_frame(std::span<const std::uint8_t> bytes)
 {
     shown_.assign(bytes.begin(), bytes.end());
@@ -2301,6 +2766,7 @@ std::expected<void, std::string> viewer::keep_frame(std::span<const std::uint8_t
     shown_height_ = height_;
     upload_needed_ = true;
     record_frame();
+    frame_denoised_ = false; // the mark was this frame's
     if (opts_.frames && (headless() || minimized_))
     {
         return save_frame_bytes(bytes, width_, height_);
@@ -2308,10 +2774,35 @@ std::expected<void, std::string> viewer::keep_frame(std::span<const std::uint8_t
     return {};
 }
 
+// A frame a key kept between two iterates (P and C finish the pass in progress, P under the denoiser denoises the image
+// it saves): presented at once and, with --frames, saved as iterate saves its frames, before the next iterate's frame
+// can take its place on screen, so that --frames saves every frame --record writes. Without a window, or minimized, it
+// does nothing (keep_frame saved the frame already): the headless runs and their replays are unaffected by it. An error
+// is printed (fail); one that lasts, a texture or an upload SDL can't make, ends the program at the next iterate, which
+// meets it again.
+void viewer::show_kept_frame()
+{
+    if (!window_ || minimized_)
+    {
+        return;
+    }
+    if ((shown_width_ != texture_width_ || shown_height_ != texture_height_) &&
+        !make_texture(shown_width_, shown_height_))
+    {
+        return;
+    }
+    if (upload_shown())
+    {
+        draw_and_present(true);
+    }
+}
+
 // --record: the settings when they change, then the frame. The display's lines follow the settings when the display,
 // or the scene's own, isn't the books' bytes (names_display), and once written they come with every change of the
 // settings or of the display: a script's display holds for every scene after it (see viewer_script), so a replay shows
-// each frame as the window did. A recording of the books' scenes that never left their bytes stays as it was.
+// each frame as the window did. A recording of the books' scenes that never left their bytes stays as it was. So does
+// one that never used the denoiser: its line, denoise on or off, comes only once N was used (or --denoise, or a
+// script's denoise line), with each change, and a frame the window denoised is marked, so a replay denoises those.
 void viewer::record_frame()
 {
     if (!record_.is_open())
@@ -2338,8 +2829,13 @@ void viewer::record_frame()
         record_ << format_display(display);
         recorded_display_ = shown;
     }
+    if (denoise_used_ && recorded_denoise_ != denoise_)
+    {
+        record_ << format_denoise(denoise_);
+        recorded_denoise_ = denoise_;
+    }
     const gpu::accumulation state = session_->state();
-    record_ << format_frame(state.passes, state.rows, generation_, width_, height_, view_);
+    record_ << format_frame(state.passes, state.rows, generation_, width_, height_, view_, frame_denoised_);
     record_.flush();
 }
 
@@ -2365,13 +2861,14 @@ std::expected<bool, std::string> viewer::play_next()
         {
             move_.reset();
         }
-        // N passes of the new view; a frame that doesn't change the camera keeps the image, N more passes on
+        // N passes of the new view; a frame that doesn't change the camera keeps the image, N more passes on. The
+        // camera is moving: under the denoiser, the frame shows the image itself, as the window's moving frames do.
         try
         {
             const gpu::accumulation now = session_->state();
             const std::int64_t target = generation_ != before ? passes : now.passes + passes;
             script_report_ = session_->render_to({target, 0});
-            if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
+            if (const auto kept = keep_frame(frame_bytes(denoise_rule::moving)); !kept)
             {
                 return at(kept.error());
             }
@@ -2452,6 +2949,15 @@ std::expected<bool, std::string> viewer::play_next()
         else if (std::holds_alternative<set_exposure>(line.command))
         {
             display_.exposure = std::get<set_exposure>(line.command).exposure;
+        }
+        else if (std::holds_alternative<set_denoise>(line.command))
+        {
+            // As N, from the next frame: on, its use_settings gives a session made without OptiX's runtime the
+            // window's (attach_denoiser), its image kept; off, it frees what the denoiser kept (frame_bytes). Either
+            // forgets a denoise that failed before it.
+            denoise_ = std::get<set_denoise>(line.command).on;
+            denoise_used_ = true;
+            denoise_failure_.reset();
         }
         else if (std::holds_alternative<set_camera>(line.command))
         {
@@ -2539,8 +3045,12 @@ std::expected<bool, std::string> viewer::play_next()
             }
             try
             {
+                // Denoised where the window denoised it (the mark, which parse_script takes only under denoise on),
+                // else as the window showed it (frame_bytes); after a denoise that failed here, the image itself
                 script_report_ = session_->render_to(want);
-                if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
+                if (const auto kept =
+                        keep_frame(frame_bytes(c->denoised ? denoise_rule::marked : denoise_rule::unmarked));
+                    !kept)
                 {
                     return at(kept.error());
                 }
@@ -2552,13 +3062,13 @@ std::expected<bool, std::string> viewer::play_next()
             return true;
         }
     }
-    // A frame of a hold
+    // A frame of a hold: a still view, which the denoiser denoises as the window does (denoise_due)
     --hold_left_;
     try
     {
         const gpu::accumulation now = session_->state();
         script_report_ = session_->render_to({now.passes + hold_passes_, 0});
-        if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
+        if (const auto kept = keep_frame(frame_bytes(denoise_rule::schedule)); !kept)
         {
             return std::unexpected(kept.error());
         }
@@ -2604,7 +3114,7 @@ SDL_AppResult viewer::run_headless()
         {
             const std::uint64_t start = SDL_GetTicksNS();
             const gpu::render_report report = session_->render_to({target_, 0});
-            if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
+            if (const auto kept = keep_frame(frame_bytes(denoise_rule::schedule)); !kept)
             {
                 return fail(kept.error());
             }
@@ -2835,7 +3345,7 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         else if (e.key.key == SDLK_SPACE)
         {
             paused_ = !paused_;
-            present_needed_ = true;
+            present_needed_ = true; // and, under the denoiser, a paused image is denoised as it stands (iterate)
         }
         else if (e.key.key == SDLK_RETURN || e.key.key == SDLK_KP_ENTER)
         {
@@ -2864,7 +3374,7 @@ SDL_AppResult viewer::event(const SDL_Event& e)
             // P's command: the view on screen, its pass in progress finished
             if (const auto state = complete_pass(); state)
             {
-                const std::string command = gpu_command(state->passes);
+                const std::string command = gpu_command(state->passes, denoising());
                 if (SDL_SetClipboardText(command.c_str()))
                 {
                     std::println("Copied: {}", command);
@@ -2902,6 +3412,11 @@ SDL_AppResult viewer::event(const SDL_Event& e)
             {
                 return result;
             }
+        }
+        else if (e.key.key == SDLK_N)
+        {
+            // The denoiser on or off, the session kept: N never ends the program
+            switch_denoise();
         }
         else if (is(SDLK_COMMA, SDL_SCANCODE_COMMA) || is(SDLK_PERIOD, SDL_SCANCODE_PERIOD))
         {
@@ -3146,25 +3661,30 @@ SDL_AppResult viewer::iterate()
             // Paused, the image doesn't refine, but a new view (a camera move, a new size) still gets its first pass
             const std::int64_t limit = paused_ ? std::min(target_, std::max<std::int64_t>(session_->state().passes, 1))
                                                : target_;
+            // Under the denoiser, a moving view's frames show the image itself, and a still view's are denoised on
+            // their schedule (frame_bytes)
+            const denoise_rule rule = moving ? denoise_rule::moving : denoise_rule::schedule;
             if (!minimized_pause && session_->state().passes < limit)
             {
                 const double budget = moving ? moving_share * pacing_.frame_seconds : still_seconds;
                 const gpu::accumulation before = session_->state();
                 report = session_->render_for(budget, limit);
                 last_samples_ = samples_in(session_->state()) - samples_in(before);
-                if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
+                if (const auto kept = keep_frame(frame_bytes(rule)); !kept)
                 {
                     return fail(kept.error());
                 }
                 new_samples = true;
                 redisplay_ = false; // this frame has the display as it is now
             }
-            else if (redisplay_ && !minimized_pause)
+            else if ((redisplay_ || (!moving && denoise_pending())) && !minimized_pause)
             {
                 // A display changed on an image that doesn't refine (done, or paused): its samples once more, through
-                // the new display, as a frame that adds none. keep_frame records it with the same passes, rows and
-                // generation, which a replay renders by rendering nothing; the rendering stays asleep.
-                if (const auto kept = keep_frame(session_->display(shown_display())); !kept)
+                // the new display (under the denoiser, its last denoised floats re-toned), as a frame that adds none.
+                // keep_frame records it with the same passes, rows and generation, which a replay renders by rendering
+                // nothing; the rendering stays asleep. So does a denoise the image is due once its view stands still
+                // (done or paused, see denoise_pending), and N's frame, on or off.
+                if (const auto kept = keep_frame(frame_bytes(rule)); !kept)
                 {
                     return fail(kept.error());
                 }
@@ -3232,6 +3752,14 @@ SDL_AppResult viewer::iterate()
         {
             SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "waitevent");
             skip_interval_ = true;
+            // A denoise due once the view stands still (it moved, then stopped refining): a timer wakes the loop
+            // then, one per moment the view stops
+            if (!minimized_pause && denoise_pending() && moving_until_ns_ != denoise_wake_ns_)
+            {
+                denoise_wake_ns_ = moving_until_ns_;
+                const std::uint64_t at = SDL_GetTicksNS();
+                SDL_AddTimerNS(moving_until_ns_ > at ? moving_until_ns_ - at + 1'000'000 : 1'000'000, wake_up, nullptr);
+            }
         }
         else
         {

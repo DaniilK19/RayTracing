@@ -35,3 +35,8 @@ regress-optix|G|scripts/verify/regress-optix.txt|yes|none
 # OptiX in the window (from Step 95): O on and off, Tab's scenes of glTF models, a model's file and a focus on it
 # through OptiX's pick, rendered headless and stamped like regress-optix
 regress-optix-viewer|V|tests/regress-optix-viewer.txt|yes|none
+# OptiX's AI denoiser in the window (from Step 96): recorded frames to 64 passes denoised where marked, off the doubling
+# schedule, and re-toned ones, the window's doubling schedule under holds and a move, a tone map between two denoises
+# re-toning the kept floats, on the quality kernel, OptiX and the first book's kernel, stamped like regress-optix (the
+# denoiser's weights come with the graphics driver)
+regress-denoise-viewer|V|tests/regress-denoise-viewer.txt|yes|none

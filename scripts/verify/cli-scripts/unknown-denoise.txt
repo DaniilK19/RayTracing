@@ -1,0 +1,4 @@
+# A script with a denoise line that is neither on nor off (Step 96 adds denoise on|off)
+size 16 9
+denoise maybe
+hold 1 +1
