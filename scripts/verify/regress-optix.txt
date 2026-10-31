@@ -1,9 +1,9 @@
 # OptiX's renders for scripts/verify/hostgate.ps1's chained section regress-optix (from Step 89; chained.txt: kind G,
 # stamped): one RayTracingGPU command's arguments a line, each rendered by hostgate with -o NAME.pfm -o NAME.png into a
-# folder of its own. The graphics driver compiles OptiX's programs, so the kept lines (the Scene, View, Kernel, Mean
-# radiance, Rays traced and Shadow rays lines, and every file's SHA-256) carry a stamp, the driver's version and the
-# programs' SHA-256: under the stamp of the last accepted lines a step's lines must equal them, under another they wait
-# for review (RE-VERIFY).
+# folder of its own. The graphics driver compiles OptiX's programs and brings OptiX's denoiser, so the kept lines (the
+# Scene, View, Kernel, Mean radiance, Rays traced, Shadow rays and Denoised lines, and every file's SHA-256, the
+# -denoised files' included) carry a stamp, the driver's version and the programs' SHA-256: under the stamp of the last
+# accepted lines a step's lines must equal them, under another they wait for review (RE-VERIFY).
 #
 # Tiny renders (96 by 54 pixels, 16 samples) of the kinds of geometry and light the OptiX tracer handles: quads and a
 # lamp (cornell), every kind with media and textures (final), an environment map and GGX metals (studio), moving
@@ -15,3 +15,6 @@ studio --optix -p mis -w 96 --height 54 -s 16
 bouncing --optix -p material -w 96 --height 54 -s 16
 smoke --optix -p nee -w 96 --height 54 -s 16
 earth --optix -p material -w 96 --height 54 -s 16
+# OptiX's denoiser (from Step 94) on a CUDA render, through a tone map: the denoised PNG (the display's bytes of the
+# denoised image), its PFM and the Denoised line, beside the plain files
+cornell -p mis --denoise --tonemap agx -w 96 --height 54 -s 16

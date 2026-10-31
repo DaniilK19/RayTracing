@@ -82,4 +82,8 @@ void launch_test(core& c, std::span<const unsigned char> ptx, const char* entry,
 void denoise(core& c, const void* beauty, const void* albedo, const void* normal, void* out, int width, int height);
 // What the last denoise computed and holds (denoiser.cpp, C): renderer.h's denoise_report, valid false before the first
 denoise_report last_denoise(const core& c);
+// The denoiser's state and scratch freed and their setup forgotten; the denoiser itself kept (denoiser.cpp, C)
+void release_denoiser(core& c);
+// GpuTests: tiles of at most `side` (0: none), the next denoise set up again (denoiser.cpp, C)
+void set_denoise_tile_limit(core& c, int side);
 }

@@ -7,19 +7,21 @@
 #      them all (CPU work, many seconds, counted in the step's GPU time and reported apart by gpu.ps1 -Report). If it
 #      fails, OptiX doesn't run with this driver and nothing else is tried;
 #   2. GpuTests optix-runtime optix-tracer optix-render --require-optix: the runtime's probes, the OptiX tracer against
-#      the BVH ray by ray, the same-seed survey of every GPU scene (and the suites later steps add: see section 5);
+#      the BVH ray by ray, the same-seed survey of every GPU scene (and the suites later steps added: optix-triangles,
+#      optix-pbr, and the denoiser's guides and denoise; see section 5);
 #   3. the white furnaces under --optix: furnace and env-furnace, -p material, 480x270, 64 samples, every value exactly
 #      1.0 (PfmStats stats --equal 1 --share 1);
 #   4. compare.ps1 on cornell, final and studio: mis@quality:ref (Step 85's references, which no driver changes)
 #      against mis@optix:3,4. A protocol that comes out VOID (a control failed: the comparison can't be trusted on
 #      that scene) runs once more, B's seeds +10; VOID again stops the script: nothing more is run, ask the user;
-#   5. what later steps add (Claude fills these sections in when integrating Steps 91, 92 and 94: see below).
+#   5. what later steps added: the protocols of Steps 91 and 92, and Step 94's denoiser on cornell (see below).
 # Every run goes through gpu.ps1 into State\runs\stepNN\, each queued run's whole output in <label>.txt there.
 # All pass: Claude stamps the stamped entries anew (carry.ps1 -Restamp for the entries whose bytes the step's check run
 # found the ones recorded, -Record for the others; hostgate.ps1 -Accept), and the commit says "re-verified after a
 # graphics driver update", naming no version. Any failure: stop and ask the user (a driver change or a latent bug; its
-# diagnosis may pass the budget). The checks cost about 25 to 35 s of GPU plus the compile: past the step's 55 s, or
-# when a job would take it past 60 s, gpu.ps1 asks for -Approved.
+# diagnosis may pass the budget). The checks cost about 26 to 36 s of GPU plus the compile (Step 94's two suites and
+# its two denoised 480x270 renders add about a second of it, each render's process starting OptiX and making the
+# denoiser): past the step's 55 s, or when a job would take it past 60 s, gpu.ps1 asks for -Approved.
 #   powershell -ExecutionPolicy Bypass -File scripts\verify\optix-reverify.ps1 -Step 90
 # Exit code 0 when every check passes, 1 when one fails, 2 when nothing is re-verified (a build without OptiX
 # programs; a refusal of gpu.ps1, in this script's runs or compare.ps1's (its exit code 4); a protocol VOID twice, no
@@ -98,11 +100,11 @@ try {
 
     # --- 2. the suites: the runtime, the tracer ray by ray, the same-seed survey --------------------------------------
     $run = Invoke-Queued "reverify-suites" @($tests, "optix-runtime", "optix-tracer", "optix-render", "optix-triangles",
-        "optix-pbr", "--require-optix")
+        "optix-pbr", "guides", "denoise", "--require-optix")
     $run.lines | Where-Object { $_ -match '(: |, )(FAIL|SKIP)\b|^Error|^GpuTests: ' } | ForEach-Object { "  $_" }
     $detail = "exit code $($run.code)"
-    Write-Check "GpuTests optix-runtime optix-tracer optix-render optix-triangles optix-pbr --require-optix" `
-        ($run.code -eq 0) $detail
+    Write-Check ("GpuTests optix-runtime optix-tracer optix-render optix-triangles optix-pbr guides denoise " +
+        "--require-optix") ($run.code -eq 0) $detail
 
     # --- 3. the white furnaces under --optix: every value exactly 1.0 -------------------------------------------------
     foreach ($scene in @("furnace", "env-furnace", "mesh-furnace")) {
@@ -153,7 +155,7 @@ try {
         Write-Check "compare.ps1 $scene, mis@quality:ref against $b" ($code -eq 0) $detail
     }
 
-    # --- 5. the checks later steps add (empty until Claude integrates that step) --------------------------------------
+    # --- 5. the checks later steps added -----------------------------------------------------------------------------
     # Step 91: the triangles (the suite optix-triangles in section 2, mesh-furnace in section 3), and its protocols:
     # cornell's quads under the quality kernel against cornell-triangles under OptiX (the triangles' hierarchies and the
     # origins moved off them under the new driver), and instances-baked against instances (the instance transforms).
@@ -178,9 +180,32 @@ try {
             $detail
     }
 
-    # Step 94: the denoiser's evaluation on cornell (denoise.ps1: the N16/D16 renders, PfmStats error, the thresholds),
-    #          against its references State\ref\cornell-mis2048-s101.pfm and -s102.pfm: Step 85's renders, which a
-    #          driver update doesn't change.
+    # Step 94: the denoiser, whose network comes with the driver (the suites guides and denoise in section 2), and its
+    # evaluation on cornell as denoise.ps1 makes it: 16 samples at seeds 1 and 2, 480x270, -p mis, denoised by
+    # RayTracingGPU --denoise (the program's own path), each pair judged by PfmStats error with denoise.ps1's thresholds
+    # against the references State\ref\cornell-mis2048-s101.pfm and -s102.pfm: Step 85's renders, which a driver update
+    # doesn't change.
+    $references = @((Join-Path $stateDir "ref\cornell-mis2048-s101.pfm"),
+        (Join-Path $stateDir "ref\cornell-mis2048-s102.pfm"))
+    foreach ($reference in $references) {
+        if (-not (Test-Path -LiteralPath $reference)) { throw "no $reference (references.ps1 renders it)" }
+    }
+    foreach ($seed in @(1, 2)) {
+        $noisy = Join-Path $work "reverify-denoise-N$seed.pfm"
+        $denoised = Join-Path $work "reverify-denoise-N$seed-denoised.pfm"
+        $run = Invoke-Queued "reverify-denoise-N$seed" @($gpu, "cornell", "-p", "mis", "-w", "480", "--height", "270",
+            "-s", "16", "--seed", "$seed", "--denoise", "-o", $noisy)
+        if ($run.code -ne 0) {
+            Write-Check "cornell -p mis --denoise, seed $seed" $false "the render's exit code $($run.code)"
+            continue
+        }
+        $result = Invoke-Native $stats (@("error", $noisy, $denoised) + $references +
+            @("--min-gain", "4", "--max-drift", "0.02", "--tiles", "32", "--spp", "16"))
+        $result.lines | ForEach-Object { "  $_" }
+        $detail = if ($result.code -eq 2) { "an error, PfmStats exit code 2" }
+            else { "PfmStats exit code $($result.code)" }
+        Write-Check "the denoiser on cornell, seed $seed, against Step 85's references" ($result.code -eq 0) $detail
+    }
 
     Write-Output ""
     if ($failures -gt 0) {

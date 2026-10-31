@@ -346,6 +346,10 @@ public:
 
     denoise_report last_denoise() const override { return optix_core::last_denoise(*core_); }
 
+    void release_denoiser() override { optix_core::release_denoiser(*core_); }
+
+    void set_denoise_tile_limit(int side) override { optix_core::set_denoise_tile_limit(*core_, side); }
+
     bool cache_enabled() const override { return optix_core::cache_enabled(*core_); }
 
     void compile_programs() override { optix_core::compile_programs(*core_); }

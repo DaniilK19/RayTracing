@@ -41,6 +41,7 @@
 #include "bvh.cuh"
 #include "camera.cuh"
 #include "constant_medium.cuh"
+#include "denoise.cuh"
 #include "device_memory.h"
 #include "display.cuh"
 #include "material.cuh"
@@ -1217,6 +1218,34 @@ void check_display(const display_options& options, precision arithmetic)
                                     "only");
     }
 }
+
+// What a session allocates for a denoise, per pixel: four float4 images (the beauty, the two guides, the denoised
+// image) and the widened sums. The denoiser keeps its state, scratch and these within 1024 MiB (denoiser.cpp, which
+// knows its own sizes), and leaves 256 MiB of the GPU's memory free beside them.
+constexpr std::size_t denoise_bytes_per_pixel = 4 * sizeof(float4) + 3 * sizeof(double);
+constexpr std::size_t denoise_memory_cap = std::size_t{1024} << 20;
+constexpr std::size_t denoise_free_margin = std::size_t{256} << 20;
+
+// Bytes as MiB, rounded up, for the messages (as denoiser.cpp rounds them)
+std::size_t mib(std::size_t bytes)
+{
+    return (bytes + (std::size_t{1} << 20) - 1) >> 20;
+}
+
+// An image whose denoise images alone pass the cap: refused by render() before it renders anything, and by the
+// session before it allocates any of them, in the same words (a size that isn't one is the camera's check to refuse)
+void check_denoise_size(int width, int height)
+{
+    const std::size_t pixels =
+        static_cast<std::size_t>(std::max(width, 0)) * static_cast<std::size_t>(std::max(height, 0));
+    if (pixels > denoise_memory_cap / denoise_bytes_per_pixel)
+    {
+        throw std::runtime_error(std::format("OptiX's denoiser may take at most {} MiB of the GPU's memory, and a "
+                                             "{}×{} image needs {} MiB for its images alone",
+                                             denoise_memory_cap >> 20, width, height,
+                                             mib(pixels * denoise_bytes_per_pixel)));
+    }
+}
 }
 
 // What a session holds, behind its pointer (see session in renderer.h). The precision is chosen at run time, so the
@@ -1236,7 +1265,10 @@ struct session::impl
     virtual std::span<const std::uint8_t> display() = 0;
     virtual std::span<const std::uint8_t> display(const display_options& options) = 0;
     virtual std::span<const std::uint8_t> display_denoised(const display_options& options) = 0;
+    virtual std::span<const std::uint8_t> retone_denoised(const display_options& options) = 0;
     virtual std::vector<float> denoised_pixels() const = 0;
+    virtual void attach_optix(std::shared_ptr<optix_runtime> runtime) = 0;
+    virtual void drop_denoised() = 0;
     virtual double pick_distance(const std::array<double, 3>& origin, const std::array<double, 3>& direction) = 0;
     virtual std::uint64_t rays() const = 0;
     virtual std::uint64_t shadow_rays() const = 0;
@@ -1439,15 +1471,262 @@ public:
 
     // --- The display_denoised region (track C, Step 94): guides if stale, the beauty, optix_runtime::denoise, the
     // denoised floats widened to sums, display(options)'s kernels at scale 1 -----------------------------------------
-    std::span<const std::uint8_t> display_denoised(const display_options& /*options*/) override
+    // The image as display(options) shows it, its two bands each over its own number of samples, through OptiX's AI
+    // denoiser first: the view's guides (16 samples per pixel, computed at the view's first denoise and kept until
+    // set_camera), the beauty (denoise.cu), optix_runtime::denoise, and the denoised floats widened to sums, which
+    // display()'s own kernels turn into bytes at a scale of 1.0 (to_rgba8, to_rgba8_toned: the bytes of those floats
+    // exactly). The image the last call denoised (the same view, passes and rows) isn't denoised again: a new exposure
+    // or tone map only shows the kept floats another way. Into display()'s buffers, valid as long as its bytes are.
+    std::span<const std::uint8_t> display_denoised(const display_options& options) override
     {
-        throw std::logic_error("session::display_denoised comes in Step 94");
+        check_display(options, std::same_as<Real, float> ? precision::float32 : precision::float64);
+        // The refusals in render()'s order and words: no runtime, then float64
+        if (!options_.optix)
+        {
+            throw std::logic_error("a session that denoises needs the program's OptiX runtime (session_options::optix, "
+                                   "from start_optix, or attach_optix)");
+        }
+        // The denoiser is new, and what is new computes in float only
+        if constexpr (std::same_as<Real, float>)
+        {
+            const accumulation now = planner().state();
+            if (now.passes == 0)
+            {
+                throw std::logic_error("the image has no complete pass to show");
+            }
+            if (denoised_generation_ != generation_ || denoised_at_ != now)
+            {
+                denoise_image(now);
+            }
+            return show_denoised(options);
+        }
+        else
+        {
+            throw std::invalid_argument("OptiX's denoiser computes in float only");
+        }
     }
 
+    // The kept denoised floats of this view through other display options, whatever the image has rendered since:
+    // display_denoised's bytes for those options on the image it denoised last, with no denoise
+    std::span<const std::uint8_t> retone_denoised(const display_options& options) override
+    {
+        check_display(options, std::same_as<Real, float> ? precision::float32 : precision::float64);
+        if constexpr (std::same_as<Real, float>)
+        {
+            check_view();
+            if (denoised_generation_ != generation_)
+            {
+                throw std::logic_error("the view has no denoised image: display_denoised makes it");
+            }
+            return show_denoised(options);
+        }
+        else
+        {
+            throw std::invalid_argument("OptiX's denoiser computes in float only");
+        }
+    }
+
+    // The floats of the last display_denoised of this view: linear, before the exposure, 3 per pixel, rows from the top
     std::vector<float> denoised_pixels() const override
     {
-        throw std::logic_error("session::denoised_pixels comes in Step 94");
+        check_view();
+        if (denoised_generation_ != generation_)
+        {
+            throw std::logic_error("the view has no denoised image: display_denoised makes it");
+        }
+        const std::size_t pixels =
+            static_cast<std::size_t>(camera_.image_width) * static_cast<std::size_t>(camera_.image_height);
+        const std::vector<float4> denoised = denoised_.to_host(pixels);
+        std::vector<float> values(3 * pixels);
+        for (std::size_t p = 0; p < pixels; ++p)
+        {
+            values[3 * p] = denoised[p].x;
+            values[3 * p + 1] = denoised[p].y;
+            values[3 * p + 2] = denoised[p].z;
+        }
+        return values;
     }
+
+    // The program's runtime for a session made without one: the denoiser is all it serves here (the tracer was chosen
+    // when the session was made), and the image goes on as it was
+    void attach_optix(std::shared_ptr<optix_runtime> runtime) override
+    {
+        if (!runtime)
+        {
+            throw std::invalid_argument("attach_optix needs the program's OptiX runtime (from start_optix)");
+        }
+        if constexpr (std::same_as<Real, float>)
+        {
+            if (options_.optix && options_.optix != runtime)
+            {
+                throw std::logic_error("the session has another OptiX runtime already: a program starts one");
+            }
+            options_.optix = std::move(runtime);
+        }
+        else
+        {
+            throw std::invalid_argument("OptiX's denoiser computes in float only");
+        }
+    }
+
+    // Everything a denoise keeps on the GPU but the denoiser itself: the session's five buffers, and the runtime's
+    // state and scratch (optix_runtime::release_denoiser), set up again at the next denoise
+    void drop_denoised() override
+    {
+        release_denoise_buffers();
+        if (options_.optix)
+        {
+            options_.optix->release_denoiser();
+        }
+    }
+
+private:
+    // The guides' own random numbers: the session's seed with "guidesee" in ASCII mixed in, so they never share the
+    // beauty's (sample_generator mixes the seed, the pixel and the pass)
+    static constexpr std::uint64_t guide_seed_mask = 0x6775696465736565;
+
+    // An array at least `size` long: grown as the sums are, the old memory freed before the new is allocated
+    template <typename T>
+    static void grow(device_array<T>& array, std::size_t size)
+    {
+        if (array.size() < size)
+        {
+            array = device_array<T>(0);
+            array = device_array<T>(size);
+        }
+    }
+
+    // The bytes grow() adds to an array to make it `size` long: the new array's, less the old one's it frees first
+    template <typename T>
+    static std::size_t growth(const device_array<T>& array, std::size_t size)
+    {
+        return array.size() < size ? (size - array.size()) * sizeof(T) : 0;
+    }
+
+    // The five buffers freed, and nothing kept: the next denoise computes the guides again and allocates anew
+    void release_denoise_buffers()
+    {
+        guides_generation_ = 0;
+        denoised_generation_ = 0;
+        guide_albedo_ = device_array<float4>(0);
+        guide_normal_ = device_array<float4>(0);
+        beauty_ = device_array<float4>(0);
+        denoised_ = device_array<float4>(0);
+        widened_ = device_array<double>(0);
+    }
+
+    // The kept denoised floats (widened_) as display(options) shows an image, over one band at a scale of 1.0: the
+    // widened floats are the image already. Into display()'s buffers, grown as it grows them.
+    std::span<const std::uint8_t> show_denoised(const display_options& options)
+    {
+        const int width = camera_.image_width;
+        const int height = camera_.image_height;
+        const std::size_t bytes = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4;
+        if (rgba_.size() < bytes)
+        {
+            rgba_ = device_array<std::uint8_t>(0);
+            rgba_ = device_array<std::uint8_t>(bytes);
+        }
+        if (shown_.size() < bytes)
+        {
+            shown_ = pinned_array<std::uint8_t>();
+            shown_ = pinned_array<std::uint8_t>(bytes);
+        }
+        if (options.op == tone_map::books)
+        {
+            detail::to_rgba8(widened_.data(), width, 0, height, 1.0, rgba_.data());
+        }
+        else
+        {
+            detail::to_rgba8_toned(widened_.data(), width, 0, height, 1.0, options.op,
+                                   static_cast<float>(std::exp2(options.exposure)), rgba_.data());
+        }
+        check(cudaMemcpy(shown_.data(), rgba_.data(), bytes, cudaMemcpyDeviceToHost),
+              "copying the denoised image from the GPU");
+        return {shown_.data(), bytes};
+    }
+
+    // The view's image at `now` denoised into denoised_ and widened_ (float sessions only: see display_denoised).
+    // Before any buffer grows, the GPU must have the growth free and 256 MiB besides: on Windows an allocation the GPU
+    // can't hold may be taken from the system's memory instead of failing. Whatever throws on the way leaves nothing
+    // kept: the five buffers are freed, so a refused or failed denoise holds none of them, and the next call starts
+    // over.
+    void denoise_image(accumulation now)
+    {
+        if constexpr (std::same_as<Real, float>)
+        {
+            const int width = camera_.image_width;
+            const int height = camera_.image_height;
+            const std::size_t pixels = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+            denoised_generation_ = 0;
+            try
+            {
+                check_denoise_size(width, height); // render() said it before rendering; a session's views say it here
+                const std::size_t added = growth(guide_albedo_, pixels) + growth(guide_normal_, pixels) +
+                                          growth(beauty_, pixels) + growth(denoised_, pixels) +
+                                          growth(widened_, 3 * pixels);
+                if (added > 0)
+                {
+                    std::size_t free_bytes = 0;
+                    std::size_t total_bytes = 0;
+                    check(cudaMemGetInfo(&free_bytes, &total_bytes), "reading how much of the GPU's memory is free");
+                    if (added + denoise_free_margin > free_bytes)
+                    {
+                        throw std::runtime_error(std::format(
+                            "OptiX's denoiser needs {} MiB more of the GPU's memory for the images of a {}×{} view; {} "
+                            "MiB are free, and {} MiB must stay so",
+                            mib(added), width, height, free_bytes >> 20, mib(denoise_free_margin)));
+                    }
+                }
+                if (guides_generation_ != generation_)
+                {
+                    guides_generation_ = 0;
+                    grow(guide_albedo_, pixels);
+                    grow(guide_normal_, pixels);
+                    const std::uint64_t seed = options_.seed ^ guide_seed_mask;
+                    if (optix_)
+                    {
+                        optix_scene_->guides(cam_, seed, guide_albedo_.data(), guide_normal_.data());
+                        // Waited for here, so that a failure in OptiX's programs says so, as run() does for the render
+                        try
+                        {
+                            check(cudaStreamSynchronize(nullptr), "computing the denoiser's guides");
+                        }
+                        catch (const std::runtime_error& error)
+                        {
+                            throw std::runtime_error(std::string("OptiX's programs failed on the GPU: ") +
+                                                     error.what());
+                        }
+                    }
+                    else
+                    {
+                        detail::launch_guides(quality_scene_.get(), device_.view(), cam_, seed, guide_albedo_.data(),
+                                              guide_normal_.data());
+                    }
+                    guides_generation_ = generation_;
+                }
+                grow(beauty_, pixels);
+                grow(denoised_, pixels);
+                grow(widened_, 3 * pixels);
+                // display()'s two bands and their scales: 1.0 / the number of samples
+                const auto passes = static_cast<double>(now.passes);
+                detail::to_beauty(sums_.data(), width, 0, now.rows, 1.0 / (passes + 1), beauty_.data());
+                detail::to_beauty(sums_.data(), width, now.rows, height - now.rows, 1.0 / passes, beauty_.data());
+                options_.optix->denoise(beauty_.data(), guide_albedo_.data(), guide_normal_.data(), denoised_.data(),
+                                        width, height);
+                detail::to_sums(denoised_.data(), width, height, widened_.data());
+            }
+            catch (...)
+            {
+                release_denoise_buffers();
+                throw;
+            }
+            denoised_generation_ = generation_;
+            denoised_at_ = now;
+        }
+    }
+
+public:
     // --- end of the display_denoised region ------------------------------------------------------------------------
 
     // --- The pick_distance region (track B, Step 91): one thread of __raygen__pick in an OptiX session of a scene with
@@ -1737,6 +2016,14 @@ private:
     pinned_array<std::uint8_t> shown_;
     // --- The display_denoised region's state (track C, Step 94): the guide, beauty and denoised buffers, sized to the
     // view like sums_, and the (generation, passes, rows) of the kept denoised floats ---------------------------------
+    device_array<float4> guide_albedo_{0}; // the view's guides, float4 per pixel (see guides.cuh)
+    device_array<float4> guide_normal_{0};
+    device_array<float4> beauty_{0};   // the image the denoiser takes (to_beauty)
+    device_array<float4> denoised_{0}; // and what it gives back
+    device_array<double> widened_{0};  // denoised_ as sums, for the display's kernels at scale 1 (to_sums)
+    std::int64_t guides_generation_ = 0;   // the view (generation_) the guides belong to; 0: none (views count from 1)
+    std::int64_t denoised_generation_ = 0; // the view denoised_ and widened_ belong to; 0: none
+    accumulation denoised_at_;             // and how far its image had come
     // --- end of the display_denoised region's state ----------------------------------------------------------------
 };
 
@@ -1864,9 +2151,24 @@ std::span<const std::uint8_t> session::display_denoised(const display_options& o
     return impl_->display_denoised(options);
 }
 
+std::span<const std::uint8_t> session::retone_denoised(const display_options& options)
+{
+    return impl_->retone_denoised(options);
+}
+
 std::vector<float> session::denoised_pixels() const
 {
     return impl_->denoised_pixels();
+}
+
+void session::attach_optix(std::shared_ptr<optix_runtime> runtime)
+{
+    impl_->attach_optix(std::move(runtime));
+}
+
+void session::drop_denoised()
+{
+    impl_->drop_denoised();
 }
 
 double session::pick_distance(const std::array<double, 3>& origin, const std::array<double, 3>& direction)
@@ -1989,6 +2291,10 @@ render_result render(const scene_desc& scene, const render_options& options)
     {
         throw std::invalid_argument("OptiX's denoiser computes in float only");
     }
+    if (options.denoise)
+    {
+        check_denoise_size(scene.camera.image_width, scene.camera.image_height);
+    }
     session one(scene, {.seed = options.seed,
                          .arithmetic = options.arithmetic,
                          .all_books_kernel = options.all_books_kernel,
@@ -2023,15 +2329,30 @@ render_result render(const scene_desc& scene, const render_options& options)
         const std::span<const std::uint8_t> bytes = one.display(options.display);
         result.rgba.assign(bytes.begin(), bytes.end());
     }
+    // The render's time, before any denoise: the programs' "Render time" and rays per second stay the render's, with or
+    // without denoise (whose guides, invoke and the denoiser's creation would otherwise count in them)
+    result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
     // The image denoised by OptiX, through the same display (session::display_denoised): beside the pixels, which stay
-    // the image as rendered
+    // the image as rendered. What fails now (the denoiser's memory plan, its creation, the GPU on the way) can't be
+    // known before the passes, which are done: the render's image is kept, and denoise_error says why the denoised one
+    // is missing.
     if (options.denoise)
     {
-        const std::span<const std::uint8_t> bytes = one.display_denoised(options.display);
-        result.denoised_rgba.assign(bytes.begin(), bytes.end());
-        result.denoised = one.denoised_pixels();
+        try
+        {
+            const std::span<const std::uint8_t> bytes = one.display_denoised(options.display);
+            result.denoised_rgba.assign(bytes.begin(), bytes.end());
+            result.denoised = one.denoised_pixels();
+            result.denoise_tile = options.optix->last_denoise().tile;
+        }
+        catch (const std::exception& error)
+        {
+            result.denoised_rgba.clear();
+            result.denoised.clear();
+            result.denoise_tile = 0;
+            result.denoise_error = error.what();
+        }
     }
-    result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start_time).count();
     return result;
 }
 }

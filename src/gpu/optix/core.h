@@ -74,5 +74,6 @@ public:
     std::map<const unsigned char*, OptixModule> test_modules;
     std::map<std::tuple<const unsigned char*, std::string, bool>, test_pipeline> tests;
     std::unique_ptr<denoiser_state, denoiser_deleter> denoiser;
+    unsigned int denoise_tile_limit = 0; // GpuTests: set_denoise_tile_limit's side (0: none)
 };
 }

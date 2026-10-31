@@ -105,6 +105,8 @@ G cornell --optix -w 16 -s 1 -o out\m5\runs\cli-case.png
 G --optix -p uniform -w 16 -s 1 -o out\m5\runs\cli-case.png
 G --optix -p lights -w 16 -s 1 -o out\m5\runs\cli-case.png
 G cornell --optix -p mixture -w 16 -s 1 -o out\m5\runs\cli-case.png
+G --denoise --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+G cornell -p mis --tonemap agx --denoise --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
 V -p mis --fp64 --headless -w 16 -s 1
 V final -p mis --headless -w 16 -s 1
 V cornell -p mis --fp64 --headless -w 16 -s 1
@@ -146,3 +148,4 @@ G still-life --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
 G still-life --quality-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
 G still-life --all-books-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
 G mesh-furnace -p mixture -w 16 -s 1 -o out\m5\runs\cli-case.png
+G still-life --denoise --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png

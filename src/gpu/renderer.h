@@ -312,10 +312,10 @@ struct denoise_report
 {
     float intensity = 0;                // hdrIntensity (optixDenoiserComputeIntensity)
     float average_color[3] = {0, 0, 0}; // hdrAverageColor, the AOV model's (optixDenoiserComputeAverageColor)
-    std::size_t state_bytes = 0;        // the denoiser's state, set up for the largest image or tile so far
+    std::size_t state_bytes = 0;        // the denoiser's state, set up for the last image (or for its tiles)
     std::size_t scratch_bytes = 0;      // its scratch, shared by the setup, the invoke and the two computations above
-    int tile = 0;                       // the side of the tiles the image was denoised in; 0: one invoke for all of it
-    bool valid = false;                 // false until a denoise has completed
+    int tile = 0;                       // the side of the tiles the last image was denoised in; 0: one invoke for all
+    bool valid = false;                 // false until a denoise has completed, and again after release_denoiser
 };
 
 // How a glTF texture repeats outside [0, 1]
@@ -448,7 +448,8 @@ struct render_options
     bool optix_tracer = false;            // trace with OptiX (needs `optix`): float, -p material, nee or mis
     std::shared_ptr<optix_runtime> optix; // started by the program (start_optix); every session keeps it alive
     // Also the image denoised by OptiX's AI denoiser, after the last pass, into render_result::denoised and
-    // denoised_rgba (needs `optix`; float only): biased, for the eye, while `pixels` stays the image as rendered
+    // denoised_rgba (needs `optix`; float only; what it refuses: see render()): biased, for the eye, while `pixels`
+    // stays the image as rendered
     bool denoise = false;
 };
 
@@ -475,7 +476,8 @@ struct render_result
 {
     std::vector<double> pixels; // width × height × 3 linear values (before gamma correction and clamping), row by row
                                 // from the top: the layout of the CPU's image
-    double seconds = 0;         // the whole render() call: the BVH, copying to the GPU, all passes, copying back
+    double seconds = 0;         // render() up to its last pass and the display's bytes: the BVH, copying to the GPU,
+                                // all passes, copying back; a denoise isn't counted
     double kernel_seconds = 0;  // the passes alone, timed on the GPU
     std::uint64_t rays = 0;     // rays traced: camera rays and all their bounces
     kernel_info kernel;
@@ -483,6 +485,10 @@ struct render_result
     std::vector<std::uint8_t> rgba; // the display's bytes after a tone map other than the books' (empty otherwise)
     std::vector<std::uint8_t> denoised_rgba; // with denoise: the display's bytes of the denoised image
     std::vector<float> denoised;             // with denoise: the denoised linear image, 3 floats per pixel
+    int denoise_tile = 0;                    // with denoise: the side of the tiles it was denoised in; 0: one invoke
+    // With denoise: why the denoised image is missing (denoised and denoised_rgba are then empty), when the denoise
+    // failed after the passes; empty when it ran, or wasn't asked for
+    std::string denoise_error;
 };
 
 struct device_info
@@ -512,8 +518,11 @@ device_info query_device(wait_mode wait = wait_mode::spin);
 // Renders the scene on the first CUDA device. Throws std::runtime_error with CUDA's message if something fails, or if
 // the scene is inconsistent (an index out of range, a checker before its textures...), and std::invalid_argument for
 // options out of range (launch_seconds, passes, a display session::display refuses), before rendering anything.
-// denoise is refused before anything is rendered too: std::logic_error without `optix`, std::invalid_argument in
-// float64.
+// What denoise can't do that is known before the passes is refused before anything is rendered too: std::logic_error
+// without `optix`, std::invalid_argument in float64, std::runtime_error for an image whose denoise images alone (88
+// bytes per pixel) would pass the denoiser's 1024 MiB. What fails in the denoise itself, after the passes (the
+// denoiser's memory plan, its creation), throws nothing: the result holds the rendered image as it would without
+// denoise, and denoise_error says why its denoised twin is missing.
 render_result render(const scene_desc& scene, const render_options& options);
 
 // --- A render that goes on: the window's -------------------------------------------------------------------------
@@ -627,10 +636,28 @@ public:
 
     // OptiX's AI denoiser on the image display() shows, the complete passes plus the rows of the pass in progress, each
     // band divided by its own number of samples; then the display transform: 4 bytes per pixel as display(options),
-    // valid until the next display or set_camera. Float sessions with a runtime (session_options::optix) only:
-    // std::invalid_argument in float64, std::logic_error without a runtime, and as display() does.
+    // valid until the next display or set_camera. Float sessions with a runtime (session_options::optix, or
+    // attach_optix) only: std::invalid_argument in float64, std::logic_error without a runtime, and as display() does.
+    // The view's guides are computed at its first denoise and kept until set_camera; the image the last call denoised
+    // (the same view, passes and rows) isn't denoised again. The images a denoise needs (88 bytes per pixel) are
+    // allocated only if the GPU has them free with 256 MiB besides, else std::runtime_error with the sizes; a denoise
+    // that throws keeps none of them.
     std::span<const std::uint8_t> display_denoised(const display_options& options); // float; needs optix
-    std::vector<float> denoised_pixels() const;   // the last display_denoised's linear floats, 3 per pixel
+    // The view's last denoised image (display_denoised's floats, kept) through other display options, whatever the
+    // image has rendered since, and with no denoise: the bytes display_denoised gave, or would give, for these options
+    // on that image, in the same memory. std::logic_error when the view has none (none yet, set_camera since,
+    // drop_denoised); std::invalid_argument as display_denoised.
+    std::span<const std::uint8_t> retone_denoised(const display_options& options);
+    std::vector<float> denoised_pixels() const;   // the view's last denoised floats, linear, 3 per pixel; throws as
+                                                  // retone_denoised
+    // The program's runtime for a float session made without one, for display_denoised only (the session keeps the
+    // tracer it was made with): the window's denoiser in a CUDA session, with no new session and the image kept.
+    // std::invalid_argument for none and in float64; a session that has a runtime keeps it: the same one again does
+    // nothing, another throws std::logic_error.
+    void attach_optix(std::shared_ptr<optix_runtime> runtime);
+    // Frees what a denoise keeps on the GPU but the denoiser itself: the session's images of it and, with a runtime,
+    // the denoiser's state and scratch (made again, with the guides, at the next display_denoised)
+    void drop_denoised();
     double pick_distance(const std::array<double, 3>& origin, const std::array<double, 3>& direction);
                                                   // an OptiX session of a scene with meshes: the nearest
                                                   // surface's distance along the unit direction, ∞ for none

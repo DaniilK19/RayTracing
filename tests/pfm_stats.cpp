@@ -22,6 +22,21 @@
 //       ulps in any channel.
 //   png-same a.png b.png
 //       the same decoded pixels: the window's frames are PNGs with an alpha channel, RayTracingGPU's without one.
+//   error TEST DENOISED REF1 REF2 [--min-gain G] [--max-drift F] [--tiles N] [--spp S]
+//       what a denoiser removed: TEST a noisy render, DENOISED the same render denoised, REF1 and REF2 references of
+//       many samples with independent seeds, clamped to [0, 10^4] as the denoiser's input is (denoise.cu). Against
+//       their average R, the error of each image corrected for R's own noise: MSE' = mean((x − R)²) − v, with
+//       v = mean((REF1 − REF2)²)/4, R's variance (each reference's is half the variance of their difference, and R's
+//       half of that again); relMSE' the same per value, divided by R² + 0.01. Passes when the denoiser removed at
+//       least G = 4 times the noisy image's relative error, relMSE'(DENOISED) ≤ relMSE'(TEST)/G, and kept the mean:
+//       in every channel |mean(DENOISED) − mean(R)| ≤ F·mean(R), F = 0.02. The gain is relative because an absolute
+//       one belongs to the brightest pixels: a lamp seen directly (around 15 beside a ceiling below 1) and a softbox's
+//       reflections hold almost all of a denoised image's MSE', where the denoiser softens an edge, while relMSE'
+//       measures each value's error relative to its own brightness (divided by R² + 0.01), as the eye sees an error.
+//       Also printed: the samples the gain is worth (S = 16, TEST's samples, times it), MSE'(TEST)/MSE'(DENOISED)
+//       without a verdict, and the largest drift of a tile of N×N pixels (N = 32), (mean(DENOISED) − mean(R))/(mean(R)
+//       + 0.01) of the channel average. A denoised error within R's own noise (relMSE'(DENOISED) ≤ 0) is an unbounded
+//       gain, which passes.
 //   self-test
 //       checks this program's own arithmetic on small images it writes (for ctest).
 // Exit code: 0 the check passes, 1 it fails, 2 an error (a file that can't be read, sizes that differ, a NaN or an
@@ -588,6 +603,242 @@ int run_png_same(arguments& args)
     return differ == 0 ? 0 : 1;
 }
 
+// --- error ----------------------------------------------------------------------------------------------------------
+
+// relMSE's ε: a dark value's error counts relative to 0.01 rather than to its own near-0 value (the denoising
+// literature's convention since Rousselle et al. 2011); the tiles' drift uses the same
+constexpr double relative_epsilon = 0.01;
+// The references are clamped as the denoiser's beauty is (beauty_ceiling in src/gpu/denoise.cu)
+constexpr double beauty_ceiling = 1e4;
+
+double clamp_as_beauty(double v) { return std::clamp(v, 0.0, beauty_ceiling); }
+
+// What error TEST DENOISED REF1 REF2 measures (see the comment at the top)
+struct error_figures
+{
+    double variance = 0; // v: R's own, mean((REF1 − REF2)²)/4
+    double mse_test = 0; // MSE'
+    double mse_denoised = 0;
+    double rel_test = 0; // relMSE'
+    double rel_denoised = 0;
+    std::array<double, 3> mean_reference{}; // of R, per channel
+    std::array<double, 3> mean_denoised{};
+    double tile_drift = 0; // the largest drift of a tile, by its size, with its sign
+    int tile_x = 0;        // that tile, counted in tiles from the top left
+    int tile_y = 0;
+    std::int64_t clamped = 0; // values of REF1 and REF2 that the clamp changed
+};
+
+error_figures error_of(const image& test, const image& denoised, const image& ref1, const image& ref2, int tile)
+{
+    error_figures f;
+    double sum_v = 0;
+    double sum_test = 0;
+    double sum_denoised = 0;
+    double sum_rel_test = 0;
+    double sum_rel_denoised = 0;
+    std::array<double, 3> sum_r{};
+    std::array<double, 3> sum_d{};
+    const int across = (test.width() + tile - 1) / tile;
+    const int down = (test.height() + tile - 1) / tile;
+    // Per tile: the sums of R's and DENOISED's channel averages, and its pixels
+    std::vector<double> tile_r(static_cast<std::size_t>(across) * static_cast<std::size_t>(down));
+    std::vector<double> tile_d(tile_r.size());
+    std::vector<std::int64_t> tile_n(tile_r.size());
+    for (int y = 0; y < test.height(); ++y)
+    {
+        for (int x = 0; x < test.width(); ++x)
+        {
+            double r_average = 0;
+            double d_average = 0;
+            for (std::size_t k = 0; k < 3; ++k)
+            {
+                const int c = static_cast<int>(k);
+                const double a = channel(ref1[x, y], c);
+                const double b = channel(ref2[x, y], c);
+                const double ca = clamp_as_beauty(a);
+                const double cb = clamp_as_beauty(b);
+                f.clamped += (ca != a ? 1 : 0) + (cb != b ? 1 : 0);
+                const double r = (ca + cb) / 2;
+                const double v = (ca - cb) * (ca - cb) / 4; // this value's share of R's variance
+                const double t = channel(test[x, y], c);
+                const double d = channel(denoised[x, y], c);
+                const double et = (t - r) * (t - r);
+                const double ed = (d - r) * (d - r);
+                const double scale = r * r + relative_epsilon;
+                sum_v += v;
+                sum_test += et;
+                sum_denoised += ed;
+                sum_rel_test += (et - v) / scale;
+                sum_rel_denoised += (ed - v) / scale;
+                sum_r[k] += r;
+                sum_d[k] += d;
+                r_average += r / 3;
+                d_average += d / 3;
+            }
+            const std::size_t in_tile = static_cast<std::size_t>(y / tile) * static_cast<std::size_t>(across) +
+                                        static_cast<std::size_t>(x / tile);
+            tile_r[in_tile] += r_average;
+            tile_d[in_tile] += d_average;
+            tile_n[in_tile] += 1;
+        }
+    }
+    const double pixels = static_cast<double>(test.width()) * test.height();
+    const double values = 3 * pixels;
+    f.variance = sum_v / values;
+    f.mse_test = sum_test / values - f.variance;
+    f.mse_denoised = sum_denoised / values - f.variance;
+    f.rel_test = sum_rel_test / values;
+    f.rel_denoised = sum_rel_denoised / values;
+    for (std::size_t k = 0; k < 3; ++k)
+    {
+        f.mean_reference[k] = sum_r[k] / pixels;
+        f.mean_denoised[k] = sum_d[k] / pixels;
+    }
+    for (std::size_t t = 0; t < tile_r.size(); ++t)
+    {
+        const double n = static_cast<double>(tile_n[t]);
+        const double drift = (tile_d[t] / n - tile_r[t] / n) / (tile_r[t] / n + relative_epsilon);
+        if (std::abs(drift) > std::abs(f.tile_drift))
+        {
+            f.tile_drift = drift;
+            f.tile_x = static_cast<int>(t % static_cast<std::size_t>(across));
+            f.tile_y = static_cast<int>(t / static_cast<std::size_t>(across));
+        }
+    }
+    return f;
+}
+
+// The verdict's gain and what it is worth: relMSE'(TEST)/relMSE'(DENOISED) and S times it in samples, unbounded when
+// the denoised error is within R's own noise (relMSE'(DENOISED) ≤ 0); and MSE'(TEST)/MSE'(DENOISED), printed without a
+// verdict, unbounded the same way
+struct error_gains
+{
+    bool passes = false;           // relMSE'(DENOISED) ≤ relMSE'(TEST)/G, multiplied out: an unbounded gain passes
+    bool bounded = false;          // relMSE'(DENOISED) > 0: gain and equivalent_samples hold numbers
+    double gain = 0;               // relMSE'(TEST)/relMSE'(DENOISED)
+    double equivalent_samples = 0; // S · gain: the samples of TEST's kind that would have DENOISED's error
+    bool mse_bounded = false;      // MSE'(DENOISED) > 0: mse_ratio holds a number
+    double mse_ratio = 0;          // MSE'(TEST)/MSE'(DENOISED)
+};
+
+error_gains gains_of(const error_figures& f, double min_gain, double spp)
+{
+    error_gains g;
+    g.passes = min_gain * f.rel_denoised <= f.rel_test;
+    g.bounded = f.rel_denoised > 0;
+    if (g.bounded)
+    {
+        g.gain = f.rel_test / f.rel_denoised;
+        g.equivalent_samples = spp * g.gain;
+    }
+    g.mse_bounded = f.mse_denoised > 0;
+    if (g.mse_bounded)
+    {
+        g.mse_ratio = f.mse_test / f.mse_denoised;
+    }
+    return g;
+}
+
+int run_error(arguments& args)
+{
+    const std::string test_path = args.take("TEST");
+    const std::string denoised_path = args.take("DENOISED");
+    const std::string ref1_path = args.take("REF1");
+    const std::string ref2_path = args.take("REF2");
+    double min_gain = 4;
+    double max_drift = 0.02;
+    int tile = 32;
+    double spp = 16;
+    while (!args.done())
+    {
+        const std::string option = args.take("an option");
+        if (option == "--min-gain")
+        {
+            min_gain = args.number("--min-gain");
+        }
+        else if (option == "--max-drift")
+        {
+            max_drift = args.number("--max-drift");
+        }
+        else if (option == "--tiles")
+        {
+            tile = args.integer("--tiles");
+        }
+        else if (option == "--spp")
+        {
+            spp = args.number("--spp");
+        }
+        else
+        {
+            throw usage_error{std::format("error: unknown option '{}'", option)};
+        }
+    }
+    if (!(min_gain > 0) || !(max_drift >= 0) || tile < 1 || !(spp > 0))
+    {
+        throw usage_error{"error: --min-gain and --spp are above 0, --max-drift at least 0, --tiles at least 1"};
+    }
+    const image test = load_pfm(test_path);
+    const image denoised = load_pfm(denoised_path);
+    const image ref1 = load_pfm(ref1_path);
+    const image ref2 = load_pfm(ref2_path);
+    check_same_size(test, denoised, "error");
+    check_same_size(test, ref1, "error");
+    check_same_size(test, ref2, "error");
+    const error_figures f = error_of(test, denoised, ref1, ref2, tile);
+
+    std::println("{} and {} against R = ({} + {})/2: {}×{}", test_path, denoised_path, ref1_path, ref2_path,
+                 test.width(), test.height());
+    std::println("  R's own variance v = mean((REF1 - REF2)²)/4 = {:.6e}; reference values clamped to [0, {}]: {}",
+                 f.variance, beauty_ceiling, f.clamped);
+    std::println("  noisy:    MSE' {:.6e}, relMSE' {:.6e}", f.mse_test, f.rel_test);
+    std::println("  denoised: MSE' {:.6e}, relMSE' {:.6e}", f.mse_denoised, f.rel_denoised);
+    const error_gains g = gains_of(f, min_gain, spp);
+    const bool gain_ok = g.passes;
+    if (g.bounded)
+    {
+        std::println("  gain relMSE'(noisy)/relMSE'(denoised): {:.4g}, at least {} needed: {}", g.gain, min_gain,
+                     gain_ok ? "PASS" : "FAIL");
+        std::println("  equivalent samples: {:.4g} ({} times the gain)", g.equivalent_samples, spp);
+    }
+    else
+    {
+        std::println("  gain relMSE'(noisy)/relMSE'(denoised): unbounded (the denoised error is within R's own "
+                     "noise), at least {} needed: {}",
+                     min_gain, gain_ok ? "PASS" : "FAIL");
+        std::println("  equivalent samples: beyond what R can tell");
+    }
+    if (g.mse_bounded)
+    {
+        std::println("  MSE'(noisy)/MSE'(denoised), no verdict: {:.4g}", g.mse_ratio);
+    }
+    else
+    {
+        std::println("  MSE'(noisy)/MSE'(denoised), no verdict: unbounded (within R's own noise)");
+    }
+    constexpr std::array names{"red", "green", "blue"};
+    bool drift_ok = true;
+    std::string drifts;
+    for (std::size_t k = 0; k < 3; ++k)
+    {
+        const double difference = f.mean_denoised[k] - f.mean_reference[k];
+        drift_ok = drift_ok && std::abs(difference) <= max_drift * f.mean_reference[k];
+        const std::string_view separator = k > 0 ? ", " : "";
+        drifts += f.mean_reference[k] > 0
+                      ? std::format("{}{} {:+.3f}%", separator, names[k], 100 * difference / f.mean_reference[k])
+                      : std::format("{}{} {:+.3e} (R's mean is 0)", separator, names[k], difference);
+    }
+    std::println("  drift of the mean, denoised against R: {}; at most {}% allowed: {}", drifts, 100 * max_drift,
+                 drift_ok ? "PASS" : "FAIL");
+    std::println("  largest drift in tiles of {}×{}: {:+.3f}% at tile ({}, {}): columns {} to {}, rows {} to {}", tile,
+                 tile, 100 * f.tile_drift, f.tile_x, f.tile_y, f.tile_x * tile,
+                 std::min(test.width(), (f.tile_x + 1) * tile) - 1, f.tile_y * tile,
+                 std::min(test.height(), (f.tile_y + 1) * tile) - 1);
+    const bool pass = gain_ok && drift_ok;
+    std::println("error: {}", pass ? "PASS" : "FAIL");
+    return pass ? 0 : 1;
+}
+
 // --- self-test ------------------------------------------------------------------------------------------------------
 
 // Small images with known numbers, written to a temporary folder and read back through the same code
@@ -664,6 +915,101 @@ int run_self_test()
         expect(run(run_same, {pa, pb, "--rect", "4", "0", "7", "3"}) == 0, "same --rect: the right halves are");
         expect(run(run_rule, {pa, pb, pa, pb, pa, pb, pa, pb}) == 0, "rule: tests as noisy as the controls pass");
         expect(run(run_rule, {pa, pb, pa, pb, pa, pa, pa, pa}) == 1, "rule: tests noisier than the controls fail");
+
+        // error, on 4×4 images of known values, every channel alike. REF1 is 1, REF2 1 but 1.5 at (0, 0): R is 1 but
+        // 1.25 there, and v = (3 values of 0.5²/4)/48 = 1/256. TEST is R but 2 at (1, 1) and 0 at (2, 2): mean (TEST -
+        // R)² = 6/48, MSE' = 31/256. DENOISED is R but 1.5 at (1, 1): MSE' = 0.75/48 - 1/256 = 3/256, an MSE' ratio of
+        // 31/3 (printed without a verdict).
+        // Its mean, 16.75/16 against R's 16.25/16, drifts by +3.08%; in tiles of 2×2 the top left one drifts by
+        // (1.1875 - 1.0625)/(1.0625 + 0.01), the others not at all.
+        const auto filled = [](double value) {
+            image img(4, 4);
+            for (int y = 0; y < 4; ++y)
+            {
+                for (int x = 0; x < 4; ++x)
+                {
+                    img[x, y] = color{value, value, value};
+                }
+            }
+            return img;
+        };
+        const auto gray = [](double value) { return color{value, value, value}; };
+        image r1 = filled(1);
+        image r2 = filled(1);
+        r2[0, 0] = gray(1.5);
+        image t = filled(1);
+        t[0, 0] = gray(1.25);
+        t[1, 1] = gray(2);
+        t[2, 2] = gray(0);
+        image d = filled(1);
+        d[0, 0] = gray(1.25);
+        d[1, 1] = gray(1.5);
+        const std::string pr1 = save(r1, "r1.pfm");
+        const std::string pr2 = save(r2, "r2.pfm");
+        const std::string pt = save(t, "t.pfm");
+        const std::string pd = save(d, "d.pfm");
+        const error_figures f = error_of(load_pfm(pt), load_pfm(pd), load_pfm(pr1), load_pfm(pr2), 2);
+        expect(f.variance == 1.0 / 256 && f.mse_test == 31.0 / 256 && f.mse_denoised == 3.0 / 256 && f.clamped == 0,
+               "error: R's variance and MSE' of both images");
+        const double at_0_0 = -0.0625 / (1.5625 + 0.01); // ((x - R)² - (REF1 - REF2)²/4)/(R² + 0.01) at (0, 0)
+        expect(std::abs(f.rel_test - 3 * (at_0_0 + 2 / 1.01) / 48) < 1e-12 &&
+                   std::abs(f.rel_denoised - 3 * (at_0_0 + 0.25 / 1.01) / 48) < 1e-12,
+               "error: relMSE' of both images");
+        // The gain and what it is worth, as run_error prints them (gains_of): the relMSE' gain
+        // (2/1.01 + at_0_0)/(0.25/1.01 + at_0_0), 16 times it in samples, and the MSE' ratio 31/3
+        const double relative_gain = (2 / 1.01 + at_0_0) / (0.25 / 1.01 + at_0_0);
+        const error_gains g = gains_of(f, 4, 16);
+        expect(g.bounded && g.passes && std::abs(g.gain / relative_gain - 1) < 1e-12 &&
+                   std::abs(g.equivalent_samples / (16 * relative_gain) - 1) < 1e-12,
+               "error: the relMSE' gain and the equivalent samples, 16 times it");
+        expect(g.mse_bounded && g.mse_ratio == 31.0 / 3, "error: the MSE' ratio 31/3");
+        expect(f.mean_reference == std::array{16.25 / 16, 16.25 / 16, 16.25 / 16} &&
+                   f.mean_denoised == std::array{16.75 / 16, 16.75 / 16, 16.75 / 16},
+               "error: the means per channel");
+        expect(std::abs(f.tile_drift - 0.125 / 1.0725) < 1e-12 && f.tile_x == 0 && f.tile_y == 0,
+               "error: the largest drift in tiles of 2×2");
+        // The references clamped as the denoiser's input: 2·10^4 in both counts as 10^4 (3 values each)
+        image high = filled(1);
+        high[3, 3] = gray(2e4);
+        image top = filled(1);
+        top[3, 3] = gray(1e4);
+        const error_figures clamped = error_of(top, top, high, high, 32);
+        expect(clamped.clamped == 6 && clamped.variance == 0 && clamped.mse_test == 0,
+               "error: the references clamped to [0, 10^4]");
+        // The verdicts: the relMSE' gain (2/1.01 + at_0_0)/(0.25/1.01 + at_0_0) = 9.34 passes 4 and 9 and fails 10,
+        // which the MSE' gain 31/3 would pass; the drift of 3.08% fails 2% and passes 4%
+        expect(run(run_error, {pt, pd, pr1, pr2}) == 1, "error: a mean that drifts by 3.08% fails 2%");
+        expect(run(run_error, {pt, pd, pr1, pr2, "--max-drift", "0.04"}) == 0, "error: and passes 4%");
+        expect(run(run_error, {pt, pd, pr1, pr2, "--max-drift", "0.04", "--min-gain", "9"}) == 0,
+               "error: a relMSE' gain of 9.34 passes 9");
+        expect(run(run_error, {pt, pd, pr1, pr2, "--max-drift", "0.04", "--min-gain", "10"}) == 1,
+               "error: and fails 10, the gain measured in relMSE', not in MSE' (31/3)");
+        // DENOISED equal to R exactly (1 but 1.25 at (0, 0)): its error lies below R's own noise, relMSE' < 0 and
+        // MSE' < 0, an unbounded gain, which passes; its mean doesn't drift
+        image same_as_r = filled(1);
+        same_as_r[0, 0] = gray(1.25);
+        const std::string pe = save(same_as_r, "r.pfm");
+        const error_figures fe = error_of(load_pfm(pt), load_pfm(pe), load_pfm(pr1), load_pfm(pr2), 2);
+        const error_gains ge = gains_of(fe, 4, 16);
+        expect(fe.rel_denoised < 0 && !ge.bounded && ge.passes && !ge.mse_bounded,
+               "error: DENOISED equal to R, relMSE' below 0: an unbounded gain that passes");
+        expect(run(run_error, {pt, pe, pr1, pr2}) == 0, "error: and the command passes it");
+        // Errors (exit code 2): sizes that differ, a NaN in an input
+        const auto refused = [&run](std::vector<std::string> list) {
+            try
+            {
+                run(run_error, std::move(list));
+            }
+            catch (const usage_error&)
+            {
+                return true;
+            }
+            return false;
+        };
+        image broken = filled(1);
+        broken[3, 3] = gray(std::numeric_limits<double>::quiet_NaN());
+        const std::string pn = save(broken, "nan.pfm");
+        expect(refused({pt, pd, pr1, pa}) && refused({pn, pd, pr1, pr2}), "error: sizes that differ, a NaN");
     }
     catch (const usage_error& error)
     {
@@ -680,13 +1026,14 @@ int run_self_test()
 
 void print_usage()
 {
-    std::println("Usage: PfmStats stats|noise|rule|same|png-same|self-test ... (see the comment at the top of "
+    std::println("Usage: PfmStats stats|noise|rule|same|png-same|error|self-test ... (see the comment at the top of "
                  "tests/pfm_stats.cpp)\n"
                  "  stats A.pfm [--rect X0 Y0 X1 Y1 [--expect V T]]... [--equal V [--share F]] [--max V]\n"
                  "  noise A1.pfm A2.pfm [--trim F] [--tiles N]\n"
                  "  rule T1a T1b T2a T2b A1 A2 B1 B2 [--margin M] [--trim F]\n"
                  "  same A.pfm B.pfm [--rect X0 Y0 X1 Y1]... [--ulps N --max-share F]\n"
                  "  png-same a.png b.png\n"
+                 "  error TEST DENOISED REF1 REF2 [--min-gain 4] [--max-drift 0.02] [--tiles 32] [--spp 16]\n"
                  "  self-test\n"
                  "Exit code: 0 pass, 1 fail, 2 error.");
 }
@@ -717,6 +1064,10 @@ int main(int argc, char* argv[])
         if (command == "png-same")
         {
             return run_png_same(args);
+        }
+        if (command == "error")
+        {
+            return run_error(args);
         }
         if (command == "self-test")
         {

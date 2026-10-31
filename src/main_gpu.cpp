@@ -27,8 +27,8 @@ constexpr std::string_view default_gpu_scene = "weekend";
 constexpr int max_launch_ms = static_cast<int>(gpu::max_launch_seconds * 1000);
 
 // The options are RayTracing's, plus the GPU programs' own: --fp64, --all-books-kernel, --quality-kernel, --optix,
-// --launch-ms, --strata, the view options (view_options.ixx) and the display's (tone_options.ixx). std::optional tells
-// "not given: take it from the scene" apart from any given value.
+// --launch-ms, --strata, --denoise, the view options (view_options.ixx) and the display's (tone_options.ixx).
+// std::optional tells "not given: take it from the scene" apart from any given value.
 struct options
 {
     std::string_view scene = default_gpu_scene; // a scene's name, or a glTF model's file (is_model_path)
@@ -43,8 +43,9 @@ struct options
     bool fp64 = false;
     bool all_books_kernel = false;
     bool quality_kernel = false;
-    bool optix = false; // OptiX traces the quality kernel's integrator (render_options::optix_tracer)
-    int launch_ms = 50; // how long one kernel launch should take (see render_options::launch_seconds)
+    bool optix = false;   // OptiX traces the quality kernel's integrator (render_options::optix_tracer)
+    bool denoise = false; // also each image denoised by OptiX's AI denoiser, beside it
+    int launch_ms = 50;   // how long one kernel launch should take (see render_options::launch_seconds)
     bool help = false;
 };
 
@@ -89,6 +90,9 @@ Options:
   -o, --output FILE    where to save the image (default <scene>-gpu.png): a .png, or a .pfm that
                        keeps the linear values as floats, before gamma correction and clamping;
                        give it several times to save several files: -o out.png -o out.pfm
+      --denoise        also write each image denoised by OptiX's AI denoiser, as
+                       NAME-denoised.png/.pfm (for the eye: it is biased; the plain images stay
+                       as rendered)
 {}
   -h, --help           show this help
 
@@ -126,6 +130,11 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
         if (arg == "--optix")
         {
             opts.optix = true;
+            continue;
+        }
+        if (arg == "--denoise")
+        {
+            opts.denoise = true;
             continue;
         }
 
@@ -292,6 +301,64 @@ std::string cuda_version(int version)
     return std::format("{}.{}", version / 1000, version % 1000 / 10);
 }
 
+// --denoise's file for an output: <stem>-denoised.png or .pfm beside it
+std::filesystem::path denoised_name(const std::filesystem::path& output)
+{
+    std::filesystem::path name = output.stem();
+    name += "-denoised";
+    name += output.extension();
+    return output.parent_path() / name;
+}
+
+// --denoise: each output's denoised twin, after the plain files, which stay as they would be without it. A PNG holds
+// the display's bytes of the denoised image (render_result::denoised_rgba, through the plain PNG's display: books, or
+// the tone map and exposure), written by the books' writer through bytes_to_image as a tone map's PNG is; a PFM holds
+// the denoised linear floats (render_result::denoised), before any exposure. One line names the files, and the tiles
+// when the denoiser took the image in tiles (its bytes then differ slightly from one invoke's). False if one couldn't
+// be saved; the others are saved all the same.
+bool save_denoised(const gpu::render_result& result, const std::vector<std::filesystem::path>& outputs, int width,
+                   int height)
+{
+    std::optional<image> png;
+    try
+    {
+        png = bytes_to_image(result.denoised_rgba, width, height);
+    }
+    catch (const std::invalid_argument& error)
+    {
+        std::println("Error: {}", error.what());
+        return false;
+    }
+    const std::vector<double> linear(result.denoised.begin(), result.denoised.end());
+    const auto pfm = to_image(linear, width, height);
+    if (!pfm)
+    {
+        std::println("Error: {}", pfm.error());
+        return false;
+    }
+    std::vector<std::string> saved_files;
+    bool all_saved = true;
+    for (const std::filesystem::path& output : outputs)
+    {
+        const std::filesystem::path file = denoised_name(output);
+        const image& source = is_png(file) ? *png : *pfm;
+        if (const auto saved = source.save(file); !saved)
+        {
+            std::println("Error: {} ({})", saved.error(), to_utf8(file));
+            all_saved = false;
+            continue;
+        }
+        saved_files.push_back(to_utf8(std::filesystem::absolute(file)));
+    }
+    if (!saved_files.empty())
+    {
+        std::println("Denoised: {}{}",
+                     saved_files | std::views::join_with(std::string(", ")) | std::ranges::to<std::string>(),
+                     result.denoise_tile > 0 ? std::format(" (in tiles of {})", result.denoise_tile) : std::string());
+    }
+    return all_saved;
+}
+
 int main(int argc, char* argv[])
 {
     const auto opts = parse_options(std::span(argv, static_cast<std::size_t>(argc)));
@@ -305,6 +372,12 @@ int main(int argc, char* argv[])
     {
         print_usage();
         return 0;
+    }
+    // The denoiser is OptiX's, and works in float: refused before anything starts
+    if (opts->denoise && opts->fp64)
+    {
+        std::println("Error: --denoise works in float only: drop --fp64");
+        return 1;
     }
 
     // The scene with the options' settings, translated for the GPU (gpu_scene.ixx)
@@ -362,14 +435,16 @@ int main(int argc, char* argv[])
         std::println("Error: {}", checked.error());
         return 1;
     }
-    // OptiX, only for --optix and for a scene with triangle meshes: nothing of it starts otherwise, so every other run
-    // is as before. It runs on the CUDA device query_device() starts, so it starts after that, below; a build without
-    // OptiX's headers refuses both here instead, before CUDA starts (start_optix() then says why, and starts nothing).
-    // The runtime lives until main returns, after every session that used it (never a static: CUDA's own exit comes
-    // first).
-    const bool use_optix = opts->optix || meshes;
+    // OptiX, only for what needs it: --optix and a scene with triangle meshes, which it traces, and --denoise, whose
+    // denoiser is OptiX's; one runtime for all three. Nothing of it starts otherwise, so every other run is as before.
+    // It runs on the CUDA device query_device() starts, so it starts after that, below; a build without OptiX's
+    // headers refuses them here instead, before CUDA starts (start_optix() then says why, and starts nothing). The
+    // runtime lives until main returns, after every session that used it (never a static: CUDA's own exit comes
+    // first). An error names what asked for it: --optix if given, else the scene's meshes, else --denoise.
+    const bool use_optix = opts->optix || meshes; // the tracer (render_options::optix_tracer)
+    const bool wants_optix = use_optix || opts->denoise;
     std::shared_ptr<gpu::optix_runtime> optix;
-    const auto open_optix = [&optix, &opts] {
+    const auto open_optix = [&optix, &opts, meshes] {
         try
         {
             optix = gpu::start_optix();
@@ -382,15 +457,19 @@ int main(int argc, char* argv[])
             {
                 std::println("Error: --optix: {}", error.what());
             }
-            else
+            else if (meshes)
             {
                 std::println("Error: '{}' has triangle meshes, which only OptiX renders: {}", opts->scene,
                              error.what());
             }
+            else
+            {
+                std::println("Error: --denoise: {}", error.what());
+            }
             return false;
         }
     };
-    if (use_optix && !gpu::optix_built() && !open_optix())
+    if (wants_optix && !gpu::optix_built() && !open_optix())
     {
         return 1;
     }
@@ -428,7 +507,7 @@ int main(int argc, char* argv[])
                      device.name, device.multiprocessors, device.compute_capability_major,
                      device.compute_capability_minor, device.memory_gib, cuda_version(device.runtime_version),
                      cuda_version(device.driver_version), opts->fp64 ? "float64" : "float32");
-        if (use_optix && !open_optix())
+        if (wants_optix && !open_optix())
         {
             return 1;
         }
@@ -458,7 +537,8 @@ int main(int argc, char* argv[])
             .passes = rays_per_pixel,
             .display = display,
             .optix_tracer = use_optix,
-            .optix = optix};
+            .optix = optix,
+            .denoise = opts->denoise};
         result = gpu::render(built->desc, gpu_options);
     }
     catch (const std::exception& error)
@@ -469,8 +549,8 @@ int main(int argc, char* argv[])
     }
     std::print("\r{:30}\r", ""); // erase the progress line
 
-    // Both times come from the renderer: the whole render() call (the BVH, copying the scene to the GPU and the image
-    // back, all the passes), and the passes alone, timed on the GPU
+    // Both times come from the renderer: the render() call (the BVH, copying the scene to the GPU and the image back,
+    // all the passes; --denoise's work after them left out), and the passes alone, timed on the GPU
     std::println("Render time: {:.2f} s (GPU passes: {:.2f} s)", result.seconds, result.kernel_seconds);
     // Which kernel rendered (see the kernels in renderer.cu), and what decides how many of its threads the GPU keeps in
     // flight: the registers a thread takes (see blocks_per_multiprocessor)
@@ -544,6 +624,17 @@ int main(int argc, char* argv[])
             continue;
         }
         std::println("Image saved: {}", to_utf8(std::filesystem::absolute(output)));
+    }
+    // A denoise that failed after the passes (the denoiser's memory plan, its creation) leaves the plain files saved
+    // above, as without --denoise, and no -denoised file: the error is said last, and the exit code is 1
+    if (opts->denoise && !result.denoise_error.empty())
+    {
+        std::println("Error: --denoise: {}", result.denoise_error);
+        return 1;
+    }
+    if (opts->denoise && !save_denoised(result, opts->outputs, width, height))
+    {
+        all_saved = false;
     }
     return all_saved ? 0 : 1;
 }

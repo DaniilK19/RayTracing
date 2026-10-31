@@ -28,6 +28,7 @@
 #
 # The window's tone maps (from Step 75): the books' bytes, agx, neutral and none, a pass in progress, a scene change
 regress-tone|V|tests/regress-tone.txt|no|reference
-# OptiX's renders (from Step 89): six tiny RayTracingGPU renders under --optix, stamped with the driver and the
-# programs, since the graphics driver compiles OptiX's programs
+# OptiX's renders (from Step 89): six tiny RayTracingGPU renders under --optix, and (from Step 94) one denoised by
+# OptiX's denoiser, stamped with the driver and the programs, since the graphics driver compiles OptiX's programs and
+# brings its denoiser
 regress-optix|G|scripts/verify/regress-optix.txt|yes|none

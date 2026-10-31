@@ -74,12 +74,21 @@ public:
     virtual kernel_info kernel() const = 0;
     virtual int resident_blocks() const = 0; // the planner's one-wave floor: detail::quality_resident_blocks()
     // The AI denoiser: beauty, albedo, normal (world, unit or 0) → out, float4 per pixel, rows from the top, on stream
-    // 0. Made on the first call; images above 2048 a side in tiles; std::runtime_error with the sizes past 1024 MiB.
+    // 0. Made on the first call, set up again for each new image size: one invoke for an image of at most 2048 a side,
+    // else (or when that doesn't fit) tiles of 2048, 1024 or 512, the first that fits in 1024 MiB with the caller's
+    // images; std::runtime_error with the sizes of the smallest when none does (denoiser.cpp).
     virtual void denoise(const float4* beauty, const float4* albedo, const float4* normal, float4* out, int width,
                          int height) = 0;
-    // Not pure, these two: a test's own optix_runtime needs neither.
+    // Not pure, these four: a test's own optix_runtime needs none of them.
     // What the last denoise computed and holds (renderer.h's denoise_report): valid false before the first
     virtual denoise_report last_denoise() const { return {}; }
+    // Frees the denoiser's state and scratch, and forgets their setup (session::drop_denoised: the window's denoiser
+    // turned off). The denoiser itself stays made, since making it takes a while; the next denoise sets it up again.
+    virtual void release_denoiser() {}
+    // GpuTests only, so that the tiled path is checked on a small image: an image wider or taller than `side` is
+    // denoised in tiles of `side`, one no larger in one invoke (the memory plan still applies); 0, the default: the
+    // layouts above
+    virtual void set_denoise_tile_limit(int /*side*/) {}
     // Whether OptiX keeps the programs it compiled in its disk cache (start_optix.h's optix_cache_enabled asks this)
     virtual bool cache_enabled() const { return true; }
 
