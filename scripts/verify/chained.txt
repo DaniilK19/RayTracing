@@ -32,3 +32,6 @@ regress-tone|V|tests/regress-tone.txt|no|reference
 # OptiX's denoiser, stamped with the driver and the programs, since the graphics driver compiles OptiX's programs and
 # brings its denoiser
 regress-optix|G|scripts/verify/regress-optix.txt|yes|none
+# OptiX in the window (from Step 95): O on and off, Tab's scenes of glTF models, a model's file and a focus on it
+# through OptiX's pick, rendered headless and stamped like regress-optix
+regress-optix-viewer|V|tests/regress-optix-viewer.txt|yes|none

@@ -81,6 +81,11 @@
 //   second-model    still-life's material offset: every triangle of the bust and of the vase (told apart by where
 //                   they stand) wears one of its own model's materials as load_gltf reads them from the file, the
 //                   factors and the textures' texels, base color sRGB and metallic-roughness linear.
+// Suite optix-sessions (Step 95):
+//   in-turn         the window's sessions, one after another as Tab, M, F2 and O make them: five of sunlit in the
+//                   quality kernel, then five of still-life on the process's OptiX runtime, each rendering a pass at
+//                   32 × 18 and destroyed before the next is made; the device's free memory (cudaMemGetInfo) after
+//                   the fifth within 2 MiB of what it was after the first, the memory each held INFO.
 // The OptiX checks reach the GPU through the fixture's runtime (optix_fixture.h): an upload of a scene_desc the test
 // makes (a gpu::mesh_set of meshes from module meshes, through tests/mesh_services.h), and launch_test of the check
 // module's __raygen__probe_mesh. Its creation and first compiles are left out of the 10 s budget. closed-block and
@@ -196,7 +201,10 @@
 //
 // Step criteria: $GT optix-triangles --require-optix and $GT optix-pbr --require-optix exit 0 (≈ 3 s and ≈ 1 s, the
 // check module's cold compile apart); $GT mesh-cache exits 0 (a fraction of a second of CPU: at most six reads of a
-// model, the first build's two, the touched vase's two and second-model's two, and six builds' studio map).
+// model, the first build's two, the touched vase's two and second-model's two, and six builds' studio map). From Step
+// 95 the suite optix-sessions (the window's sessions in turn, below) builds sunlit and still-life (whose models the
+// cache holds when mesh-cache ran first) and renders ten small sessions, a fraction of a second; it sorts after
+// optix-runtime, which starts OptiX and compiles its programs in a run of every suite.
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -222,6 +230,7 @@
 #include "camera.cuh"
 #include "gpu_test.cuh"
 #include "gpu_test.h"
+#include "host_services.h"
 #include "material.cuh"
 #include "mesh_services.h"
 #include "optix/embedded.h"
@@ -3696,7 +3705,8 @@ GPU_TEST(optix_pbr, refusals)
 }
 
 // =====================================================================================================================
-// Suite mesh-cache (Step 93): gpu_scene's model cache, on the host alone
+// Suite mesh-cache (Step 93): gpu_scene's model cache, on the host alone; then suite optix-sessions (Step 95): the
+// window's sessions in turn
 // =====================================================================================================================
 
 // Two builds of still-life share their meshes and textures (the same shared_ptrs: each model converted once per
@@ -3770,5 +3780,95 @@ GPU_TEST(mesh_cache, second_model)
                                          "{} mesh(es) of {} triangles",
                                          c.materials, c.textures, c.bust_meshes, c.bust_triangles, c.vase_meshes,
                                          c.vase_triangles));
+}
+
+// The device's free memory now, in bytes (cudaMemGetInfo: the whole device's, so another program's allocations move it
+// too)
+std::int64_t free_device_bytes()
+{
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    gpu_test::cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes), "reading the GPU's free memory");
+    return static_cast<std::int64_t>(free_bytes);
+}
+
+constexpr double mebibyte = 1024.0 * 1024.0;
+
+// What sessions of one scene leave on the GPU when they come one after another, as the window makes them (the old one
+// destroyed before the next is made), each rendering a pass: the device's free memory read before each, while it holds
+// its pass, and once it is gone
+struct sessions_memory
+{
+    double first_held = 0; // MiB the first session held, with what CUDA and OptiX make at a first session and keep
+    double held = 0;       // MiB the largest of the others held
+    double lost = 0;       // MiB less free after the last session than after the first (negative: more)
+};
+
+sessions_memory sessions_in_turn(const gpu::scene_desc& scene, const gpu::session_options& options, int count)
+{
+    sessions_memory m;
+    std::int64_t after_first = 0;
+    for (int k = 0; k < count; ++k)
+    {
+        const std::int64_t before = free_device_bytes();
+        {
+            gpu::session session(scene, options);
+            session.render_to({.passes = 1});
+            const double held = static_cast<double>(before - free_device_bytes()) / mebibyte;
+            if (k == 0)
+            {
+                m.first_held = held;
+            }
+            else
+            {
+                m.held = std::max(m.held, held);
+            }
+        }
+        const std::int64_t after = free_device_bytes();
+        if (k == 0)
+        {
+            after_first = after;
+        }
+        m.lost = static_cast<double>(after_first - after) / mebibyte;
+    }
+    return m;
+}
+
+// Suite optix-sessions: the window's sessions in turn. Every Tab, M, F2 and O makes a new session at once (the old one
+// destroyed first), and those that trace with OptiX each hold a copy of the program's one runtime, for as long as the
+// window runs. Five sessions of sunlit in the quality kernel (CUDA's alone, so this half runs in a build without OptiX
+// too: its spheres, its ground and the sky's HDR map with its sampling tables), then five of still-life on the
+// process's runtime (two glTF models: their triangles' acceleration structures under an instance root, their textures,
+// the studio's map), each rendering a pass at 32 × 18 and destroyed: the
+// device's free memory once the fifth is gone must be within 2 MiB of what it was once the first was. A session that
+// left its acceleration structures, its textures or its images behind would lose what it held (INFO) every time, four
+// times over. The base is the memory after the first session, not before it: what a first session makes once and
+// keeps (the modules CUDA loads at a kernel's first launch, OptiX's pipeline) is no leak. The free memory is the whole
+// device's: another program allocating meanwhile shows here too.
+GPU_TEST(optix_sessions, in_turn)
+{
+    constexpr int sessions = 5;
+    constexpr double allowed = 2; // MiB
+    const auto check = [&](std::string_view name, const sessions_memory& m) {
+        ctx.exact(name, std::max(0.0, m.lost), 0, allowed);
+        ctx.info(name, std::format("{:.3f} MiB less free after the {}th session than after the first; each held "
+                                   "{:.1f} MiB while it rendered, the first {:.1f} MiB",
+                                   m.lost, sessions, m.held, m.first_held));
+    };
+    guarded(ctx, "sunlit-sessions", [&] {
+        const gpu::scene_desc sunlit = gpu_test::host::built_scene("sunlit", {.width = 32, .height = 18, .samples = 1});
+        check("sunlit-sessions", sessions_in_turn(sunlit, {.quality_kernel = true}, sessions));
+    });
+    const std::shared_ptr<gpu::optix_runtime> runtime = optix_for(ctx, "still-life-sessions");
+    if (!runtime)
+    {
+        return;
+    }
+    guarded(ctx, "still-life-sessions", [&] {
+        const gpu::scene_desc still_life =
+            gpu_test::host::built_scene("still-life", {.width = 32, .height = 18, .samples = 1});
+        check("still-life-sessions",
+              sessions_in_turn(still_life, {.optix_tracer = true, .optix = runtime}, sessions));
+    });
 }
 }

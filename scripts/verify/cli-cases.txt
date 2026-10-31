@@ -133,6 +133,7 @@ V --headless --script scripts\verify\cli-scripts\quality-mixture.txt
 V --headless --script scripts\verify\cli-scripts\unknown-tonemap.txt
 V --headless --script scripts\verify\cli-scripts\bad-exposure.txt
 V --headless --script scripts\verify\cli-scripts\fp64-tonemap.txt
+V --headless --script scripts\verify\cli-scripts\model-missing.txt
 
 # glTF models and the scenes with triangle meshes, which OptiX alone renders (Step 93): refused before CUDA starts.
 # tests\data\cut-short.glb is committed: the 12-byte header of a .glb whose length says 256 bytes (67 6C 54 46 02 00 00
@@ -149,3 +150,22 @@ G still-life --quality-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
 G still-life --all-books-kernel -w 16 -s 1 -o out\m5\runs\cli-case.png
 G mesh-furnace -p mixture -w 16 -s 1 -o out\m5\runs\cli-case.png
 G still-life --denoise --fp64 -w 16 -s 1 -o out\m5\runs\cli-case.png
+
+# OptiX and glTF models in the window (Step 95): RayTracingGPU's refusals, in its words, before the window and CUDA
+# (each a tiny headless render, should one not be refused). The two model files that can't be read are the committed
+# ones of the G cases above.
+V nosuch.glb
+V x.obj
+V tests\data\cut-short.glb --headless -w 16 -s 1
+V tests\data\lines-only.gltf --headless -w 16 -s 1
+V --optix --fp64 --headless -w 16 -s 1
+V --optix --all-books-kernel --headless -w 16 -s 1
+V --optix --quality-kernel --headless -w 16 -s 1
+V cornell --optix --headless -w 16 -s 1
+V --optix -p uniform --headless -w 16 -s 1
+V cornell --optix -p mixture --headless -w 16 -s 1
+V assets\models\brass_vase_01\brass_vase_01_1k.gltf --fp64 --headless -w 16 -s 1
+V still-life --fp64 --headless -w 16 -s 1
+V still-life --quality-kernel --headless -w 16 -s 1
+V still-life --all-books-kernel --headless -w 16 -s 1
+V mesh-furnace -p mixture --headless -w 16 -s 1

@@ -15,9 +15,13 @@ import viewer_camera;
 
 // --- Scripts -------------------------------------------------------------------------------------------------------
 //
-// One command per line; # starts a comment. Settings stay until changed:
-//   scene NAME | size W H | seed S | strata K | precision float|double | kernel auto|all-books|quality |
-//   sampling NAME|scene
+// One command per line; # starts a comment (outside a quoted word). Settings stay until changed:
+//   scene NAME | scene "FILE.glb" | size W H | seed S | strata K | precision float|double |
+//   kernel auto|all-books|quality|optix | sampling NAME|scene
+//                a scene of the list, or a glTF 2.0 model's file (FILE.glb or FILE.gltf, quoted: a path may hold
+//                spaces) in the photo studio, as on the command line. kernel optix traces with OptiX (the window's O,
+//                --optix); a scene with triangle meshes renders with OptiX under kernel auto too, since only OptiX
+//                traces triangles.
 //   tonemap books|none|agx|neutral | exposure EV   the display the frames are shown with (EV from -24 to 24; the
 //                books' bytes take none): it doesn't change the image, so a frame after it may show the samples of
 //                the frame before through it. Without them each scene shows its own display, until one of them is
@@ -117,27 +121,31 @@ export bool changes_view(const script_command& c)
 
 namespace
 {
-// The words of a line, without its comment; a quoted word ("1,2,3", as format_view writes points) loses its quotes
+// The words of a line, without its comment; a quoted word ("1,2,3", as format_view writes points, or a model's file,
+// "C:\My models\bust.glb") loses its quotes, and holds the spaces and the # between them. A quote that isn't closed
+// starts a word as any other character does, so every line of the scripts before quoted files reads as it did.
 std::vector<std::string_view> words(std::string_view line)
 {
-    if (const std::size_t hash = line.find('#'); hash != std::string_view::npos)
-    {
-        line = line.substr(0, hash);
-    }
+    const auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
     std::vector<std::string_view> result;
     std::size_t i = 0;
-    while (i < line.size())
+    while (true)
     {
-        while (i < line.size() && (line[i] == ' ' || line[i] == '\t' || line[i] == '\r'))
+        while (i < line.size() && blank(line[i]))
         {
             ++i;
         }
-        if (i == line.size())
+        if (i == line.size() || line[i] == '#')
         {
             break;
         }
         std::size_t end = i;
-        while (end < line.size() && line[end] != ' ' && line[end] != '\t' && line[end] != '\r')
+        if (const std::size_t close = line[i] == '"' ? line.find('"', i + 1) : std::string_view::npos;
+            close != std::string_view::npos)
+        {
+            end = close + 1;
+        }
+        while (end < line.size() && !blank(line[end]) && line[end] != '#')
         {
             ++end;
         }
@@ -286,14 +294,15 @@ std::expected<script_command, std::string> command(std::span<const std::string_v
     }
     if (verb == "kernel")
     {
-        for (const kernel_choice k : {kernel_choice::automatic, kernel_choice::all_books, kernel_choice::quality})
+        for (const kernel_choice k :
+             {kernel_choice::automatic, kernel_choice::all_books, kernel_choice::quality, kernel_choice::optix})
         {
             if (w.size() == 2 && w[1] == kernel_choice_name(k))
             {
                 return set_kernel{k};
             }
         }
-        return std::unexpected("kernel is auto, all-books or quality");
+        return std::unexpected("kernel is auto, all-books, quality or optix");
     }
     if (verb == "sampling")
     {
@@ -505,6 +514,16 @@ std::string quoted(const point3& p)
 {
     return std::format("\"{},{},{}\"", p.x, p.y, p.z);
 }
+
+// A scene as a script names it: a name of the list as it is (each is lowercase letters, digits and dashes), a model's
+// file quoted, as it may hold spaces (a Windows path never holds a quote)
+std::string scene_word(std::string_view scene)
+{
+    const bool name = !scene.empty() && std::ranges::all_of(scene, [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+    });
+    return name ? std::string(scene) : std::format("\"{}\"", scene);
+}
 }
 
 // The display a recording's frames are shown with: a tone map and its exposure in EV
@@ -523,13 +542,14 @@ export std::string format_display(const display_setting& display)
 
 // The settings lines that start a recording, and that follow a change of settings; the display's lines after them,
 // when it is given (the window gives it unless both the display and the scene's own are the books' bytes, so the
-// books' scenes' recordings stay as they were)
+// books' scenes' recordings stay as they were). A model's file is written quoted, and kernel optix only in a session
+// that traces with OptiX, so the recordings of the window without OptiX stay as they were too.
 export std::string format_settings(std::string_view scene, bool fp64, kernel_choice kernel,
                                    std::optional<strategy> s, std::uint32_t seed, int strata,
                                    const std::optional<display_setting>& display = std::nullopt)
 {
     const std::string name = s ? std::string(strategy_name(*s)) : std::string("scene");
-    return std::format("scene {}\nprecision {}\nkernel {}\nsampling {}\nseed {}\nstrata {}\n{}", scene,
+    return std::format("scene {}\nprecision {}\nkernel {}\nsampling {}\nseed {}\nstrata {}\n{}", scene_word(scene),
                        fp64 ? "double" : "float", kernel_choice_name(kernel), name, seed, strata,
                        display ? format_display(*display) : std::string());
 }

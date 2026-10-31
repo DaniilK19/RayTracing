@@ -1,0 +1,5 @@
+# A script naming a glTF model's file that isn't there, quoted (Step 95: a model's file as a scene): the quotes keep
+# the spaces and the # inside them, and the window refuses the file by its whole name before it renders
+size 16 9
+scene "no such # file.glb"
+hold 1 +1

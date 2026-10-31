@@ -1,0 +1,53 @@
+# OptiX in the window, driven by scripted input (see docs/viewer.md, "Scripted input"), recorded and replayed. It quits
+# by itself, at frame 72, so it runs without --exit-when-done:
+#   RayTracingViewer sunlit -w 320 --height 180 --strata 4 -s 16 --input tests\window-optix.input --record r.txt
+#                    --frames A --stats s.csv
+#   RayTracingViewer --headless --script r.txt --record r2.txt --frames B
+# Every frame in A equals the one in B of the same number (decoded), and r2.txt equals r.txt but for each frame line's
+# gen: where a new session starts, a replay counts two generations (use_settings makes the session, and the frame
+# line's new gen starts its image again) and the window one, as replays have always recorded. P's printed command, run,
+# renders P's PNG and PFM, and s.csv has one "# model read" line per glTF file over all the Tabs (gpu_scene keeps the
+# last two models: the bust and the vase are read once, by still-life). The keys come every few frames: the image
+# needn't be done for them, as the recording holds each frame's passes and rows wherever the clock left them.
+#
+# O on sunlit: OptiX on, a new session at the same view (the first one compiles OptiX's programs, once per driver: the
+# window says so and stands still meanwhile)
+at 5 key O
+# Tab: in a session with OptiX the scene after sunlit is still-life (the marble bust and the brass vase, read now)
+at 10 key Tab
+# A double-click on the bust (left of the image's middle, at the height of its chest): OptiX's pick finds the
+# triangles, which the CPU's world doesn't hold, and the focus moves to them
+at 20 mouse-down left 118 100
+at 20 mouse-up left 118 100
+at 20 mouse-down left 118 100 2
+at 20 mouse-up left 118 100 2
+# still-life's view saved as still-life-view-NNN.png and .pfm in the current folder, and its RayTracingGPU command
+# printed (without --optix: a scene with triangle meshes implies it)
+at 25 key P
+# O on still-life: refused, as a scene with triangle meshes always traces with OptiX ("Note: still-life has triangle
+# meshes: always OptiX", on the console and on screen); the session stays
+at 28 key O
+# Tab on through busts and cornell-bust, around to the books' first scene, materials, under OptiX (Tab keeps it), and
+# Shift+Tab back to still-life: no model read again
+at 30 key Tab
+at 35 key Tab
+at 40 key Tab
+at 45 key-down Left Shift
+at 45 key Tab
+at 50 key Tab
+at 55 key Tab
+at 55 key-up Left Shift
+# Shift+Tab once more: sunlit, the scene before still-life, at the view it opened with and still under OptiX (Tab keeps
+# it; the Scene line names OptiX's programs)
+at 60 key-down Left Shift
+at 60 key Tab
+at 60 key-up Left Shift
+# F2 under OptiX: refused ("Note: OptiX computes in float32 only: O to turn it off first"); the session stays
+at 63 key F2
+# O: OptiX off, sunlit in a new session at the same view with the command line's kernel, auto, which for sunlit is the
+# quality kernel (the Scene line names it; "OptiX off" on screen; kernel auto in the recording)
+at 66 key O
+# Tab without OptiX: the cycle without the scenes of glTF models, where the scene after sunlit is materials, under the
+# books' kernel
+at 69 key Tab
+at 72 quit

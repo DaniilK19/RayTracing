@@ -1,5 +1,5 @@
 // GpuTests' OptiX: one optix_runtime per process for every OptiX suite (optix-runtime, optix-tracer, optix-render,
-// optix-triangles, optix-pbr, guides, denoise), made by start_optix() when the first of them asks for it. That suite
+// optix-triangles, optix-pbr, optix-sessions, guides, denoise), made by start_optix() when the first of them asks for it. That suite
 // pays for OptiX's start (the driver loads nvoptix.dll, optixInit, the context): its seconds are printed as INFO and
 // left out of the suite's 10 s budget (gpu_test.h's exclude_seconds). The programs' first compile is the asking
 // suite's to leave out, through excluded_seconds around compile_programs() or a test pipeline's first launch_test:

@@ -17,6 +17,7 @@
 #include <SDL3/SDL_main.h>
 
 #include "gpu/renderer.h"
+#include "gpu/start_optix.h"
 
 import std;
 import camera;
@@ -46,7 +47,7 @@ constexpr int default_strata = 8; // a round of 8×8 samples per pixel (see --st
 
 struct options
 {
-    std::string_view scene = default_viewer_scene;
+    std::string_view scene = default_viewer_scene; // a scene's name, or a glTF model's file (is_model_path)
     std::optional<int> image_width;
     std::optional<int> samples_per_pixel;
     int strata = default_strata;
@@ -56,6 +57,7 @@ struct options
     bool fp64 = false;
     bool all_books_kernel = false;
     bool quality_kernel = false;
+    bool optix = false; // trace with OptiX (O switches it), as RayTracingGPU's --optix
     std::vector<std::filesystem::path> outputs; // saved when the window closes
     display_choice display;                     // --tonemap, --exposure (tone_options.ixx)
     bool exit_when_done = false;
@@ -77,6 +79,8 @@ void print_usage()
                  "image refines while the view stands still. Options as in RayTracingGPU.\n\n"
                  "Scenes:");
     std::print("{}", scenes_usage(default_viewer_scene));
+    std::println("\nOr a glTF 2.0 model, FILE.glb or FILE.gltf, in a photo studio (OptiX renders it; P names its\n"
+                 "images after the file: FILE-view-001.png).");
     std::println(R"(
 Options:
   -w, --width N        image width in pixels: the window's (default: the scene's aspect ratio at
@@ -93,6 +97,9 @@ Options:
       --all-books-kernel
                        render with the kernel for all three books, also the first book's scenes
       --quality-kernel render with the quality kernel, also the books' scenes under -p material
+      --optix          trace with OptiX (on the ray tracing cores where the GPU has them): the
+                       quality kernel's integrator in an OptiX program (float; -p material, nee or
+                       mis); scenes with triangle meshes always use it
       --seed N         which random numbers to draw, from 0 (the default) to {}
   -o, --output FILE    save the image when the window closes: a .png or a .pfm; several -o save
                        several files
@@ -113,9 +120,12 @@ In the window:
   [ and ]              a narrower or wider lens (depth of field)
   Shift+wheel          focus nearer or farther
   double-click         focus on what is under the cursor
-  Tab, Shift+Tab       the next or the previous scene
+  Tab, Shift+Tab       the next or the previous scene; with OptiX (--optix, O, or a scene with
+                       triangle meshes), also still-life, busts and cornell-bust
   M, Shift+M           the next or the previous sampling strategy, skipping those the scene can't take
   F2                   float32 or float64
+  O                    OptiX on or off for the scene (see --optix); the scenes with triangle meshes
+                       always use it
   T, Shift+T           the next or the previous tone map: books, none, agx, neutral
   , and .              exposure down or up by 0.5 EV (not with books)
   0                    exposure back to 0 EV
@@ -151,6 +161,59 @@ constexpr auto value_options = std::to_array<std::string_view>(
     {"-w", "--width", "-s", "--samples", "--strata", "-p", "--sampling", "--seed", "-o", "--output", "--frames",
      "--stats", "--script", "--record", "--input", "--refresh-hz", "--tonemap", "--exposure"});
 
+// A scene as the command line or a script names it, checked as RayTracingGPU checks its own: one of the GPU programs'
+// scenes (gpu_scenes.ixx), or a glTF 2.0 model's file (it ends in .glb or .gltf, which no scene's name does), which
+// must exist. The model is read when the scene is built (gpu_scene's cache keeps the last two models read).
+std::expected<void, std::string> check_scene(std::string_view scene)
+{
+    if (is_model_path(scene))
+    {
+        std::error_code error;
+        if (!std::filesystem::is_regular_file(std::filesystem::path(scene), error))
+        {
+            return std::unexpected(std::format("there is no file '{}'", scene));
+        }
+        return {};
+    }
+    if (!find_gpu_scene(scene))
+    {
+        return std::unexpected(std::format("unknown scene '{}'", scene));
+    }
+    return {};
+}
+
+// A model's file as the window shows it (the HUD, the title): its file name; a scene's name as it is
+std::string scene_label(std::string_view scene)
+{
+    return is_model_path(scene) ? to_utf8(std::filesystem::path(scene).filename()) : std::string(scene);
+}
+
+// The start of the names P saves under: a model's file's stem (bust.glb: bust-view-001.png), as RayTracingGPU names
+// its image; a scene's name
+std::string scene_stem(std::string_view scene)
+{
+    return is_model_path(scene) ? to_utf8(std::filesystem::path(scene).stem()) : std::string(scene);
+}
+
+// A word of a command the window prints, as a command line reads it back: as it is when it holds only letters, digits
+// and - _ . : \ / (every scene's name, and the files P names after one), else in double quotes, which cmd.exe and
+// PowerShell both read as one word, spaces, parentheses and commas included (a Windows path never holds a quote);
+// `always` quotes it whatever it holds
+std::string command_word(std::string_view word, bool always = false)
+{
+    const bool plain = !always && !word.empty() && std::ranges::all_of(word, [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+               c == '.' || c == ':' || c == '\\' || c == '/';
+    });
+    return plain ? std::string(word) : std::format("\"{}\"", word);
+}
+
+// The scene as a RayTracingGPU command names it: a model's file always quoted, as a path may hold spaces
+std::string scene_argument(std::string_view scene)
+{
+    return command_word(scene, is_model_path(scene));
+}
+
 std::expected<options, std::string> parse_options(std::span<char* const> args)
 {
     options opts;
@@ -163,21 +226,22 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             continue;
         }
         if (arg == "--fp64" || arg == "--all-books-kernel" || arg == "--quality-kernel" || arg == "--exit-when-done" ||
-            arg == "--headless" || arg == "--frames-hud")
+            arg == "--headless" || arg == "--frames-hud" || arg == "--optix")
         {
             (arg == "--fp64"               ? opts.fp64
              : arg == "--all-books-kernel" ? opts.all_books_kernel
              : arg == "--quality-kernel"   ? opts.quality_kernel
              : arg == "--headless"         ? opts.headless
              : arg == "--frames-hud"       ? opts.frames_hud
+             : arg == "--optix"            ? opts.optix
                                            : opts.exit_when_done) = true;
             continue;
         }
         if (!arg.starts_with('-'))
         {
-            if (!find_gpu_scene(arg))
+            if (const auto known = check_scene(arg); !known)
             {
-                return std::unexpected(std::format("unknown scene '{}'", arg));
+                return std::unexpected(known.error());
             }
             opts.scene = arg;
             continue;
@@ -427,6 +491,19 @@ struct render_settings
     bool operator==(const render_settings&) const = default;
 };
 
+// Whether a scene has triangle meshes (a showcase of glTF models, a model's file), which only OptiX traces
+bool has_meshes(const gpu_build& built)
+{
+    return !built.desc.meshes.instances.empty();
+}
+
+// Whether a session of these settings traces with OptiX: asked for (--optix, O, a script's kernel optix), or needed by
+// the scene's triangle meshes, whatever the kernel asked for (as in RayTracingGPU, which renders them without --optix)
+bool traces_with_optix(const render_settings& settings, const gpu_build& built)
+{
+    return settings.kernel == kernel_choice::optix || has_meshes(built);
+}
+
 class viewer
 {
 public:
@@ -450,6 +527,13 @@ private:
     // The scene, its session and the view
     render_settings settings_;
     std::optional<gpu_build> build_;
+    // OptiX, for the sessions that trace with it: started at the first need (open_optix) and kept for the rest of the
+    // run, so that Tab, M, F2 and O never compile its programs again. Declared before session_, it outlives every
+    // session, and each session holds a copy too (session_options::optix).
+    std::shared_ptr<gpu::optix_runtime> optix_;
+    std::optional<std::string> optix_failure_; // why OptiX couldn't start: the answer from then on, never tried again
+    bool optix_compiled_ = false;              // a session has traced with OptiX: its programs are compiled
+    std::set<std::string> warned_models_;      // the glTF files whose warnings the console has shown
     std::optional<gpu::session> session_;
     camera_settings view_;          // the camera's settings: the scene's own view, changed by options or scripts
     camera_settings start_view_;    // the scene's view as it started (R goes back to it)
@@ -555,8 +639,12 @@ private:
     SDL_AppResult fail(const std::string& message);
     std::expected<void, std::string> use_settings(const render_settings& settings);
     std::expected<void, std::string> check_display_for(const render_settings& settings) const;
-    std::expected<gpu_build, std::string> build_for(const render_settings& settings) const;
+    std::expected<gpu_build, std::string> build_for(const render_settings& settings);
     std::expected<void, std::string> use_build(const render_settings& settings, gpu_build built);
+    std::expected<void, std::string> open_optix();
+    void note_optix_compile();
+    void report_models(const gpu_build& built);
+    kernel_choice command_line_kernel() const;
     camera_settings settings_for(const camera_settings& view, int width, int height) const;
     std::expected<void, std::string> show_view(const camera_settings& view, int width, int height, bool restart);
     std::expected<void, std::string> size_window(int width, int height);
@@ -579,11 +667,13 @@ private:
     SDL_AppResult run_headless();
     bool move_camera(const camera_settings& to);
     std::optional<camera_settings> pick_focus(double x, double y); // not const: a miss says so on screen
+    std::optional<camera_settings> pick_focus_optix(const camera_settings& view, const ray& r, int i, int j);
     camera_settings moved(const move& m, double t) const;
     void save_view();
     SDL_AppResult switch_scene(int step);
     SDL_AppResult switch_precision();
     SDL_AppResult switch_strategy(int step);
+    SDL_AppResult switch_optix();
     SDL_AppResult switched(const std::expected<void, std::string>& used, const std::string& what);
     void change_target(bool more);
     gpu::display_options scene_display() const;
@@ -598,6 +688,7 @@ private:
 viewer::~viewer()
 {
     session_.reset(); // the GPU's memory first, while CUDA is still up
+    optix_.reset();   // then OptiX's programs and context, after every session that traced with them
     if (texture_)
     {
         SDL_DestroyTexture(texture_);
@@ -648,7 +739,7 @@ std::expected<void, std::string> viewer::use_settings(const render_settings& set
 // The display these settings would show: a tone map beyond the books computes in float32 only (as T and F2 keep it)
 std::expected<void, std::string> viewer::check_display_for(const render_settings& settings) const
 {
-    const gpu_scene_entry* entry = find_gpu_scene(settings.scene);
+    const gpu_scene_entry* entry = scene_entry(settings.scene); // a model's file: the model entry's (AgX)
     if (const gpu::display_options shown = effective_display(display_, entry ? entry->display : gpu::display_options{});
         settings.fp64 && shown.op != gpu::tone_map::books)
     {
@@ -658,9 +749,12 @@ std::expected<void, std::string> viewer::check_display_for(const render_settings
 }
 
 // The scene these settings build, as a new session would render it, or why the window can't show it, while nothing
-// changes yet (M and Tab ask it of the settings they could go to): the display (check_display_for), the scene's own
-// errors, and what the quality kernel can't render (the float-only rule, the books' strategies but the material's)
-std::expected<gpu_build, std::string> viewer::build_for(const render_settings& settings) const
+// changes yet (M, Tab and O ask it of the settings they could go to): the display (check_display_for), the scene's own
+// errors, what the quality kernel can't render (the float-only rule, the books' strategies but the material's), and
+// what OptiX can't: a scene with triangle meshes refuses float64 and the other kernels (check_meshes), and a session
+// that traces with OptiX takes its rules and needs it started (open_optix). The glTF files the build read are reported
+// (report_models), also when the window then can't show the scene.
+std::expected<gpu_build, std::string> viewer::build_for(const render_settings& settings)
 {
     if (const auto shown = check_display_for(settings); !shown)
     {
@@ -682,11 +776,97 @@ std::expected<gpu_build, std::string> viewer::build_for(const render_settings& s
     {
         return built;
     }
-    if (const auto checked = check_kernel(*built, settings.scene, settings.kernel, settings.fp64); !checked)
+    report_models(*built);
+    if (const auto checked = check_meshes(*built, settings.scene, settings.kernel, settings.fp64); !checked)
     {
         return std::unexpected(checked.error());
     }
+    const bool optix = traces_with_optix(settings, *built);
+    if (const auto checked =
+            check_kernel(*built, settings.scene, optix ? kernel_choice::optix : settings.kernel, settings.fp64);
+        !checked)
+    {
+        return std::unexpected(checked.error());
+    }
+    if (const auto opened = optix ? open_optix() : std::expected<void, std::string>{}; !opened)
+    {
+        return std::unexpected(std::format("OptiX can't run here: {}", opened.error()));
+    }
     return built;
+}
+
+// OptiX for the sessions that trace with it, started at the first need, after CUDA (start_optix: the graphics driver's
+// OptiX and a context on CUDA's device; the programs compile at the first session's upload). A start that failed isn't
+// tried again: its reason (no OptiX in this build, a driver too old, none in the driver) is the answer from then on.
+std::expected<void, std::string> viewer::open_optix()
+{
+    if (optix_)
+    {
+        return {};
+    }
+    if (!optix_failure_)
+    {
+        try
+        {
+            optix_ = gpu::start_optix();
+            return {};
+        }
+        catch (const std::exception& error)
+        {
+            optix_failure_ = error.what();
+        }
+    }
+    return std::unexpected(*optix_failure_);
+}
+
+// The first session that traces with OptiX has the graphics driver compile OptiX's programs, seconds of the processor
+// in which the window stands still (once per driver while OptiX's disk cache keeps them; at every start when the cache
+// is off): a note says so first, on the console and, over the scene shown, on screen (in ASCII, the only characters
+// SDL's debug font draws)
+void viewer::note_optix_compile()
+{
+    const std::string note = !optix_ || gpu::optix_cache_enabled(*optix_)
+                                 ? "compiling OptiX's programs (once per driver)..."
+                                 : "compiling OptiX's programs (OptiX's program cache is off: at every start)...";
+    std::println("Note: {}", note);
+    say(note);
+    if (window_ && texture_ && session_ && !minimized_ && !upload_needed_)
+    {
+        draw_and_present(false); // shows the note now: the window draws nothing more until the programs are compiled
+    }
+}
+
+// What a build read from glTF files (gpu_scene's cache keeps the last two models read, so Tab and M read a file again
+// only once it has left the cache or changed): each model's warnings, what the renderer can't show, once per run, as
+// RayTracingGPU prints them before it renders; and with --stats a line per file read, a comment between the frames'
+// rows ("# model read: FILE, ..."), its triangles as placed, its images and the milliseconds reading it took
+void viewer::report_models(const gpu_build& built)
+{
+    for (const model_load& model : built.models)
+    {
+        if (warned_models_.insert(model.file).second)
+        {
+            for (const std::string& warning : model.warnings)
+            {
+                std::println("Warning: {}", warning);
+            }
+        }
+        if (stats_.is_open())
+        {
+            stats_ << std::format("# model read: {}, {} triangles, {} images, {:.3f} ms\n", model.file,
+                                  model.triangles, model.images, model.seconds * 1e3);
+            stats_.flush();
+        }
+    }
+}
+
+// The kernel O turns OptiX off to: the command line's (the kernel each scene picks, unless --quality-kernel or
+// --all-books-kernel picked one for all)
+kernel_choice viewer::command_line_kernel() const
+{
+    return opts_.quality_kernel     ? kernel_choice::quality
+           : opts_.all_books_kernel ? kernel_choice::all_books
+                                    : kernel_choice::automatic;
 }
 
 // use_settings with the scene its settings built (build_for): the new session, or the old scene back
@@ -703,7 +883,8 @@ std::expected<void, std::string> viewer::use_build(const render_settings& settin
         view.focus_dist = view_.focus_dist;
     }
     // A new session: a new image, which the console reports when it is done, at a rate of its own, and the time the
-    // session took to build is no frame's
+    // session took to build is no frame's. One that traces with OptiX gets a copy of the runtime (build_for started
+    // it), which it keeps alive.
     const auto session_for = [&](const gpu_build& b, const camera_settings& v, const render_settings& s) {
         gpu::scene_desc desc = b.desc;
         desc.camera = to_gpu(camera(settings_for(v, width_, height_)).frame(), b.sampling);
@@ -713,12 +894,19 @@ std::expected<void, std::string> viewer::use_build(const render_settings& settin
                                                     .all_books_kernel = s.kernel == kernel_choice::all_books,
                                                     .quality_kernel = s.kernel == kernel_choice::quality,
                                                     .launch_seconds = still_seconds,
-                                                    .wait = gpu::wait_mode::sleep});
+                                                    .wait = gpu::wait_mode::sleep,
+                                                    .optix_tracer = traces_with_optix(s, b),
+                                                    .optix = optix_});
         ++generation_;
         done_reported_ = false;
         samples_per_second_ = 0;
         skip_interval_ = true;
     };
+    const bool optix = traces_with_optix(settings, built);
+    if (optix && !optix_compiled_)
+    {
+        note_optix_compile();
+    }
     session_.reset();
     try
     {
@@ -739,6 +927,7 @@ std::expected<void, std::string> viewer::use_build(const render_settings& settin
         }
         return std::unexpected(error.what());
     }
+    optix_compiled_ = optix_compiled_ || optix;
     if (!same_scene)
     {
         pending_view_.reset(); // a move of the old scene's camera still waiting
@@ -825,12 +1014,14 @@ std::expected<void, std::string> viewer::size_window(int width, int height)
     return {};
 }
 
-// The RayTracingGPU command that renders the image of `passes` samples of the view on screen again, bit for bit
+// The RayTracingGPU command that renders the image of `passes` samples of the view on screen again, bit for bit (a
+// model's file quoted; --optix where OptiX traces a scene without triangle meshes, which imply it)
 std::string viewer::gpu_command(std::int64_t passes) const
 {
-    std::string command = std::format("RayTracingGPU {} {} -s {} --strata {} --seed {}", settings_.scene,
-                                      format_view(settings_for(view_, width_, height_), height_), passes,
-                                      settings_.strata, settings_.seed);
+    std::string command =
+        std::format("RayTracingGPU {} {} -s {} --strata {} --seed {}", scene_argument(settings_.scene),
+                    format_view(settings_for(view_, width_, height_), height_), passes, settings_.strata,
+                    settings_.seed);
     if (settings_.sampling)
     {
         command += std::format(" -p {}", strategy_name(*settings_.sampling));
@@ -846,6 +1037,10 @@ std::string viewer::gpu_command(std::int64_t passes) const
     else if (settings_.kernel == kernel_choice::quality)
     {
         command += " --quality-kernel";
+    }
+    else if (settings_.kernel == kernel_choice::optix && !has_meshes(*build_))
+    {
+        command += " --optix";
     }
     // The display, wherever it or the scene's own isn't the books' bytes (see names_display), with the exposure's
     // shortest digits that read back as the same number
@@ -877,6 +1072,10 @@ bool viewer::move_camera(const camera_settings& to)
 // mist (an isotropic medium) don't stop the pick: it goes on to the surface behind them, and takes the medium's own
 // point only when nothing is behind (the second book's final scene stands in a mist that fills the whole world). They
 // are hit at random depths, so the random numbers start over first. Empty if the ray hits nothing.
+//
+// A scene with triangle meshes holds what the CPU's world doesn't (the CPU builds no triangle): there the session's
+// own tracer finds the surface, one thread of OptiX's programs on the image's acceleration structures
+// (session::pick_distance), triangles, spheres and quads alike, as the image sees them.
 std::optional<camera_settings> viewer::pick_focus(double x, double y)
 {
     const camera_settings view = current_view();
@@ -888,6 +1087,10 @@ std::optional<camera_settings> viewer::pick_focus(double x, double y)
     const int j = static_cast<int>(std::clamp(y, 0.0, height_ - 1.0));
     const point3 target = f.pixel00_loc + i * f.pixel_delta_u + j * f.pixel_delta_v;
     const ray r{.origin = f.center, .direction = target - f.center, .time = 0};
+    if (has_meshes(*build_))
+    {
+        return pick_focus_optix(view, r, i, j);
+    }
     seed_random(std::mt19937_64::default_seed);
     const auto medium = [](const std::optional<hit_record>& h) { return dynamic_cast<const isotropic*>(h->mat); };
     auto hit = build_->cpu.world.hit(r, interval{0.001, infinity});
@@ -923,6 +1126,46 @@ std::optional<camera_settings> viewer::pick_focus(double x, double y)
         std::println("Focus: {} at pixel ({}, {}): the hit at {},{},{} is {} along the view, outside what a view "
                      "allows",
                      to.focus_dist, i, j, hit->p.x, hit->p.y, hit->p.z, along);
+    }
+    return to;
+}
+
+// pick_focus in a scene with triangle meshes: OptiX's pick of the nearest surface along the ray's unit direction (a
+// distance t, ∞ for none), which the line on the console gives too, so that a check can compare it with the focus.
+// Media aren't surfaces to it; the scenes with meshes have none.
+std::optional<camera_settings> viewer::pick_focus_optix(const camera_settings& view, const ray& r, int i, int j)
+{
+    const vec3 d = unit_vector(r.direction);
+    double t = 0;
+    try
+    {
+        t = session_->pick_distance({r.origin.x, r.origin.y, r.origin.z}, {d.x, d.y, d.z});
+    }
+    catch (const std::exception& error)
+    {
+        std::println("Error: {}", error.what());
+        say(std::format("can't focus: {}", error.what()));
+        return std::nullopt;
+    }
+    if (!std::isfinite(t))
+    {
+        std::println("Focus: nothing there at pixel ({}, {})", i, j);
+        say("nothing there to focus on");
+        return std::nullopt;
+    }
+    const point3 p = r.origin + t * d;
+    const double along = dot(p - view.lookfrom, unit_vector(view.lookat - view.lookfrom));
+    const camera_settings to = with_focus(view, along);
+    if (to.focus_dist == along)
+    {
+        std::println("Focus: {} at pixel ({}, {}), the hit at {},{},{}, {} along the ray (OptiX's pick)",
+                     to.focus_dist, i, j, p.x, p.y, p.z, t);
+    }
+    else
+    {
+        std::println("Focus: {} at pixel ({}, {}): the hit at {},{},{}, {} along the ray (OptiX's pick), is {} along "
+                     "the view, outside what a view allows",
+                     to.focus_dist, i, j, p.x, p.y, p.z, t, along);
     }
     return to;
 }
@@ -1032,7 +1275,7 @@ void viewer::save_view()
     std::string name;
     do
     {
-        name = std::format("{}-view-{:03}", settings_.scene, ++views_saved_);
+        name = std::format("{}-view-{:03}", scene_stem(settings_.scene), ++views_saved_);
     } while (std::filesystem::exists(name + ".png") || std::filesystem::exists(name + ".pfm"));
     for (const std::string_view extension : {".png", ".pfm"})
     {
@@ -1046,9 +1289,10 @@ void viewer::save_view()
     }
     std::println("Saved {} and .pfm ({} samples per pixel). The same image:",
                  to_utf8(std::filesystem::absolute(name + ".png")), state->passes);
-    // With a tone map the command saves the PNG too, whose bytes it renders again
-    std::println("{}{} -o {}-gpu.pfm", gpu_command(state->passes), toned ? std::format(" -o {}-gpu.png", name) : "",
-                 name);
+    // With a tone map the command saves the PNG too, whose bytes it renders again. A model's file name may hold a space
+    // or parentheses ("model (1).glb"): the files' names are then quoted, as the scene's is.
+    std::println("{}{} -o {}", gpu_command(state->passes),
+                 toned ? std::format(" -o {}", command_word(name + "-gpu.png")) : "", command_word(name + "-gpu.pfm"));
 }
 
 // A message on screen for two seconds. A loop waiting for events wouldn't take it off, so a timer wakes it then.
@@ -1069,10 +1313,18 @@ void viewer::say(std::string message)
 void viewer::print_settings() const
 {
     const std::string_view sampling = strategy_name(build_->sampling);
-    // The quality kernel is named (the books' two, as before, aren't): the image is its own
-    const std::string precision =
-        std::string(settings_.fp64 ? "float64" : "float32") +
-        (session_ && session_->kernel().name == "quality" ? ", the quality kernel" : "");
+    // The quality kernel's integrator is named, in the quality kernel or in OptiX's programs with their version and
+    // SHA-256 (the books' two kernels, as before, aren't): the image is its own
+    std::string renderer;
+    if (session_ && traces_with_optix(settings_, *build_))
+    {
+        renderer = std::format(", {}", optix_ ? gpu::describe(*optix_) : std::string("OptiX"));
+    }
+    else if (session_ && gpu::uses_quality_integrator(session_->kernel()))
+    {
+        renderer = ", the quality kernel";
+    }
+    const std::string precision = std::string(settings_.fp64 ? "float64" : "float32") + renderer;
     if (opts_.script)
     {
         // The script decides the frames and the views
@@ -1098,12 +1350,19 @@ void viewer::print_settings() const
 // but the material's, beyond the books) renders with its own instead and says so, and the next scene is asked for the
 // named one again. A scene the window can't show here is skipped, the console saying why: the scenes beyond the books
 // in float64 and under --all-books-kernel (only the quality kernel renders them, in float32), and, under
-// --quality-kernel with no strategy named, a scene whose own strategy is a books' one but the material's. The scenes
-// with triangle meshes aren't in the cycle: only OptiX renders them, which the window doesn't start.
+// --quality-kernel with no strategy named, a scene whose own strategy is a books' one but the material's.
+//
+// The scenes with triangle meshes, which only OptiX renders, are in the cycle of a session that traces with OptiX
+// (--optix, O, a mesh scene or a model's file shown), after sunlit, where the list has them: a session without OptiX
+// goes through the very scenes it went through before them, in the same order. Tab from a session with OptiX keeps it
+// for the next scene, as --optix would, so the cycle stays the longer one until O turns OptiX off; a scene OptiX can't
+// render is skipped as above (a books' strategy of its own, or OptiX that can't start, with its reason). A model's
+// file is outside the cycle: Tab goes from it to the first scene and Shift+Tab to the last, as from a test scene.
 SDL_AppResult viewer::switch_scene(int step)
 {
-    const auto in_cycle = [](const gpu_scene_entry& e) {
-        return (e.role == scene_role::book || e.role == scene_role::showcase) && !has_triangle_meshes(e);
+    const bool optix = traces_with_optix(settings_, *build_);
+    const auto in_cycle = [optix](const gpu_scene_entry& e) {
+        return (e.role == scene_role::book || e.role == scene_role::showcase) && (optix || !has_triangle_meshes(e));
     };
     const std::vector<const gpu_scene_entry*> cycle = gpu_scene_list() | std::views::filter(in_cycle) |
                                                       std::views::transform([](const auto& e) { return &e; }) |
@@ -1130,6 +1389,10 @@ SDL_AppResult viewer::switch_scene(int step)
         render_settings next = settings_;
         next.scene = std::string(entry.name);
         next.sampling = named_sampling_;
+        if (optix)
+        {
+            next.kernel = kernel_choice::optix;
+        }
         if (next.scene == settings_.scene)
         {
             break; // around the cycle
@@ -1188,15 +1451,20 @@ SDL_AppResult viewer::switch_scene(int step)
 }
 
 // F2: the other precision, in a new session at the same view (the moves still waiting are shown first). The quality
-// kernel, and a tone map other than books, compute in float32 only: there F2 stays and says so, with the way out.
+// kernel's integrator (in the quality kernel or in OptiX), and a tone map other than books, compute in float32 only:
+// there F2 stays and says so, with the way out.
 SDL_AppResult viewer::switch_precision()
 {
-    if (!settings_.fp64 && session_ && session_->kernel().name == "quality")
+    if (!settings_.fp64 && session_ && gpu::uses_quality_integrator(session_->kernel()))
     {
-        // A book scene renders with the quality kernel under nee and mis (or --quality-kernel); the others always do
-        const gpu_scene_entry* entry = find_gpu_scene(settings_.scene);
+        // A book scene renders with the quality kernel under nee and mis (or --quality-kernel); the others always do.
+        // OptiX was asked for (O turns it off), or the scene's triangle meshes need it.
+        const gpu_scene_entry* entry = scene_entry(settings_.scene);
         const std::string note =
-            settings_.kernel == kernel_choice::quality ? "--quality-kernel works in float32 only"
+            has_meshes(*build_) ? std::format("{} has triangle meshes, which only OptiX renders, in float32",
+                                              scene_label(settings_.scene))
+            : settings_.kernel == kernel_choice::optix ? "OptiX computes in float32 only: O to turn it off first"
+            : settings_.kernel == kernel_choice::quality ? "--quality-kernel works in float32 only"
             : entry && entry->role == scene_role::book
                 ? "the quality kernel works in float32 only: M to a books' strategy first"
                 : std::format("{} renders with the quality kernel, in float32 only", settings_.scene);
@@ -1275,6 +1543,47 @@ SDL_AppResult viewer::switch_strategy(int step)
     return SDL_APP_CONTINUE;
 }
 
+// O: OptiX on or off for the scene shown, in a new session at the same view (the moves still waiting are shown first),
+// as F2 changes the precision: on, OptiX's programs trace the quality kernel's integrator (--optix); off, the scene
+// renders with the kernel of the command line. Where it can't change, O stays and says why: a scene with triangle
+// meshes always traces with OptiX; OptiX computes in float32 only; a strategy it can't take (a books' one but the
+// material's), and OptiX that can't start here, with its reason (build_for).
+SDL_AppResult viewer::switch_optix()
+{
+    const auto refused = [this](const std::string& note) {
+        std::println("Note: {}", note);
+        say(note);
+        return SDL_APP_CONTINUE;
+    };
+    if (has_meshes(*build_))
+    {
+        return refused(std::format("{} has triangle meshes: always OptiX", scene_label(settings_.scene)));
+    }
+    if (settings_.fp64)
+    {
+        return refused("OptiX computes in float32 only: F2 first");
+    }
+    if (const auto applied = apply_pending_view(); !applied)
+    {
+        return fail(applied.error());
+    }
+    render_settings next = settings_;
+    next.kernel = settings_.kernel == kernel_choice::optix ? command_line_kernel() : kernel_choice::optix;
+    auto built = build_for(next);
+    if (!built)
+    {
+        return refused(built.error());
+    }
+    const bool on = next.kernel == kernel_choice::optix;
+    const SDL_AppResult result =
+        switched(use_build(next, std::move(*built)), std::format("can't turn OptiX {}", on ? "on" : "off"));
+    if (result == SDL_APP_CONTINUE && session_ && settings_ == next)
+    {
+        say(on ? "OptiX on" : "OptiX off");
+    }
+    return result;
+}
+
 // After a switch: the new scene's line on the console; or the error, on the console and on screen, over the scene that
 // was shown, which use_settings brought back. If not even that scene could have a session again, the program ends.
 SDL_AppResult viewer::switched(const std::expected<void, std::string>& used, const std::string& what)
@@ -1314,10 +1623,10 @@ void viewer::change_target(bool more)
                           : std::format("refining to {} samples", target_));
 }
 
-// The scene's own display (its entry in gpu_scenes.ixx: the books' bytes for the books' scenes)
+// The scene's own display (its entry in gpu_scenes.ixx: the books' bytes for the books' scenes; a model's file: AgX)
 gpu::display_options viewer::scene_display() const
 {
-    const gpu_scene_entry* entry = find_gpu_scene(settings_.scene);
+    const gpu_scene_entry* entry = scene_entry(settings_.scene);
     return entry ? entry->display : gpu::display_options{};
 }
 
@@ -1395,6 +1704,7 @@ void viewer::draw_overlay()
         "Tab, Shift+Tab      the next or previous scene",
         "M, Shift+M          the next or previous strategy",
         "F2                  float32 or float64",
+        "O                   OptiX on or off",
         "T, Shift+T          the next or previous tone map",
         ", .                 exposure -/+ 0.5 EV",
         "0                   exposure back to 0 EV",
@@ -1409,11 +1719,13 @@ void viewer::draw_overlay()
     constexpr float note_height = line + 6;
     const auto w = static_cast<float>(width_);
     const auto h = static_cast<float>(height_);
-    // The quality kernel's strategy is named on the first line ("  mis"), as a tone map is on the third
-    // ("  agx +0.5 EV"): the books' scenes, under their own kernels and bytes, show the numbers they showed
-    const std::string strategy = session_ && session_->kernel().name == "quality"
+    // The quality kernel's integrator's strategy is named on the first line ("  mis"), as a tone map is on the third
+    // ("  agx +0.5 EV"), and OptiX after it ("  optix"): the books' scenes, under their own kernels and bytes, show
+    // the numbers they showed
+    const std::string strategy = session_ && gpu::uses_quality_integrator(session_->kernel())
                                      ? std::format("  {}", strategy_name(build_->sampling))
                                      : std::string();
+    const std::string_view optix = session_ && traces_with_optix(settings_, *build_) ? "  optix" : "";
     const gpu::display_options shown = shown_display();
     const std::string tone = shown.op == gpu::tone_map::books
                                  ? std::string()
@@ -1471,8 +1783,8 @@ void viewer::draw_overlay()
             progress += std::format("   {:.1f} M samples/s   frame {:.1f} ms", samples_per_second_ / 1e6, frame_ms_);
         }
         const std::string lines[] = {
-            std::format("{}  {}x{}  {}  strata {}x{}{}", settings_.scene, width_, height_,
-                        settings_.fp64 ? "float64" : "float32", settings_.strata, settings_.strata, strategy),
+            std::format("{}  {}x{}  {}  strata {}x{}{}{}", scene_label(settings_.scene), width_, height_,
+                        settings_.fp64 ? "float64" : "float32", settings_.strata, settings_.strata, strategy, optix),
             progress,
             std::format("vfov {:.4g}  aperture {:.4g}  focus {:.4g}{}{}", view_.vfov, view_.defocus_angle,
                         view_.focus_dist, tone, live ? "   H: help" : ""),
@@ -1501,9 +1813,7 @@ SDL_AppResult viewer::init()
     // the script's, and the window has the script's size from the start)
     render_settings settings{.scene = std::string(opts_.scene),
                              .fp64 = opts_.fp64,
-                             .kernel = opts_.quality_kernel     ? kernel_choice::quality
-                                       : opts_.all_books_kernel ? kernel_choice::all_books
-                                                                : kernel_choice::automatic,
+                             .kernel = opts_.optix ? kernel_choice::optix : command_line_kernel(),
                              .sampling = opts_.sampling,
                              .seed = opts_.seed,
                              .strata = opts_.strata};
@@ -1526,10 +1836,9 @@ SDL_AppResult viewer::init()
             const script_command& c = line.command;
             if (const auto* scene = std::get_if<set_scene>(&c))
             {
-                if (!find_gpu_scene(scene->name))
+                if (const auto known = check_scene(scene->name); !known)
                 {
-                    return fail(std::format("{}: line {}: unknown scene '{}'", to_utf8(*opts_.script), line.line,
-                                            scene->name));
+                    return fail(std::format("{}: line {}: {}", to_utf8(*opts_.script), line.line, known.error()));
                 }
                 settings.scene = scene->name;
             }
@@ -1601,7 +1910,24 @@ SDL_AppResult viewer::init()
         return fail(
             "--all-books-kernel picks the books' kernel for all three books; --quality-kernel needs the quality kernel");
     }
-    if (const auto checked = check_kernel(*built, settings.scene, settings.kernel, settings.fp64); !checked)
+    if (opts_.optix && opts_.quality_kernel)
+    {
+        return fail("--optix and --quality-kernel each pick a renderer: give one");
+    }
+    if (opts_.optix && opts_.all_books_kernel)
+    {
+        return fail("--all-books-kernel picks the books' kernel for all three books; --optix renders with OptiX");
+    }
+    // A scene with triangle meshes (a model's file among them) renders with OptiX without --optix: what it can't be
+    // rendered with is said first, in its own words (see check_meshes in gpu_scene.ixx)
+    if (const auto checked = check_meshes(*built, settings.scene, settings.kernel, settings.fp64); !checked)
+    {
+        return fail(checked.error());
+    }
+    const bool optix = traces_with_optix(settings, *built);
+    if (const auto checked =
+            check_kernel(*built, settings.scene, optix ? kernel_choice::optix : settings.kernel, settings.fp64);
+        !checked)
     {
         return fail(checked.error());
     }
@@ -1616,6 +1942,21 @@ SDL_AppResult viewer::init()
         opts_.script && settings.fp64 && shown.op != gpu::tone_map::books)
     {
         return fail(std::format("{}: {} works in float32 only", to_utf8(*opts_.script), tone_map_name(shown.op)));
+    }
+    // OptiX, for --optix (or a script's kernel optix) and for a scene with triangle meshes, and only for them, so that
+    // every other run is as before. It starts on the device CUDA starts, after query_device below; a build without
+    // OptiX's headers refuses here instead, before the window and CUDA, in RayTracingGPU's words (start_optix() says
+    // why, and starts nothing).
+    const auto optix_refused = [&](const std::string& reason) {
+        return fail(opts_.optix ? std::format("--optix: {}", reason)
+                    : has_meshes(*built)
+                        ? std::format("'{}' has triangle meshes, which only OptiX renders: {}", settings.scene, reason)
+                        : std::format("OptiX can't run here: {}", reason));
+    };
+    if (const auto opened = optix && !gpu::optix_built() ? open_optix() : std::expected<void, std::string>{};
+        !opened)
+    {
+        return optix_refused(opened.error());
     }
     width_ = built->frame.image_width;
     height_ = built->frame.image_height;
@@ -1662,6 +2003,8 @@ SDL_AppResult viewer::init()
         stats_ << "frame,wall_ms,dt_ms,gpu_ms,launches,longest_launch_ms,passes,rows,new_samples,presented,moving,"
                   "generation,width,height,strata,time_ms\n";
     }
+    // The glTF files the first build read (the session's own build below finds them in gpu_scene's cache)
+    report_models(*built);
     if (opts_.record)
     {
         record_.open(*opts_.record, std::ios::binary);
@@ -1686,8 +2029,8 @@ SDL_AppResult viewer::init()
         }
         const int asked_width = width_;
         const int asked_height = height_;
-        window_ = SDL_CreateWindow(std::format("RayTracingViewer: {}", settings.scene).c_str(), width_, height_,
-                                   SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+        window_ = SDL_CreateWindow(std::format("RayTracingViewer: {}", scene_label(settings.scene)).c_str(), width_,
+                                   height_, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
         if (!window_)
         {
             return fail(std::format("SDL couldn't open the window: {}", SDL_GetError()));
@@ -1746,6 +2089,10 @@ SDL_AppResult viewer::init()
     catch (const std::exception& error)
     {
         return fail(error.what());
+    }
+    if (const auto opened = optix ? open_optix() : std::expected<void, std::string>{}; !opened)
+    {
+        return optix_refused(opened.error());
     }
     if (const auto used = use_settings(settings); !used)
     {
@@ -1886,7 +2233,7 @@ std::expected<void, std::string> viewer::save_frame_bytes(std::span<const std::u
 
 void viewer::update_title()
 {
-    SDL_SetWindowTitle(window_, std::format("RayTracingViewer: {}", settings_.scene).c_str());
+    SDL_SetWindowTitle(window_, std::format("RayTracingViewer: {}", scene_label(settings_.scene)).c_str());
 }
 
 // The image of complete passes, as RayTracingGPU saves it: a pass in progress is finished first, so the file holds
@@ -2048,9 +2395,9 @@ std::expected<bool, std::string> viewer::play_next()
         if (std::holds_alternative<set_scene>(line.command))
         {
             const auto* c = &std::get<set_scene>(line.command);
-            if (!find_gpu_scene(c->name))
+            if (const auto known = check_scene(c->name); !known)
             {
-                return at(std::format("unknown scene '{}'", c->name));
+                return at(known.error());
             }
             settings.scene = c->name;
         }
@@ -2543,6 +2890,15 @@ SDL_AppResult viewer::event(const SDL_Event& e)
             // A switch that fails shows the strategy it came from; one that leaves no session ends the program
             if (const SDL_AppResult result = switch_strategy((mods_ & SDL_KMOD_SHIFT) ? -1 : 1);
                 result != SDL_APP_CONTINUE)
+            {
+                return result;
+            }
+        }
+        else if (e.key.key == SDLK_O)
+        {
+            // OptiX on or off: a switch that fails shows the session it came from; one that leaves none ends the
+            // program
+            if (const SDL_AppResult result = switch_optix(); result != SDL_APP_CONTINUE)
             {
                 return result;
             }

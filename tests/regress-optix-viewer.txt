@@ -1,0 +1,73 @@
+# OptiX in the window, for scripts/verify/hostgate.ps1's chained section regress-optix-viewer (from Step 95;
+# chained.txt: kind V, stamped): tiny frames rendered with
+#   RayTracingViewer --headless --script tests\regress-optix-viewer.txt --frames <folder> --record <file>
+# The graphics driver compiles OptiX's programs, so the kept lines (what the window prints, every frame's SHA-256 and
+# the recording's) carry a stamp, the driver's version and the programs' SHA-256: under the stamp of the last accepted
+# lines a step's lines must equal them, under another they wait for review (RE-VERIFY).
+#
+# 40 frames at 96x54 from rounds of 4x4: OptiX switched on and off on the Cornell box (the window's O, here kernel
+# lines); --optix on sunlit, then the three scenes of glTF models, named by scene lines in the order Tab takes them
+# after sunlit in a session with OptiX (the keys themselves are pressed by tests/window-optix.input, in a window);
+# two other strategies on the triangles (M), a camera move and a pass in progress; a model's file, the bust alone in
+# the photo studio, and a focus on it through OptiX's pick with the lens open (focus-at at the middle of the image,
+# which the bust fills); back to a scene of the books under OptiX, then without it; a mesh scene under kernel auto,
+# which traces with OptiX all the same, and a display chosen on its image. The model files are read once each (gpu_scene
+# keeps the last two models): the bust and the vase, by still-life.
+size 96 54
+strata 4
+seed 0
+# The Cornell box under -p mis (its own strategy, the mixture, isn't OptiX's): the quality kernel, OptiX, then the
+# quality kernel again. The frames are saved from f00000, so f00001 and f00004 are both the quality kernel's image at
+# 16 passes, before and after OptiX, and must be the same bytes
+scene cornell
+sampling mis
+hold 2 +8
+kernel optix
+hold 2 +8
+kernel auto
+hold 1 +16
+# --optix on sunlit, then still-life, the scene Tab takes after it in a session with OptiX: its two models read here
+kernel optix
+sampling scene
+scene sunlit
+hold 2 +8
+scene still-life
+hold 2 +8
+# M twice on the triangles: nee, then material; then the scene's own (mis) again, and a camera move
+sampling nee
+hold 2 +8
+sampling material
+hold 2 +8
+sampling scene
+orbit 4 +4 yaw 30
+# busts (one mesh, three instances) and cornell-bust, there with a pass in progress: 8 passes and the top 20 rows of
+# the ninth, then the image completed to 16
+scene busts
+hold 2 +8
+scene cornell-bust
+hold 2 +8
+frame 8 20 gen 1 size 96 54 lookfrom "278,278,-800" lookat "278,278,0" vfov 40 defocus-angle 0 focus-dist 10
+hold 1 +8
+# A model's file: the marble bust alone in the photo studio (the cache's, not read again); a lens, and the focus on
+# the bust at the image's middle, found by OptiX's pick (the line it prints gives the distance along the ray too)
+scene "assets/models/marble_bust_01/marble_bust_01_1k.gltf"
+hold 2 +8
+camera defocus-angle 3
+focus-at 48 27
+hold 4 +8
+# A scene of the books under OptiX (Tab from a scene that traces with OptiX keeps it, for the books' scenes too), then
+# without OptiX (as O turns it off)
+scene weekend
+hold 2 +8
+kernel auto
+hold 2 +8
+# still-life under kernel auto: its triangle meshes trace with OptiX all the same; then a display of the script's own
+# on OptiX's image, neutral at +1 EV, and AgX at 0 EV again (the scene's own)
+scene still-life
+hold 2 +8
+tonemap neutral
+exposure 1
+hold 2 +8
+tonemap agx
+exposure 0
+hold 3 +8
