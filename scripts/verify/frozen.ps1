@@ -3,7 +3,7 @@
 #   - for each (base, paths) pair below, the files under the paths are byte for byte the base commit's (git diff of the
 #     working tree against the base; an untracked file under a frozen path fails too):
 #       5c2d048 (Step 70): the CPU modules and programs, the books' device headers, display.cu, stb (external/stb), the
-#         SDL3 module (cmake/sdl3.cmake), the CMake presets, the manifest, the README's GIF, its script and its tour;
+#         SDL3 module (cmake/sdl3.cmake), the CMake presets, the manifest;
 #       65f297b (Step 85): every header beyond the books' that the quality and
 #         tone-map kernels compile, the tone maps, the lamp and environment tables, the nine test suites of milestone 4
 #         and the headers and regression lists they share, the HDR environment maps;
@@ -85,9 +85,7 @@ $frozenSets = @(
             "src/gpu/camera.cuh", "src/gpu/constant_medium.cuh", "src/gpu/lights.cuh", "src/gpu/material.cuh",
             "src/gpu/pdf.cuh", "src/gpu/perlin.cuh", "src/gpu/quad.cuh", "src/gpu/random.cuh", "src/gpu/scene.cuh",
             "src/gpu/sphere.cuh", "src/gpu/texture.cuh", "src/gpu/vec3.cuh", "src/gpu/display.cu",
-            "src/gpu/display.cuh", "external/stb", "cmake/sdl3.cmake", "CMakePresets.json", "assets/earthmap.jpg",
-            # Until Step 97 remakes them and moves them to blob pins
-            "docs/viewer.gif", "docs/viewer-tour.txt", "scripts/make-gif.ps1")
+            "src/gpu/display.cuh", "external/stb", "cmake/sdl3.cmake", "CMakePresets.json", "assets/earthmap.jpg")
     },
     @{
         base = "65f297b"; name = "Step 85"
@@ -106,13 +104,16 @@ $frozenSets = @(
 
 # ---- BLOB PINS: (path, git blob SHA-1 of the file as committed) ------------------------------------------------------
 # A step that freezes its own output pins it in its own commit (`git hash-object PATH` after its last edit); this
-# script is pinned nowhere, so writing the ids changes no pinned file. Step 97 adds docs/viewer.gif,
-# docs/viewer-tour.txt and scripts/make-gif.ps1 (taking them out of the Step 70 list above).
+# script is pinned nowhere, so writing the ids changes no pinned file.
 $blobPins = @(
     # Step 87: quality.cu with the one accessor OptiX's programs and the denoiser's guides read the quality kernel's view
     # through (host code: the SASS gate shows quality_kernel unchanged), and that accessor's header
     @{ path = "src/gpu/quality.cu"; blob = "f759c49a631608a432d03d779459a1f699087b31" },
-    @{ path = "src/gpu/quality_access.cuh"; blob = "8b6ac3b37ca7e4d2cfa5dbd2d576e683e5713ff3" }
+    @{ path = "src/gpu/quality_access.cuh"; blob = "8b6ac3b37ca7e4d2cfa5dbd2d576e683e5713ff3" },
+    # Step 98: the README's GIF, remade with OptiX and the denoiser, its tour and the script that makes it
+    @{ path = "docs/viewer.gif"; blob = "7955293cb675489ed89296682c4a3f29c35440f4" },
+    @{ path = "docs/viewer-tour.txt"; blob = "7b52afcd2e9e9af02afb753d975d0edb270f1158" },
+    @{ path = "scripts/make-gif.ps1"; blob = "eb1c71b73f2ab487093158a37260968f157e3496" }
 )
 # ---- end of BLOB PINS ------------------------------------------------------------------------------------------------
 
@@ -142,7 +143,6 @@ $gpuTarget = "gpu_renderer"
 $cudaVariables = '^(CACHE\{)?CMAKE_CUDA(?![A-Za-z0-9])'
 
 # ---- SELF-TEST CASES: each planted alone in the worktree W, which is put back to HEAD after each ---------------------
-# A later step adds its own cases here: Step 97 "a byte of viewer.gif changed" (FAIL).
 # $selfTestPin is pinned at its HEAD blob for the self-test only, to show the pins' mechanism on a file no other rule
 # covers.
 $selfTestPin = "README.md"
@@ -152,6 +152,8 @@ $selfTestCases = @(
        plant = { param($w) Add-LineTo $w "src/gpu/quality.cu" "// planted by frozen.ps1 -SelfTest" } },
     @{ name = "one byte of src/gpu/quality_access.cuh changed (its blob pin)"; expect = "FAIL"
        plant = { param($w) Edit-OneByte $w "src/gpu/quality_access.cuh" } },
+    @{ name = "one byte of docs/viewer.gif changed (its blob pin)"; expect = "FAIL"
+       plant = { param($w) Edit-OneByte $w "docs/viewer.gif" } },
     @{ name = "one byte of $selfTestPin changed (blob-pinned for the self-test)"; expect = "FAIL"
        plant = { param($w) Edit-OneByte $w $selfTestPin } },
     @{ name = "an untracked external/stb/x.h"; expect = "FAIL"

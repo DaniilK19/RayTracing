@@ -12,8 +12,9 @@
 #   3. smoke, RayTracingGPU: five small renders (float64; a strategy; rounds of strata with short launches; the lights
 #      list; the kernel for all three books on a first-book scene), the PFM's and the PNG's bytes, and the Scene, View,
 #      Kernel, mean radiance and rays-traced lines;
-#   4. tour, with -Tour: docs\viewer-tour.txt, the README GIF's script, rendered headless: every frame and the --record
-#      file;
+#   4. tour, with -Tour: until Step 97, docs\viewer-tour.txt, the README GIF's script, rendered headless against the
+#      reference viewer. From Step 98 the tour needs OptiX and the denoiser, which the reference viewer doesn't have: it
+#      is the stamped chained section viewer-tour (part 6), and -Tour only says so;
 #   5. strategies, with -Strategies: tests\window-strategies.input, the window's M, Tab and F2 through the strategies
 #      and the scenes beyond the books. A live window splits its samples over frames by the clock, so two live runs
 #      needn't agree frame for frame: the reference viewer ran the input once in a WINDOW, as its first lines say
@@ -589,12 +590,7 @@ if ($runParts -contains "smoke") {
 # --- 4. The GIF's tour -----------------------------------------------------------------------------------------------
 
 if ($runParts -contains "tour") {
-    $tourLines = Get-ScriptFrames $newViewer "tour" "docs\viewer-tour.txt" (Join-Path $run "tour") `
-        (Join-Path $run "tour-record.txt")
-    $failures += Compare-WithBaseline "window, the GIF's tour (frames and --record)" $tourLines "tour.txt" {
-        Get-ScriptFrames $refViewer "tour (reference)" "docs\viewer-tour.txt" (Join-Path $run "tour-ref") `
-            (Join-Path $run "tour-ref-record.txt")
-    }
+    Write-Output "window, the GIF's tour: the chained section viewer-tour since Step 98 (part 6)"
 }
 
 # --- 6. The chained sections, step to step ---------------------------------------------------------------------------

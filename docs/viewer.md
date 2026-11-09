@@ -4,9 +4,9 @@
 
 `RayTracingViewer` shows any of the GPU programs' scenes in a window, the books' 13 and those [beyond the books](quality.md), rendered by [the CUDA renderer](gpu.md) or [OptiX](optix.md), and glTF models. It refines the image for as long as the camera stands still. The mouse and the keys move the camera, open the lens and focus it, and switch scenes, sampling strategies, precision, tone maps, OptiX and the denoised image. The window renders exactly what `RayTracingGPU` renders: the image it converges to is `RayTracingGPU`'s image of the same view with the same samples, bit for bit, and every frame it shows can be rendered again offline, from a recording or from the command that P prints. With OptiX or the denoiser, both hold on the same graphics driver, which compiles OptiX's programs and carries the denoiser's weights.
 
-![The second book's final scene in RayTracingViewer: the camera orbits the scene, noisy while it moves, and the image refines when it stops; then the focus moves to a glass sphere near the camera and the lens opens, so the scene behind it blurs while the image refines again](viewer.gif)
+![A marble bust and a brass vase in RayTracingViewer: the image starts noisy and turns clean when the denoiser comes on, turns noisy while the camera orbits and clean again when it stops; then the Cornell box with the bust refines from a single sample, denoised](viewer.gif)
 
-*Replayed by `RayTracingViewer` from a camera script ([viewer-tour.txt](viewer-tour.txt)), not captured from the screen. While the camera moves, each frame holds the samples the window renders live in a frame of 1/60 s at this size; while it stands still, each frame adds those it renders in the GIF's 80 ms. So the noise of every frame and the pace of the refining are the live window's, on the machine the [timings](#performance) come from (the orbit itself plays slower than live, at the GIF's 12.5 frames a second).*
+*Replayed by `RayTracingViewer` from a camera script ([viewer-tour.txt](viewer-tour.txt)), not captured from the screen. `still-life` refines from one sample per pixel, and the denoiser comes on (N). A moving view shows the image itself, and a still view is denoised as its samples double; then `cornell-bust`. The samples per frame are the script's, chosen for the picture, and say nothing of the live window's speed. OptiX's frames and the denoiser's depend on the graphics driver.*
 
 - [Running it](#running-it)
 - [Controls](#controls)
@@ -193,30 +193,30 @@ The command names `-p` when a strategy was named (by `-p` or by M), `--fp64`, `-
 **A camera script** says what to render, frame by frame. `--script FILE` plays it in the window, which then takes no keys but Esc, and closes; `--headless --script FILE` renders it without a window, as fast as the GPU goes. One command a line, `#` starts a comment, and settings stay until changed. The GIF above is this script, [viewer-tour.txt](viewer-tour.txt):
 
 ```
-scene final
+scene still-life
 size 960 540
-strata 8
+strata 4
 seed 0
-hold 1 +40                     # the scene's own view: 0.8 s of refining
-hold 1 +32
-hold 1 +40
-hold 7 +65
-orbit 20 +6 yaw 35             # 1.6 s: an orbit around the point looked at, eased in and out, every frame a new view
-hold 1 +40                     # still: refining to 1024 samples (from the orbit's last 6)
-hold 1 +32
-hold 1 +40
-hold 13 +65
-hold 1 +61
-focus-at 513 412               # a double-click on the glass sphere in front...
-camera defocus-angle 1.5       # ...and the lens open: the scene behind it blurs, refining to 1024 again
-hold 1 +40
-hold 1 +32
-hold 1 +40
-hold 14 +65
+hold 10 +1                     # a sample per pixel more each frame: the image itself, noisy
+denoise on                     # the window's N
+hold 1 +6                      # 16 samples, denoised at once
+hold 12 +4                     # refining to 64: denoised again at the doublings, 32 and 64
+orbit 16 +8 yaw 20             # a moving view shows the image itself, every frame a new view
+hold 1 +8                      # still again: denoised at its first frame, 16 samples
+hold 12 +4                     # and at 32 and 64
+scene cornell-bust             # Tab, in a window
+hold 1 +1                      # denoised at every doubling, from a single sample
+hold 1 +1
 hold 1 +2
+hold 1 +4
+hold 1 +8
+hold 1 +16
+hold 1 +32
+hold 1 +64
+hold 1 +128                    # 256 samples: the frame the GIF ends on
 ```
 
-`hold F +N` shows F frames of the view as it is, each N samples more than the one before; the tour's first frames after a change add fewer, as the window does in the 150 ms it counts a view as moving. The moves are `orbit F +N yaw D [pitch D]`, `look F +N yaw D [pitch D]`, `pan F +N dx X [dy Y]`, `dolly F +N factor X` and `zoom F +N factor X` (or `notches Y` for either, the wheel's own steps): F frames, eased in and out, every frame a new view with N samples. They call the same functions as the mouse and the keys (`viewer_camera.ixx`), so a script moves the camera exactly as the hand does. `camera` sets any of `lookfrom "X,Y,Z"`, `lookat "X,Y,Z"`, `vfov`, `defocus-angle` and `focus-dist`; `focus-at X Y` focuses as a double-click on that pixel does. The other settings are `precision float|double`, `sampling NAME|scene` (a strategy's name, or the scene's own), `kernel auto|all-books|quality|optix`, `denoise on|off`, and the display: `tonemap NAME` (`books`, `none`, `agx` or `neutral`) and `exposure EV` (from −24 to 24). The display doesn't change the image, so a frame after a `tonemap` line may show the samples of the frame before through it. Without these two lines each scene shows its own display; once one is given, it holds for every scene, as the window's keys hold, and under `books` an exposure waits for a tone map. A script that asks for a tone map other than `books` in `double` is refused, before that frame renders. `scene` takes a model's file, quoted (`scene "assets\models\marble_bust_01\marble_bust_01_1k.gltf"`). Under `denoise on`, a hold's frames are denoised as a still view is, at its first frame and at the doublings of its passes (a script has no "done", so a hold's last frame shows the last doubling's denoise unless it lands on one); a move's frames are the image itself. A script ends with a frame: lines after its last `hold`, move or `frame` would render nothing, and are an error.
+`hold F +N` shows F frames of the view as it is, each N samples more than the one before. The moves are `orbit F +N yaw D [pitch D]`, `look F +N yaw D [pitch D]`, `pan F +N dx X [dy Y]`, `dolly F +N factor X` and `zoom F +N factor X` (or `notches Y` for either, the wheel's own steps): F frames, eased in and out, every frame a new view with N samples. They call the same functions as the mouse and the keys (`viewer_camera.ixx`), so a script moves the camera exactly as the hand does. `camera` sets any of `lookfrom "X,Y,Z"`, `lookat "X,Y,Z"`, `vfov`, `defocus-angle` and `focus-dist`; `focus-at X Y` focuses as a double-click on that pixel does. The other settings are `precision float|double`, `sampling NAME|scene` (a strategy's name, or the scene's own), `kernel auto|all-books|quality|optix`, `denoise on|off`, and the display: `tonemap NAME` (`books`, `none`, `agx` or `neutral`) and `exposure EV` (from −24 to 24). The display doesn't change the image, so a frame after a `tonemap` line may show the samples of the frame before through it. Without these two lines each scene shows its own display; once one is given, it holds for every scene, as the window's keys hold, and under `books` an exposure waits for a tone map. A script that asks for a tone map other than `books` in `double` is refused, before that frame renders. `scene` takes a model's file, quoted (`scene "assets\models\marble_bust_01\marble_bust_01_1k.gltf"`). Under `denoise on`, a hold's frames are denoised as a still view is, at its first frame and at the doublings of its passes (a script has no "done", so a hold's last frame shows the last doubling's denoise unless it lands on one); a move's frames are the image itself. A script ends with a frame: lines after its last `hold`, move or `frame` would render nothing, and are an error.
 
 **A recording.** `--record FILE` writes every frame the window shows with new samples or a new display as a `frame` line: the view, its size, how many passes and rows of the next pass it had, and a number for the view. The settings come first, and again whenever they change; the display's `tonemap` and `exposure` lines come before the frame they apply to (a recording of the books' scenes that never leaves their bytes has none, and stays as it was). A frame shown again through a new display is a `frame` line with the same passes and the same number. A recording writes `denoise on|off` only once N was used, or with `--denoise` or a script's `denoise` line, and marks each frame it denoised with a last word, `denoised`; a replay denoises exactly the marked frames, whatever the clock decided live. `--headless --script FILE` renders a recording again, frame by frame, bit for bit (with OptiX or the denoiser, on the same graphics driver): a session of the live window, cut into frames by the moments a user moved the mouse, gives the same images as a session rendering straight to each frame's samples.
 
@@ -254,7 +254,7 @@ The window was verified as the GPU renderer was, bit for bit wherever the bits a
 powershell -ExecutionPolicy Bypass -File scripts\make-gif.ps1
 ```
 
-After an x64-release build, the script renders the tour with `RayTracingViewer --headless --script docs\viewer-tour.txt --frames <folder>`, which saves every frame as a PNG; the script then holds the last frame for 2 seconds and writes `docs\viewer.gif` with [gifski](https://gif.ski) (`scoop install gifski`; an external program, run but not part of the project) at 12.5 frames a second, 960×540. Both steps are deterministic, so the same viewer and gifski 1.34.0 make the same file, byte for byte. The tour's samples per frame are the window's own, measured with `--stats` at this size: a moving frame's median, what a still view adds in 80 ms, and the smaller steps of the 150 ms after a change. To keep the GIF under 8 MiB, the orbit takes 20 frames and gifski runs at quality 80 and motion quality 70.
+After an x64-release build, the script renders the tour with `RayTracingViewer --headless --script docs\viewer-tour.txt --frames <folder>`, which saves every frame as a PNG; the script then holds the last frame for 2 seconds and writes `docs\viewer.gif` with [gifski](https://gif.ski) (`scoop install gifski`; an external program, run but not part of the project) at 12.5 frames a second, 960×540. The same frames and gifski 1.34.0 make the same file, byte for byte; the frames of OptiX and the denoiser depend on the graphics driver. `-Frames <folder>` encodes frames rendered before instead. gifski runs at quality 100, since lower qualities leave blotches of the frame before, and the GIF stays under 8 MiB.
 
 ## Limits
 

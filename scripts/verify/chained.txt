@@ -40,3 +40,6 @@ regress-optix-viewer|V|tests/regress-optix-viewer.txt|yes|none
 # re-toning the kept floats, on the quality kernel, OptiX and the first book's kernel, stamped like regress-optix (the
 # denoiser's weights come with the graphics driver)
 regress-denoise-viewer|V|tests/regress-denoise-viewer.txt|yes|none
+# The README GIF's tour (from Step 98): its frames need OptiX and the denoiser, which the reference viewer doesn't have,
+# so it is chained and stamped like them instead of compared with the reference (hostgate's part 4 until Step 97)
+viewer-tour|V|docs/viewer-tour.txt|yes|none
