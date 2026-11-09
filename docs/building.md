@@ -4,6 +4,7 @@
 
 - [Requirements](#requirements)
 - [SDL3 for the window](#sdl3-for-the-window)
+- [OptiX](#optix)
 - [Building](#building)
 - [RayTracing options](#raytracing-options)
 - [Render times](#render-times)
@@ -15,7 +16,7 @@
 
 ## Requirements
 
-Visual Studio 2026 with the "Desktop development with C++" workload, which brings the MSVC compiler, CMake and Ninja. `RayTracingGPU`, `RayTracingViewer` and `GpuTests` also need an NVIDIA graphics card and the CUDA Toolkit 13; see [the CUDA renderer](gpu.md#building-and-running). `RayTracingViewer` also needs SDL3, which CMake downloads. The two HDR photographs that light the scenes beyond the books are in the repository ([the environment maps](#the-environment-maps)).
+Visual Studio 2026 with the "Desktop development with C++" workload, which brings the MSVC compiler, CMake and Ninja. `RayTracingGPU`, `RayTracingViewer` and `GpuTests` also need an NVIDIA graphics card and the CUDA Toolkit 13; see [the CUDA renderer](gpu.md#building-and-running). `RayTracingViewer` also needs SDL3, which CMake downloads. `--optix`, the triangle meshes and the denoiser need nothing installed but a graphics driver for CUDA 13.4 or newer: CMake downloads OptiX's headers ([OptiX](#optix)). The two HDR photographs that light the scenes beyond the books are in the repository ([the environment maps](#the-environment-maps)), and so are the two glTF models.
 
 ## SDL3 for the window
 
@@ -29,9 +30,21 @@ cmake --preset x64-release -DFETCHCONTENT_SOURCE_DIR_SDL3=C:/src/SDL3-3.4.18
 cmake --preset x64-release -DRAYTRACING_VIEWER=OFF
 ```
 
+## OptiX
+
+`--optix`, the triangle meshes and the denoiser use [NVIDIA OptiX 9.0](https://github.com/NVIDIA/optix-dev), as headers only. The runtime is the graphics driver's, so the programs link nothing and ship nothing of it; they need a driver for CUDA 13.4 or newer, because the device programs are compiled with CUDA 13.4 and the driver compiles them again for the GPU. The first configure downloads NVIDIA's `optix-dev` archive into `out/downloads`, as for SDL3, and checks its SHA-256. The headers come under NVIDIA's licenses (the archive's `LICENSE.txt`: NVIDIA's SDK license, and, header by header, a proprietary license or BSD-3, named in `license_info.txt` and in each header's first comment), and nothing of them is in the repository. OptiX 9.0 is pinned, rather than the newest 9.x, because CUDA 13.4's compute-sanitizer checks OptiX up to 9.0.
+
+A download that fails never stops the configure: CMake warns that it left out OptiX, and everything else builds, with `--optix`, `--denoise` and the mesh scenes refused with "this build has no OptiX". There are three ways round it, which the warning names:
+
+```
+cmake --preset x64-release -DRAYTRACING_OPTIX_URL=file:///C:/Downloads/optix-dev-9.0.0.tar.gz
+cmake --preset x64-release -DOptiX_INSTALL_DIR=C:/ProgramData/NVIDIA/OptiX-SDK-9.0.0
+cmake --preset x64-release -DRAYTRACING_OPTIX=OFF
+```
+
 ## Building
 
-**In Visual Studio:** open the project folder, select the `x64 Release` preset and the `RayTracing.exe` startup item, and press Ctrl+F5. The program renders the `final` scene, its default, and prints the path to the finished image. The `MonteCarlo.exe` startup item runs the Monte Carlo experiments, `ImageCompare.exe` compares two renders, and `PfmStats.exe` measures them ([tests](#tests)). `RayTracingGPU.exe`, `RayTracingViewer.exe` and `GpuTests.exe` are there if the CUDA Toolkit is installed.
+**In Visual Studio:** open the project folder, select the `x64 Release` preset and the `RayTracing.exe` startup item, and press Ctrl+F5. The program renders the `final` scene, its default, and prints the path to the finished image. The `MonteCarlo.exe` startup item runs the Monte Carlo experiments, `ImageCompare.exe` compares two renders, `PfmStats.exe` measures them, and `MeshTests.exe` tests the model loader ([tests](#tests)). `RayTracingGPU.exe`, `RayTracingViewer.exe` and `GpuTests.exe` are there if the CUDA Toolkit is installed.
 
 To pass options when launching from Visual Studio, open **Debug → Debug and Launch Settings for RayTracing** and add `"args": ["cornell", "-s", "100"]` to the configuration.
 
@@ -119,7 +132,7 @@ The 13 scenes as the CPU renderer draws them, 480 pixels wide. The scene name is
 
 ## Scenes beyond the books
 
-The GPU programs render nine more scenes, which the CPU renderer doesn't have: four that show the [light and materials beyond the books](quality.md), and five that test the renderers. The help of both programs lists each group under its own heading, after the books' scenes. The four render with the quality kernel, in `float`, and open with their own strategy and display: `RayTracingGPU studio` renders `studio` with `-p mis`, multiple importance sampling, and AgX tone mapping, where the books' scenes have the mixture or the material's sampling and the books' bytes.
+The GPU programs render nineteen more scenes, which the CPU renderer doesn't have: four that show the [light and materials beyond the books](quality.md), three with triangle meshes that [OptiX](optix.md) renders, and twelve that test the renderers. The help of both programs lists each group under its own heading, after the books' scenes. The four render with the quality kernel, in `float`, and open with their own strategy and display: `RayTracingGPU studio` renders `studio` with `-p mis`, multiple importance sampling, and AgX tone mapping, where the books' scenes have the mixture or the material's sampling and the books' bytes.
 
 | | |
 |---|---|
@@ -130,6 +143,8 @@ The GPU programs render nine more scenes, which the CPU renderer doesn't have: f
 
 Each of the four is 1920×1080 by default (`cornell-ggx` 1080×1080, the Cornell box's square), with 1024 rays per pixel, and opens with `-p mis` and AgX: at 0 EV in `cornell-ggx` and `studio`, −1 EV in `veach` and −0.5 EV in `sunlit`. The rough metals and the glossy coats are GGX microfacet materials ([rough metals and glossy coats](quality.md#rough-metals-and-glossy-coats)), and `studio` and `sunlit` are lit by an HDR photograph of real surroundings instead of the books' sky.
 
+`still-life` (a marble bust and a brass vase in the photo studio), `busts` (three instances of the bust in the sun) and `cornell-bust` (the Cornell box with the bust) are triangle meshes from two glTF models, so OptiX renders them, without `--optix`; a model's file works in their place ([glTF models](optix.md#gltf-models-and-their-materials)). The models are committed in `assets/models`, from [Poly Haven](https://polyhaven.com), CC0, as published.
+
 The test scenes are checks, each made so that a renderer that loses or adds light shows it:
 
 | Scene | What it checks |
@@ -139,6 +154,10 @@ The test scenes are checks, each made so that a renderer that loses or adds ligh
 | `gloss-furnace` | white matte spheres under four glossy coats, under a white sky: the light each keeps |
 | `env-furnace` | the white sphere under a white environment map instead of a sky: every pixel exactly 1.0 again under `-p material` |
 | `sun-test` | matte spheres in the sunlight of `sunlit`'s sky, nothing but matte surfaces: `-p nee` against `-p mis`, a check of the light samples |
+| `cornell-triangles` | the Cornell box with its walls and blocks as 34 triangles, its lamp still a quad: `cornell`'s image again, under OptiX |
+| `mesh-furnace`, `mesh-furnace-smooth` | white icospheres of triangles under a white sky: every pixel exactly 1.0 with flat normals, and with smooth normals the light their silhouettes lose |
+| `instances`, `instances-baked` | one mesh placed four times, turned, stretched and mirrored, and the same four moved into the world on the CPU: the instance transforms, against their reference |
+| `pbr-test`, `pbr-reference` | spheres of triangles in glTF's metallic-roughness materials, one of them textured, and the same spheres in the scene materials they map to |
 
 ### The environment maps
 
@@ -153,11 +172,12 @@ The programs read them with stb_image, as linear radiance, and take maps of at m
 
 ## The other programs
 
-- **`RayTracingGPU`** takes the same options, with the [scenes beyond the books](#scenes-beyond-the-books) and two more strategies, and adds the image's height and the camera (`--height`, `--lookfrom`, `--lookat`, `--vfov`, `--defocus-angle`, `--focus-dist`), `--strata`, `--fp64`, `--all-books-kernel`, `--quality-kernel`, `--tonemap`, `--exposure` and `--launch-ms`; see [the CUDA renderer](gpu.md#building-and-running) and [its options beyond the books](#raytracinggpus-options-beyond-the-books).
-- **`RayTracingViewer`** shows a scene in a window and refines it while the camera stands still, with `RayTracingGPU`'s options for the scene, the size, the camera, the sampling, the precision and the display; see [the viewer](viewer.md).
+- **`RayTracingGPU`** takes the same options, with the [scenes beyond the books](#scenes-beyond-the-books) and two more strategies, and adds the image's height and the camera (`--height`, `--lookfrom`, `--lookat`, `--vfov`, `--defocus-angle`, `--focus-dist`), `--strata`, `--fp64`, `--all-books-kernel`, `--quality-kernel`, `--optix`, `--denoise`, `--tonemap`, `--exposure` and `--launch-ms`; see [the CUDA renderer](gpu.md#building-and-running) and [its options beyond the books](#raytracinggpus-options-beyond-the-books).
+- **`RayTracingViewer`** shows a scene or a glTF model in a window and refines it while the camera stands still, with `RayTracingGPU`'s options for the scene, the size, the camera, the sampling, the precision, OptiX, the denoiser and the display; see [the viewer](viewer.md).
 - **`ImageCompare A.pfm B.pfm`** tests whether two renders are the same picture up to noise; see [ImageCompare](image-compare.md).
 - **`PfmStats`** gives the numbers about renders that ImageCompare doesn't: the noise of one render, the RMS rule for two strategies, a patch's mean against a value, values exactly equal to a number, identical floats; see [tests](#tests) and [PfmStats](image-compare.md#pfmstats).
-- **`GpuTests`** tests the GPU renderer's device functions on the GPU: its samplers, densities and estimators; see [tests](#tests).
+- **`GpuTests`** tests the GPU renderer's device functions on the GPU: its samplers, densities and estimators, and OptiX's hits and programs; see [tests](#tests).
+- **`MeshTests`** tests the glTF loader and the generated meshes, with no GPU; see [tests](#tests).
 - **`MonteCarlo [experiment...]`** runs the third book's numerical experiments; see [the MonteCarlo program](sampling.md#the-montecarlo-program).
 
 ### RayTracingGPU's options beyond the books
@@ -168,6 +188,8 @@ The programs read them with stb_image, as linear radiance, and take maps of at m
 | `-p mis` | shadow rays and the material's own samples, weighed by multiple importance sampling: low noise. The default of the scenes beyond the books |
 | `--quality-kernel` | render with the quality kernel, the third one, also the books' scenes under `-p material`: a check, the same image within its noise |
 | `--all-books-kernel` | render the first book's scenes with the kernel for all three books: a check, the same image bit for bit |
+| `--optix` | trace with OptiX: the quality kernel's integrator in an OptiX program, in `float`, under `-p material`, `nee` or `mis`; the scenes with triangle meshes always use it ([OptiX](optix.md)) |
+| `--denoise` | also write each image denoised by OptiX's AI denoiser, as `NAME-denoised.png` or `.pfm`: biased, for the eye; the plain images stay as rendered ([the denoiser](optix.md#the-denoiser)) |
 | `--tonemap NAME` | the PNG's display transform: `books` (the books' square root, clamped: their scenes' default), `none` (the sRGB curve, clipped), `agx` (the default of the scenes beyond the books) or `neutral` (Khronos PBR Neutral); a `.pfm` stays linear |
 | `--exposure EV` | the light times 2^EV before the tone map, from −24 to 24 (default 0, or the scene's); not with `books` |
 
@@ -183,15 +205,15 @@ The program prints, besides [the lines RayTracing prints](#raytracing-options) a
 ctest --test-dir out\build\x64-release
 ```
 
-They are two: PfmStats' check of its own arithmetic (`PfmStats self-test`), and GpuTests' quick run (`GpuTests all --quick`), every test kernel on a few samples with the statistical verdicts skipped. On a computer without an NVIDIA graphics card GpuTests exits with 77, which ctest reports as skipped. The full statistical runs, the renders and [the verification scripts](#the-verification-scripts) are run by hand.
+They are three: PfmStats' check of its own arithmetic (`PfmStats self-test`), the model loader's and the generated meshes' tests (`MeshTests`, with no GPU), and GpuTests' quick run (`GpuTests all --quick`), every test kernel on a few samples with the statistical verdicts skipped. On a computer without an NVIDIA graphics card GpuTests exits with 77, which ctest reports as skipped. The full statistical runs, the renders and [the verification scripts](#the-verification-scripts) are run by hand.
 
 **`GpuTests`** tests the GPU renderer's device functions on the GPU: the samplers draw what their densities say, the densities integrate to 1, the estimators converge to known values. The suites of the features beyond the books check them against their written specifications, with references of their own rather than copies of the code they test.
 
 ```
-GpuTests [all | SUITE...] [--quick] [--list] [--write FILE] [--check FILE]
+GpuTests [all | SUITE...] [--quick] [--list] [--require-optix] [--exclude S1,S2,...] [--write FILE] [--check FILE]
 ```
 
-The suites are in the files `tests/*_tests.cu`, three of which hold two (`lamps` and `media` in `lamp_tests.cu`, `ggx` and `ggx-energy` in `ggx_tests.cu`, `env-map` and `env-sampling` in `env_tests.cu`), and `GpuTests --list` names the suites and their tests:
+The suites are in the files `tests/*_tests.cu`, several of which hold more than one (`lamps` and `media` in `lamp_tests.cu`, `ggx` and `ggx-energy` in `ggx_tests.cu`, `env-map` and `env-sampling` in `env_tests.cu`, OptiX's in `optix_tests.cu`, `mesh_gpu_tests.cu` and `denoise_tests.cu`), and `GpuTests --list` names the suites and their tests:
 
 | Suite | What it tests |
 |---|---|
@@ -204,6 +226,16 @@ The suites are in the files `tests/*_tests.cu`, three of which hold two (`lamps`
 | `routing` | which kernel a render takes, and what it refuses |
 | `services` | the test programs' own tools |
 | `tone` | the tone maps, the dither and the bytes, against references in `double` |
+| `denoise`, `denoise-eval` | the denoiser: the bands of its input, a synthetic image's error, a tiled denoise against one invoke, the session's re-tones and refusals; and the images of its evaluation |
+| `guides` | the denoiser's albedo and normal guides, material by material, and OptiX's against CUDA's |
+| `mesh-cache` | the model cache of the GPU programs: what two builds share, and a second model's materials |
+| `optix-pbr` | glTF's materials on triangles: the mapping, the lobe draw, the texture objects, the refusals |
+| `optix-render` | the same seed through OptiX and the quality kernel on the 22 scenes, the furnaces, determinism and the refusals |
+| `optix-runtime` | OptiX's start, its compile, a launch's indices, the tracing limits |
+| `optix-sessions` | sessions made and destroyed in turn, with no GPU memory lost |
+| `optix-tracer` | the two tracers' answers, ray by ray on the 22 scenes without meshes, and planted faults |
+| `optix-triangles` | triangle hits against brute force in `double`, the offset of a ray's origin, baked meshes against their instances, closed shapes seen from inside, the refusals |
+| `skip` | the harness's own example of a check that can't run here: one SKIP, which passes, and which no option turns into a failure (an OptiX check's SKIP fails under `--require-optix`) |
 
 Each check prints a line: its estimate, the expected value, the statistic and its limit, and PASS, FAIL or SKIP. A Monte Carlo mean must be within 4 standard errors of its exact value; Pearson's χ² test of drawn samples against a density needs a p-value of at least 1 − 0.99^(1/T) for the suite's T tests, so that a suite fails by chance in at most 1 run of 100; a test on samples wrong on purpose must reject them below p = 10⁻⁶; an exact identity must hold within a tolerance; and events that mustn't happen, a NaN or a draw of zero density, are counted. `--quick` runs every kernel on at most 10⁴ samples per check, for CUDA's memory checker, and skips the statistical verdicts. `--write` and `--check` give a suite a file: `GpuTests ggx-energy --check src\gpu\ggx_energy.cuh` computes the rough metals' energy table again and compares it with the committed file, and `--write` writes it. The exit code: 0 every check passes, 1 a check fails, 2 an error, 77 no CUDA device.
 
@@ -222,16 +254,19 @@ PfmStats self-test
 
 ## The verification scripts
 
-`scripts/verify/` holds the scripts that checked the fourth GPU milestone (`gpu-4`) while it was built ([how it was verified](quality.md#how-it-was-verified)). They keep their state, the reference renders, the builds they compare with and a log of the GPU's time, in `out\m4\`, under the builds' folder `out`, which the repository doesn't hold, so they record how the checks were made more than they run on a fresh checkout. The first lines of each say what it does and how to call it.
+`scripts/verify/` holds the scripts that checked the fourth and fifth GPU milestones (`gpu-4` and `gpu-5`) while they were built ([the fourth](quality.md#how-it-was-verified), [the fifth](optix.md#how-it-was-verified)). They keep their state, the reference renders, the builds they compare with and a log of the GPU's time, in `out\m5\`, under the builds' folder `out`, which the repository doesn't hold, so they record how the checks were made more than they run on a fresh checkout. The first lines of each say what it does and how to call it.
 
 | Script | What it does |
 |---|---|
-| `frozen.ps1` | gate F: the files the books' kernels, the display kernel and the CPU programs are built from are unchanged since `gpu-3`; it renders nothing |
-| `sassgate.sh` | the books' four render kernels and the display kernel of a new build are the same machine code as at `gpu-3`, instruction for instruction and in their constants, read with cuobjdump; nothing runs on the GPU |
-| `hostgate.ps1` | the GPU programs' host code behaves as before: what the command lines of `cli-cases.txt` print (with the window scripts in `cli-scripts\`), the window's frames of `tests\regress-viewer.txt` and `tests\regress-tone.txt`, five small renders and the README GIF's tour, against the previous build's |
+| `frozen.ps1` | gate F: the files the books' kernels, the display kernel and the CPU programs are built from are unchanged since `gpu-3`, and the quality kernel's since `gpu-4`, with a few files pinned by their git blobs; the CMake rules reach neither the CPU programs nor the renderer's existing translation units; it renders nothing |
+| `sassgate.sh` | with `--all`, every function of the base build's `RayTracingGPU`, `RayTracingViewer` and `GpuTests` is in a new build as the same machine code, instruction for instruction and in its constants, read with cuobjdump; nothing runs on the GPU |
+| `irgate.ps1` | OptiX's device programs: the hashes and a cleaned diff of their PTX, no source path in them, and a Debug build's PTX equal to Release's |
+| `hostgate.ps1` | the GPU programs' host code behaves as before: what the command lines of `cli-cases.txt` print (with the window scripts in `cli-scripts\`), the window's frames of `tests\regress-viewer.txt` and `tests\regress-tone.txt`, the window's recorded sessions, five small renders and the README GIF's tour, against the previous build's; OptiX's sections carry a stamp of the driver and the programs |
 | `compare.ps1` | the ImageCompare protocol for two strategies or two kernels: two seeds each, a control of each with itself, two cross-seed tests and the RMS rule ([comparing two strategies](image-compare.md#comparing-two-strategies)) |
 | `carry.ps1` | configurations once verified statistically still render the same bytes, so their verification carries forward |
-| `references.ps1` | the references of the statistical checks, rendered once by the `gpu-3` build: `cornell`, `light` and `final` under `material` and `mixture`, and all 13 scenes under `material` |
-| `sanitize.ps1` | CUDA's memory checker, compute-sanitizer, with memcheck and initcheck, on a tiny render or `GpuTests --quick` |
+| `references.ps1` | the references of the statistical checks, rendered once by the previous milestone's build: at `gpu-5`, the quality kernel's references for the protocols and the denoiser's evaluation |
+| `denoise.ps1` | the denoiser's evaluation: its images rendered and denoised, then judged against the references by `PfmStats error` |
+| `optix-reverify.ps1` | the statistical checks to run again after a graphics driver update, which can change OptiX's and the denoiser's bytes |
+| `sanitize.ps1` | CUDA's memory checker, compute-sanitizer, with memcheck and initcheck and OptiX's own checks, on a tiny render or `GpuTests --quick` |
 | `gpu.ps1` | the one queue for builds and GPU work: one job at a time, each logged with its time, within a budget of GPU time |
 | `docs.ps1` | the documentation: no dead link or anchor (to a file git keeps, with its case), no hardware named, no speed or time figure that the page didn't have at `gpu-3`, and the first `RayTracingGPU` command of each page runs |

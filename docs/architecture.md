@@ -52,7 +52,7 @@ The CPU renderer implements the techniques of [the three books](#third-party-cod
   - `RayTracingViewer` shows any scene in an SDL3 window and refines it while the camera stands still, through a rendering session that keeps the scene on the GPU and adds samples pass by pass;
   - rounds of strata: grid after grid of stratified samples, each with random numbers of its own, so a render can have any number of samples, and `RayTracingGPU --strata K -s N` renders the same ones;
   - camera control with the mouse and the keys (orbit, look, pan, dolly, fly, zoom), the lens and click-to-focus, scene and precision switches, the numbers and the help on screen;
-  - every frame it shows can be rendered again, bit for bit: by `RayTracingGPU` from the command P prints, or by the viewer itself without a window from a recording;
+  - every frame it shows can be rendered again, bit for bit (with OptiX or the denoiser, on the same graphics driver): by `RayTracingGPU` from the command P prints, or by the viewer itself without a window from a recording;
   - frames paced to the display while the camera moves and 50 ms of GPU work each while it stands still; waits for the GPU that sleep, so the CPU stays nearly idle;
   - camera scripts and scripted input, which make the window's behavior testable: a recording of a live window driven by scripted events, replayed without a window, gives the same frames.
 - **Light and materials beyond the books,** in a third CUDA kernel, in `float`, beside the books' two, which stay unchanged, instruction for instruction ([details](quality.md)):
@@ -62,14 +62,21 @@ The CPU renderer implements the techniques of [the three books](#third-party-cod
   - HDR photographs of the surroundings as the sky, sampled by their brightness with an alias table over cells of exact solid angle, so that a sun of a few texels is found by shadow rays rather than by chance ([how](quality.md#the-environment-map));
   - tone mapping on the GPU, in a kernel of its own that serves every scene: AgX, Khronos PBR Neutral or the plain sRGB curve, with an exposure and a dither, for the PNGs and the window; the books' scenes keep the books' bytes by default, and PFM files stay linear ([how](quality.md#tone-mapping));
   - four scenes of its own, `cornell-ggx`, `veach`, `studio` and `sunlit`, and test scenes: white furnaces, where every pixel must come out exactly 1, or as much light as a material keeps, and `sun-test`, matte spheres in the sun, where `-p nee` and `-p mis` must agree.
+- **OptiX, meshes and a denoiser,** around the same integrator ([details](optix.md)):
+  - the quality kernel's integrator as an OptiX program: a second `tracer`, its own hierarchy built by OptiX on the GPU, traversed on the ray tracing cores where the GPU has them, with no closest-hit program;
+  - the books' spheres and quads as custom primitives, through intersection programs that apply the books' own rules; statistically the quality kernel's images, and the same hits ray by ray;
+  - triangle meshes, intersected in hardware on GPUs with ray tracing cores, a hierarchy per mesh under one of instances, rays that leave a triangle moved off it, and an absorber for those that would go through;
+  - glTF 2.0 models read with cgltf, glTF's metallic-roughness materials mapped texel by texel on the GGX metal and the glossy coat, their textures read by the texture hardware;
+  - OptiX's AI denoiser with albedo and normal guides from a pass of their own, for what you look at only; its error measured against references.
 - **A verification toolkit,** committed with the code ([how it was used](quality.md#how-it-was-verified)):
   - `GpuTests` runs numerical tests of the GPU renderer's own device functions on the GPU, with fixed seeds: Pearson's χ² of the samplers' draws against their densities, Monte Carlo means against closed forms, Veach's conditions on the weights, the tables against their definitions, and planted faults that the same checks must reject. `ctest` runs every test kernel on a few samples, and skips them on a computer without an NVIDIA GPU;
-  - `PfmStats` gives the numbers about renders that `ImageCompare` doesn't: the noise of one render from two seeds, the RMS rule for two strategies of unequal noise, a patch's mean against a value, how many values are exactly 1, and whether two renders are the same bytes;
+  - `MeshTests`, with no GPU, tests the glTF loader and the generated meshes: glTF files built in the test, every limit and refusal;
+  - `PfmStats` gives the numbers about renders that `ImageCompare` doesn't: the noise of one render from two seeds, the RMS rule for two strategies of unequal noise, a patch's mean against a value, how many values are exactly 1, whether two renders are the same bytes, and the error of a denoised image against references;
   - the scripts in `scripts/verify` prove the books' kernels unchanged by their sources and their machine code (disassembled by `cuobjdump`), without rendering them, and the programs' host behavior by small renders and replays of the window ([the gates](gpu.md#the-books-kernels-unchanged)); they also run `ImageCompare`'s protocol for two strategies and compute-sanitizer's memory checks, every GPU run through one queue that logs it.
 
 ## Library and programs
 
-Each `.ixx` file in `src/` is a C++20 module (`export module ...`) or a [partition](#modern-c) of one. Twenty of them are compiled once into a static library, `raytracer`, and every program links it. The CUDA renderer is a separate static library, `gpu_renderer`, compiled by `nvcc`, and `gpu_scene` is a library of eight module files shared by the GPU programs: `gpu_scene`, which translates a scene for the renderer; `gpu_scenes` with its three partitions, the programs' own list of scenes; `strategy_options`, their sampling strategies; and `view_options` and `tone_options`, the camera's and the display's options. These, `RayTracingGPU`, `RayTracingViewer` and `GpuTests` are built only when CMake finds the CUDA Toolkit; the viewer also needs SDL3, which CMake downloads ([building](building.md#sdl3-for-the-window)).
+Each `.ixx` file in `src/` is a C++20 module (`export module ...`) or a [partition](#modern-c) of one. Twenty of them are compiled once into a static library, `raytracer`, and every program links it. The CUDA renderer is a separate static library, `gpu_renderer`, compiled by `nvcc`, and `gpu_scene` is a library of nine module files shared by the GPU programs: `gpu_scene`, which translates a scene for the renderer; `gpu_scenes` with its four partitions, the programs' own list of scenes; `strategy_options`, their sampling strategies; and `view_options` and `tone_options`, the camera's and the display's options. A third library, `mesh_io`, holds the model loader (`meshes` and `gltf`), with no CUDA, so it and its tests build on any computer. `gpu_renderer` and the libraries above it, `RayTracingGPU`, `RayTracingViewer` and `GpuTests` are built only when CMake finds the CUDA Toolkit; the viewer also needs SDL3, which CMake downloads ([building](building.md#sdl3-for-the-window)), and OptiX comes in as headers, which it downloads too ([building](building.md#optix)).
 
 ```mermaid
 flowchart LR
@@ -86,6 +93,8 @@ flowchart LR
     cu --> vw
     cu --> gt
     sdl["SDL3, downloaded and built as a static library"] --> vw
+    mi["mesh_io: glTF models and meshes made in code"] --> gs
+    mi --> mt["MeshTests: the loader's tests, with no GPU"]
 ```
 
 | Program | Source | What it does |
@@ -95,8 +104,9 @@ flowchart LR
 | `RayTracingViewer` | `main_viewer.cpp` | shows a scene in a window and refines it on the GPU while the camera stands still; the window's events, frames, keys, scripts and recordings |
 | `ImageCompare` | `image_compare.cpp` | are two renders the same picture up to noise? |
 | `MonteCarlo` | `monte_carlo.cpp` | the third book's numerical experiments, with the renderer's own random numbers, directions and densities, and a test of the light sampling |
-| `GpuTests` | `tests/gpu_tests.cpp`, `tests/*_tests.cu` | numerical tests of the GPU renderer's own device functions, run on the GPU with fixed seeds, in 12 suites |
-| `PfmStats` | `tests/pfm_stats.cpp` | the numbers about renders that `ImageCompare` doesn't give: the noise of one render, the RMS rule, exact values, identical bytes |
+| `GpuTests` | `tests/gpu_tests.cpp`, `tests/*_tests.cu`, `tests/mesh_gpu_tests.cu` | numerical tests of the GPU renderer's own device functions and OptiX's programs, run on the GPU with fixed seeds |
+| `MeshTests` | `tests/mesh_tests.cpp` | the glTF loader and the generated meshes, with no GPU |
+| `PfmStats` | `tests/pfm_stats.cpp` | the numbers about renders that `ImageCompare` doesn't give: the noise of one render, the RMS rule, exact values, identical bytes, a denoised image's error |
 
 ## Modules
 
@@ -132,15 +142,23 @@ The GPU programs' own modules:
 | `gpu_scenes:parts` (`gpu_scene_parts.ixx`) | the list's types: a scene as the CPU's objects and camera, plus what the CPU's classes can't describe (GGX side entries found by their placeholder material's address, an environment map with its turn and scale) |
 | `gpu_scenes:materials` (`gpu_scenes_materials.ixx`) | the scenes of rough metals and glossy coats: `ggx-furnace`, `gloss-furnace`, `cornell-ggx`, `veach` |
 | `gpu_scenes:environments` (`gpu_scenes_environments.ixx`) | the scenes lit by an environment map: `env-furnace`, `studio`, `sunlit`, `sun-test` |
+| `gpu_scenes:meshes` (`gpu_scenes_meshes.ixx`) | the scenes with triangle meshes: the three showcases and the test scenes of triangles, instances and glTF materials |
 | `strategy_options` | the GPU programs' sampling strategies (`-p`): the books' four, named and described as in `RayTracing`'s list, then `nee` and `mis`; the choice of kernel (`--all-books-kernel`, `--quality-kernel`) |
 | `tone_options` | `--tonemap` and `--exposure`: the tone maps' names for the options, the window's keys and the scripts, and what a scene shows (what the options choose, the scene's own display for the rest) |
 | `view_options` | the camera's options (`--height`, `--lookfrom`, `--lookat`, `--vfov`, `--defocus-angle`, `--focus-dist`), the checks a view must pass, and the `View:` line that prints a view as options |
 | `viewer_camera` | the window's camera moves as pure functions of the camera's settings: orbit, look, pan, dolly, zoom, fly, the lens and the focus, shared by the mouse, the keys and the scripts |
 | `viewer_script` | the window's camera scripts, recordings and input files, as text: parsing them and writing them |
 
+The library `mesh_io`'s two modules:
+
+| Module | Contents |
+|---|---|
+| `meshes` | the model as the renderer takes it (meshes, placements, glTF's materials, images), the limits a model's file is held to, and generated meshes: an icosphere, a torus, quads as triangles, a mesh baked into the world |
+| `gltf` | `load_gltf`: a `.glb` or a `.gltf` read through cgltf and a private copy of stb_image, every size checked before anything is allocated |
+
 ## The CUDA renderer's files
 
-The CUDA renderer in `src/gpu` is ordinary C++20 headers and six `.cu` files, compiled by `nvcc`, which can't import modules. The books' files mirror the modules they port. The files beyond the books, the third kernel's and the tone maps' from `quality.cu` down, have nothing on the CPU to port, and they stay apart from the books' kernels: `renderer.cu` includes none of their device code, and each of the new `.cu` files is a translation unit of its own, so `nvcc` compiles the books' kernels as before.
+The CUDA renderer in `src/gpu` is ordinary C++20 headers and eight `.cu` files, compiled by `nvcc`, which can't import modules. The books' files mirror the modules they port. The files beyond the books, the third kernel's and the tone maps' from `quality.cu` down, have nothing on the CPU to port, and they stay apart from the books' kernels: `renderer.cu` includes none of their device code, and each of the new `.cu` files is a translation unit of its own, so `nvcc` compiles the books' kernels as before.
 
 | File | Contents | Ports |
 |---|---|---|
@@ -178,8 +196,28 @@ The CUDA renderer in `src/gpu` is ordinary C++20 headers and six `.cu` files, co
 | `lamps_on_device.cuh`, `microfacets_on_device.cuh`, `environment_on_device.cuh` | the quality kernel's own arrays on the GPU, a class for each part | |
 | `tonemap.cu`, `tonemap.cuh` | the image's bytes through a tone map, a kernel of its own compiled without fused multiply-adds, and `renderer.cu`'s view of it | |
 | `tone_curves.cuh` | the tone curves (the sRGB curve, AgX, PBR Neutral), the rounding to bytes and its dither | |
+| `guides.cuh`, `guides.cu` | the albedo and normal guides of the denoiser, one template over either tracer, and the CUDA kernel of the BVH's | |
+| `denoise.cu` | the image to denoise, as floats, and the denoised floats widened for the display kernels | |
+| `quality_access.cuh` | the one accessor of the quality kernel's view that OptiX's programs read it through | |
 
-How these pieces render a scene, and why they are built this way: [the CUDA renderer](gpu.md#how-it-renders), and for the third kernel's, [light and materials](quality.md).
+The files of the OptiX path, in `src/gpu/optix`. Every call of OptiX's host API is in the three that `cl.exe` compiles:
+
+| File | Contents |
+|---|---|
+| `programs.cu` | the device programs, one module: it includes the ray-generation programs and the intersection programs below |
+| `optix_tracer.cuh` | the `tracer` the integrator uses under OptiX: `optixTraverse`, its hit object, the media's loop, the through-rule |
+| `raygen_render.cuh`, `raygen_guides.cuh`, `raygen_pick.cuh` | the ray-generation programs: the integrator's loop, the denoiser's guides, the window's double-click on a triangle |
+| `intersections.cuh` | the books' spheres and quads as intersection programs, with the books' own tests |
+| `triangles.cuh`, `mesh_tables.h` | a hit on a triangle: its point, normals, texture coordinates and glTF material; the origin's offset; the tables they read |
+| `optix_params.h` | the launch's parameters, shared by the host and the programs |
+| `runtime.cpp`, `runtime_core.h`, `core.h` | OptiX's context, module and pipeline, in plain types, and what to say when OptiX can't run |
+| `accel.cpp` | builds the acceleration structures: the books' custom primitives, a triangle structure per mesh, the instances |
+| `denoiser.cpp` | the AI denoiser, its tiles and its memory plan |
+| `scene.cu` | the runtime the programs hold, a scene in OptiX's acceleration structures, and its launches: compiled by `nvcc` because it fills the device structures |
+| `meshes.cu`, `mesh_scene.cuh` | the meshes on the GPU: uploads, texture objects and scratch slots, the memory plan, every material and texture checked before anything is allocated |
+| `embedded.h`, `absent.cpp` | the embedded module; what the programs say in a build without OptiX |
+
+How these pieces render a scene, and why they are built this way: [the CUDA renderer](gpu.md#how-it-renders), for the third kernel's, [light and materials](quality.md), and for OptiX's, [OptiX, meshes and the denoiser](optix.md).
 
 ## Modern C++
 
@@ -217,6 +255,6 @@ Where each one is used, and why:
 
 The CPU renderer implements the algorithms and scenes of the book series by Peter Shirley, Trevor David Black and Steve Hollasch: ["Ray Tracing in One Weekend"](https://raytracing.github.io/books/RayTracingInOneWeekend.html), ["Ray Tracing: The Next Week"](https://raytracing.github.io/books/RayTracingTheNextWeek.html) and ["Ray Tracing: The Rest of Your Life"](https://raytracing.github.io/books/RayTracingTheRestOfYourLife.html). Its classes follow the books' C++ code; the project's own additions are listed above under [Beyond the books](#beyond-the-books).
 
-The third-party libraries are [stb_image and stb_image_write](https://github.com/nothings/stb) in `external/stb`, which keep their own license (public domain or MIT, as their files say), and [SDL3](https://libsdl.org) (zlib license), which CMake downloads and builds for the viewer's window. The README's GIF of the viewer is made with [gifski](https://gif.ski), run as a separate program by `scripts/make-gif.ps1`. The CUDA renderer's random number generator is PCG32 by Melissa O'Neill ([pcg-random.org](https://www.pcg-random.org)), ported from her minimal C implementation. The Earth map `assets/earthmap.jpg` comes from the [books' repository](https://github.com/RayTracing/raytracing.github.io) and is CC0, like that repository. The two HDR environment maps in `assets`, `studio_small_09_1k.hdr` (a photographer's studio lit by softboxes) and `kloofendal_48d_partly_cloudy_puresky_1k.hdr` (a partly cloudy sky with the sun 48° up), are [Poly Haven](https://polyhaven.com)'s, CC0, committed as published so that the programs and the tests need no download. The AgX tone map follows Troy Sobotka's [AgX](https://github.com/sobotka/AgX): its matrices and structure come from iolite's Minimal AgX by Benjamin Wrensch (© 2024 Missing Deadlines), and the closed form of its curve from [linlin's AgX](https://github.com/bWFuanVzYWth/AgX) (© 2024 linlin), both under the MIT license, whose notice `src/gpu/tone_curves.cuh` carries. Khronos PBR Neutral is written from the equations of [Khronos's description](https://github.com/KhronosGroup/ToneMapping). The project's own code is under the [MIT license](../LICENSE).
+The third-party libraries are [stb_image and stb_image_write](https://github.com/nothings/stb) in `external/stb`, which keep their own license (public domain or MIT, as their files say), [cgltf](https://github.com/jkuhlmann/cgltf) v1.15 in `external/cgltf`, as published (MIT license), and [SDL3](https://libsdl.org) (zlib license), which CMake downloads and builds for the viewer's window. [NVIDIA's OptiX 9.0 headers](https://github.com/NVIDIA/optix-dev) come under NVIDIA's licenses, eight of them proprietary and six BSD-3; CMake downloads them, and they aren't in the repository, and the programs use the OptiX runtime in NVIDIA's driver. The README's GIF of the viewer is made with [gifski](https://gif.ski), run as a separate program by `scripts/make-gif.ps1`. The CUDA renderer's random number generator is PCG32 by Melissa O'Neill ([pcg-random.org](https://www.pcg-random.org)), ported from her minimal C implementation. The Earth map `assets/earthmap.jpg` comes from the [books' repository](https://github.com/RayTracing/raytracing.github.io) and is CC0, like that repository. The two HDR environment maps in `assets`, `studio_small_09_1k.hdr` (a photographer's studio lit by softboxes) and `kloofendal_48d_partly_cloudy_puresky_1k.hdr` (a partly cloudy sky with the sun 48° up), are [Poly Haven](https://polyhaven.com)'s, CC0, committed as published so that the programs and the tests need no download. So are the two models in `assets/models`, each the 1k glTF package with every texture it names, by the SHA-256 of its first file: `marble_bust_01` (`marble_bust_01_1k.gltf`, `B6F192FC01BE4349…`) and `brass_vase_01` (`brass_vase_01_1k.gltf`, `BECF6D52678C63D7…`); `MeshTests` pins every file's SHA-256. The AgX tone map follows Troy Sobotka's [AgX](https://github.com/sobotka/AgX): its matrices and structure come from iolite's Minimal AgX by Benjamin Wrensch (© 2024 Missing Deadlines), and the closed form of its curve from [linlin's AgX](https://github.com/bWFuanVzYWth/AgX) (© 2024 linlin), both under the MIT license, whose notice `src/gpu/tone_curves.cuh` carries. Khronos PBR Neutral is written from the equations of [Khronos's description](https://github.com/KhronosGroup/ToneMapping). The project's own code is under the [MIT license](../LICENSE).
 
-Published methods are credited in the comments where the code uses them. Among them, the CUDA renderer uses the SplitMix64 finalizer (Steele, Lea and Flood, 2014) to hash the seed, the pixel and the pass into each sample's generator, the ray-sphere discriminant of Haines et al. (*Ray Tracing Gems*, 2019, chapter 7), Aila and Laine's guard against zero direction components in the slab test, and the orthonormal basis of Duff et al. (JCGT, 2017); `ImageCompare` computes Student's t distribution through the incomplete beta function as in *Numerical Recipes* (section 6.4). The third kernel is written from Veach's thesis (1997, chapter 9) for multiple importance sampling and the power heuristic; Walter et al. (2007) for the GGX microfacet model, with Heitz's height-correlated masking and shadowing (2014) and sampling of visible normals (2018), drawn by the spherical caps of Dupuy and Benyoub (2023); Schlick (1994) for the facets' reflectance and Burley (2012) for the roughness scale α = r²; Turquin (2019) for the energy compensation; Ashikhmin and Shirley (2000) for the coupled diffuse term under a glossy coat; Vose (1991) for the alias table; and Jimenez (2014) for the interleaved gradient noise of the tone maps' dither. Its code is re-derived from the papers' equations, with ideas but no code from pbrt-v4. The colors of gold, silver, copper and aluminum are the measured base colors of the Unreal Engine's documentation (Physically Based Materials), taken as linear colors.
+Published methods are credited in the comments where the code uses them. Among them, the CUDA renderer uses the SplitMix64 finalizer (Steele, Lea and Flood, 2014) to hash the seed, the pixel and the pass into each sample's generator, the ray-sphere discriminant of Haines et al. (*Ray Tracing Gems*, 2019, chapter 7), Aila and Laine's guard against zero direction components in the slab test, and the orthonormal basis of Duff et al. (JCGT, 2017); `ImageCompare` computes Student's t distribution through the incomplete beta function as in *Numerical Recipes* (section 6.4). The third kernel is written from Veach's thesis (1997, chapter 9) for multiple importance sampling and the power heuristic; Walter et al. (2007) for the GGX microfacet model, with Heitz's height-correlated masking and shadowing (2014) and sampling of visible normals (2018), drawn by the spherical caps of Dupuy and Benyoub (2023); Schlick (1994) for the facets' reflectance and Burley (2012) for the roughness scale α = r²; Turquin (2019) for the energy compensation; Ashikhmin and Shirley (2000) for the coupled diffuse term under a glossy coat; Vose (1991) for the alias table; and Jimenez (2014) for the interleaved gradient noise of the tone maps' dither. Its code is re-derived from the papers' equations, with ideas but no code from pbrt-v4. The colors of gold, silver, copper and aluminum are the measured base colors of the Unreal Engine's documentation (Physically Based Materials), taken as linear colors. glTF's materials follow the mapping in the glTF 2.0 specification, appendix B, and the denoiser's guides follow Open Image Denoise's rule for what an albedo is at a coat and at a mirror.

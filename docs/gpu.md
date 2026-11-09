@@ -27,7 +27,7 @@ The port came in two milestones, tagged `gpu-1` (the first book) and `gpu-2` (th
 - **Waits that spin.** The host waits for the card at the end of every launch by spinning, asking again and again, which keeps a CPU core busy while the card works but reacts at once. That suits a program that renders and exits. The viewer's waits sleep instead ([waits that sleep](viewer.md#waits-that-sleep)).
 - **Random numbers per sample.** Every sample, a camera ray with all its bounces, gets its own small generator (Melissa O'Neill's PCG32), started from a hash of the seed, the pixel and the pass. So the image doesn't depend on the order the threads run in, or on how passes are grouped into launches. The same seed gives the same image, bit for bit, in Debug and in Release. The CPU renderer gets there another way: it seeds each image row's generator with the seed and the row's number, so its image doesn't depend on which thread renders a row. Random directions are drawn by formulas with a fixed amount of work, rather than by the CPU's rejection loops, which would keep a warp looping until its unluckiest thread is done.
 - **`float`, not `double`.** A GeForce card does arithmetic on 64-bit doubles 64 times slower than on 32-bit floats. The device code is written once, as templates on the number type constrained by a concept, and compiled twice. `--fp64` renders with doubles: in [the performance table](../README.md#performance), 12 to 40 times slower than with floats, but still faster than the CPU in every scene.
-- **One BVH for three kinds of shapes.** The tree of boxes is built on the CPU with the CPU's own rule (an object-median split: the shapes are sorted by where their boxes start along the longest axis of their common box, and the list is cut in the middle), into arrays that refer to each other by index. Its leaves hold spheres that stand still, moving spheres or quadrilaterals, each kind in an array of its own. That way a sphere that stands still is read with one 16-byte load in `float` (two in `double`), as when the GPU rendered only the first book. Each thread walks the tree in a loop with a small stack, visiting the nearer of two boxes first. The median split halves the shapes at every level, so the tree is about log₂ n levels deep for n shapes, and the stack never holds more nodes than there are levels. A scene of at most 8 shapes gets no median split: all of them go into one leaf, whose shapes every ray tests. If such a scene mixes kinds, as `light` does, it gets one leaf per kind under a root instead, and a ray tests a leaf's shapes only if it enters that leaf's box. Larger scenes get one shape per leaf. On the card the performance table was measured on, `materials` renders 1.7 times faster as a single leaf than as a tree.
+- **One BVH for three kinds of shapes.** The tree of boxes is built on the CPU with the CPU's own rule (an object-median split: the shapes are sorted by where their boxes start along the longest axis of their common box, and the list is cut in the middle), into arrays that refer to each other by index. Its leaves hold spheres that stand still, moving spheres or quadrilaterals, each kind in an array of its own. That way a sphere that stands still is read with one 16-byte load in `float` (two in `double`), as when the GPU rendered only the first book. Each thread walks the tree in a loop with a small stack, visiting the nearer of two boxes first. The median split halves the shapes at every level, so the tree is about log₂ n levels deep for n shapes, and the stack never holds more nodes than there are levels. A scene of at most 8 shapes gets no median split: all of them go into one leaf, whose shapes every ray tests. If such a scene mixes kinds, as `light` does, it gets one leaf per kind under a root instead, and a ray tests a leaf's shapes only if it enters that leaf's box. Larger scenes get one shape per leaf. On the card the performance table was measured on, `materials` renders 1.7 times faster as a single leaf than as a tree. The OptiX path builds its own hierarchy instead, on the GPU, from these same shapes' boxes ([the books' shapes as custom primitives](optix.md#the-books-shapes-as-custom-primitives)).
 - **Instances baked once.** On the CPU, `translate` and `rotate_y` move every ray into the object's coordinates and the hit back out. The GPU program instead moves the objects themselves into the world, once, before the render. Nested instances add up to one turn about the vertical axis and one shift, so the kernel knows only world coordinates. A rigid motion keeps lengths and angles, so the hits are the same. The one exception is a sphere's texture coordinates, computed in the sphere's own coordinates, so a turned sphere keeps its turn for them.
 - **Textures as tables.** A checker of checkers is a short chain of table entries, and an image is an array of texels. The marble's Perlin noise uses the CPU's own random tables, copied, so both programs draw the same marble.
 - **Smoke after the surfaces.** The CPU tests a volume of smoke while it searches its BVH, against the closest hit found so far. The GPU first finds the closest surface, then lets every volume draw its distance to a particle, and the volume wins if the particle comes first. The picture is the same: the distance a volume draws to a particle doesn't depend on the limit it is tested against, the nearest hit found so far. The limit only decides whether a collision beyond it is reported, and such a collision would lose to that nearer hit anyway.
@@ -94,6 +94,8 @@ The fourth GPU milestone, `gpu-4`, added the third kernel and the tone maps besi
 
 The third kernel's own checks, numerical tests of its functions on the GPU (`GpuTests`) and ImageCompare's protocols against the strategies it improves on, are in [Light and materials](quality.md#how-it-was-verified).
 
+The fifth milestone, `gpu-5`, used the same gates, extended: `sassgate.sh --all` against the build at `gpu-4` compares every function of `RayTracingGPU`, `RayTracingViewer` and `GpuTests`, so the quality and tone-map kernels are now frozen too, and an IR gate hashes and diffs OptiX's programs from step to step. At every step every function of `gpu-4`'s build was identical ([how it was verified](optix.md#how-it-was-verified)).
+
 ## What float costs
 
 A `float` keeps about 7 significant digits, and that mattered in seven places. All but the last were measured by comparing renders:
@@ -140,8 +142,9 @@ out\build\x64-release\RayTracingGPU.exe final
 
 ```
 RayTracingGPU [scene] [options]
-  scene                any of RayTracing's 13 scenes (default weekend), the four beyond the books
-                       (cornell-ggx, veach, studio, sunlit) or a test scene
+  scene                any of RayTracing's 13 scenes (default weekend), the seven beyond the books
+                       (cornell-ggx, veach, studio, sunlit, still-life, busts, cornell-bust), a test
+                       scene, or a glTF 2.0 model, FILE.glb or FILE.gltf (rendered by OptiX)
   -w, --width N        image width in pixels
       --height N       image height in pixels, exactly (default: from the scene's aspect ratio)
       --lookfrom X,Y,Z, --lookat X,Y,Z, --vfov D, --defocus-angle D, --focus-dist D
@@ -154,10 +157,13 @@ RayTracingGPU [scene] [options]
       --all-books-kernel
                        render the first book's scenes with the kernel for all three books
       --quality-kernel render with the quality kernel, also the books' scenes under -p material
+      --optix          trace with OptiX (float; -p material, nee or mis); the scenes with triangle
+                       meshes always use it
       --launch-ms N    how long one kernel launch should take, 1 to 500 ms (default 50)
       --seed N         which random numbers to draw, from 0 (default) to 4294967295
   -o, --output FILE    where to save the image, a .png or a .pfm (default <scene>-gpu.png);
                        give it several times to save several files
+      --denoise        also write each image denoised by OptiX's AI denoiser, as NAME-denoised
       --tonemap NAME   the PNG's display transform: books (the books' scenes' default), none,
                        agx (the default beyond the books) or neutral; a .pfm stays linear
       --exposure EV    the light times 2^EV before the tone map, from -24 to 24; not with books

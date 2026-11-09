@@ -2,7 +2,7 @@
 
 [RayTracing](../README.md) › ImageCompare
 
-Every pixel of a render is a Monte Carlo estimate, an average of random samples. So two renders of one scene differ in every pixel unless they use the same random numbers. What correct renderers must share is each pixel's expected value: the picture both converge to as the rays per pixel grow. `ImageCompare` tests whether two renders differ by more than their noise explains. It is how the CUDA renderer was [verified against the CPU](gpu.md#verification), and how the third kernel's strategies were [verified against the books'](quality.md#how-it-was-verified).
+Every pixel of a render is a Monte Carlo estimate, an average of random samples. So two renders of one scene differ in every pixel unless they use the same random numbers. What correct renderers must share is each pixel's expected value: the picture both converge to as the rays per pixel grow. `ImageCompare` tests whether two renders differ by more than their noise explains. It is how the CUDA renderer was [verified against the CPU](gpu.md#verification), and how the third kernel's strategies were [verified against the books'](quality.md#how-it-was-verified) and OptiX [against the third kernel](optix.md#how-it-was-verified). Images denoised by OptiX's AI denoiser are biased, so they are never compared this way: every comparison uses the plain renders.
 
 - [Usage](#usage)
 - [How it decides](#how-it-decides)
