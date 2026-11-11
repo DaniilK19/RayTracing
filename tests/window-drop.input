@@ -1,0 +1,12 @@
+# Files dropped on the window (scripts\verify\panel.ps1, part drop), live:
+#   RayTracingViewer cornell -w 320 --height 180 -s 16 --input tests\window-drop.input --record r.txt
+# A file dropped is shown as a model, in the photo studio, as the panel's Open... shows one; a file that isn't a glTF
+# model, and one the loader refuses, leave the scene shown, and the console says why. Relative paths are this file's
+# folder's.
+at 0 action panel on
+at 10 drop "..\assets\models\brass_vase_01\brass_vase_01_1k.gltf"
+at 40 drop "..\README.md"
+at 50 drop "data\cut-short.glb"
+# Saved: the model's file names the files (brass_vase_01_1k-view-001.png)
+at 80 action save
+at 100 quit

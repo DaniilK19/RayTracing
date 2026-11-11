@@ -16,7 +16,9 @@
 #   clicks (Step 102): tests\window-panel-clicks.input clicks the panel's controls (a scene, the strategy's and the
 #     tone map's boxes, the exposure, the samples, Save) in a 1280x720 window, tests\window-panel-asked.input asks for
 #     the same by actions at the same frames: the same settings, the same last frame, the same files saved.
-#   powershell -ExecutionPolicy Bypass -File scripts\verify\panel.ps1 -Step 102 [-Only actions,panel,clicks]
+#   drop (Step 103): tests\window-drop.input drops a glTF model on a live window (shown, with OptiX), then README.md
+#     and a .glb cut short (each refused with its reason, the model still shown), and saves the model's image.
+#   powershell -ExecutionPolicy Bypass -File scripts\verify\panel.ps1 -Step 103 [-Only actions,panel,clicks,drop]
 # Exit code 0 when everything matches ("Panel gate: PASS"), 1 when something differs ("Panel gate: FAIL (n)"), 2 for an
 # error ("Panel gate: ERROR"), 4 when a live window is postponed ("Panel gate: POSTPONED").
 param(
@@ -44,7 +46,7 @@ if (-not (Test-Path -LiteralPath $viewer)) { throw "panel: no $viewer" }
 $run = Join-Path (Get-FullPath $State) ("runs\step{0}\panel" -f $Step)
 $script:failures = 0
 
-$allParts = @("actions", "panel", "clicks")
+$allParts = @("actions", "panel", "clicks", "drop")
 $named = @(($Only -join ",") -split '[,\s]+' | Where-Object { $_ })
 foreach ($part in $named) {
     if ($allParts -notcontains $part) { throw "panel: -Only takes $($allParts -join ', '), not '$part'" }
@@ -245,6 +247,38 @@ if ($runParts -contains "clicks") {
     $clicked.console | ForEach-Object { Write-Output "    | $_" }
     $clicked.settings | ForEach-Object { Write-Output "    r $_" }
     Write-Output "    r $($clicked.last)"
+}
+
+# --- drop: files dropped on the window ---------------------------------------------------------------------------------
+
+if ($runParts -contains "drop") {
+    Write-Output "drop: tests\window-drop.input, live in a window"
+    $folder = Join-Path $run "drop"
+    $console = Invoke-Window "window-drop" $folder @("cornell", "-w", "320", "--height", "180", "-s", "16",
+        "--input", (Join-Path $project "tests\window-drop.input"), "--record", "record.txt")
+    if ($null -eq $console) {
+        Write-Output ("drop: postponed: the queue opens no window while a fullscreen application is in front (or the " +
+            "GPU is too hot): run it again later")
+        Write-Output "Panel gate: POSTPONED"
+        exit 4
+    }
+    $scenes = @($console | Where-Object { $_ -like "Scene: *" })
+    $expect = @(
+        @{ what = "the model dropped is shown, with OptiX"; ok = ($scenes.Count -eq 2 -and
+                $scenes[1] -like "Scene: *brass_vase_01_1k.gltf, sampling: mis*OptiX*") },
+        @{ what = "README.md refused: not a model"; ok = [bool]($console | Where-Object {
+                    $_ -ceq "Note: README.md isn't a glTF 2.0 model (.gltf or .glb)" }) },
+        @{ what = "cut-short.glb refused by the loader"; ok = [bool]($console | Where-Object {
+                    $_ -like "Note: can't show cut-short.glb: *" }) },
+        @{ what = "the model still shown when saved"; ok = (Test-Path -LiteralPath (Join-Path $folder "brass_vase_01_1k-view-001.png")) }
+    )
+    foreach ($e in $expect) {
+        if ($e.ok) { Write-Output "  $($e.what): PASS" }
+        else { Write-Output "  $($e.what): FAIL"; $script:failures++ }
+    }
+    Write-Output "  its console, for review:"
+    $console | Where-Object { $_ -match '^(Scene|View|Display|Note|Error|Saved|Warning):' } |
+        ForEach-Object { Write-Output "    | $_" }
 }
 
 if ($script:failures -gt 0) {

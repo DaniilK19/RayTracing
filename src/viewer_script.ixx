@@ -631,6 +631,8 @@ export std::string format_frame(std::int64_t passes, int rows, std::uint64_t gen
 //                                                   where the panel drew it last (viewer_panel's panel_item: scene
 //                                                   cornell, sampling, sampling mis, optix, save...): the mouse moves
 //                                                   there, presses and lets go, as real events do
+//   drop FILE                                       a file dropped on the window (quoted: a path may hold spaces); a
+//                                                   relative path is the input file's folder's
 
 export enum class input_kind
 {
@@ -645,6 +647,7 @@ export enum class input_kind
     quit,
     action, // performed by the window itself, not sent through SDL
     click,  // a click on the panel's control named `key`
+    drop,   // a file dropped on the window: its path in `key`
 };
 
 export struct input_event
@@ -849,6 +852,15 @@ export std::expected<std::vector<input_event>, std::string> parse_input(std::str
                 e.key += (e.key.empty() ? "" : " ") + std::string(part);
             }
             e.kind = input_kind::click;
+        }
+        else if (verb == "drop")
+        {
+            if (args.size() != 1 || args[0].empty())
+            {
+                return fail("drop needs one file (quoted, if its path holds spaces)");
+            }
+            e.key = std::string(args[0]);
+            e.kind = input_kind::drop;
         }
         else if (verb == "device-reset" || verb == "quit")
         {

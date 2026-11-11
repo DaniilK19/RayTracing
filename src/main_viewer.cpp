@@ -144,6 +144,8 @@ In the window:
   H, F1                this list in the window
   F3                   the panel: the image's numbers at the window's right edge (shown at the start
                        of a window someone watches, unless --no-panel)
+  a glTF file dropped on the window, or the panel's Open...
+                       shows the model in the photo studio
   R                    back to the start view
   P                    save the image as <scene>-view-NNN.png and .pfm in the current folder,
                        and print the RayTracingGPU command that renders it; with N on, also
@@ -192,6 +194,36 @@ std::expected<void, std::string> check_scene(std::string_view scene)
         return std::unexpected(std::format("unknown scene '{}'", scene));
     }
     return {};
+}
+
+// A path from UTF-8 text: the process's code page is UTF-8 (utf8.manifest), so a path's narrow string is UTF-8 too
+std::filesystem::path from_utf8(std::string_view text)
+{
+    return std::filesystem::path(std::string(text));
+}
+
+// The project's assets folder, as the scenes find their files (find_asset in scenes.ixx and gpu_scene.ixx): the
+// current folder's, or the nearest one above it that has one; without one, the plain relative path, which doesn't exist
+std::filesystem::path find_asset_folder()
+{
+    std::error_code error;
+    const std::filesystem::path start = std::filesystem::current_path(error);
+    if (error)
+    {
+        return "assets";
+    }
+    for (std::filesystem::path dir = start;; dir = dir.parent_path())
+    {
+        std::error_code missing; // a folder that isn't there is no error here: the search goes on above it
+        if (std::filesystem::is_directory(dir / "assets", missing))
+        {
+            return dir / "assets";
+        }
+        if (dir == dir.parent_path())
+        {
+            return "assets";
+        }
+    }
 }
 
 // A model's file as the window shows it (the HUD, the title): its file name; a scene's name as it is
@@ -506,6 +538,7 @@ std::string tone_map_tip(gpu::tone_map op)
 // thread performs it (SDL's timers run on a thread of their own)
 Uint32 wake_type = 0;
 Uint32 timed_input_type = 0;
+Uint32 opened_file_type = 0; // the open dialog's file, from the dialog's thread: a heap string in data1
 
 Uint64 SDLCALL timed_input(void* index, SDL_TimerID, Uint64)
 {
@@ -709,6 +742,9 @@ private:
     std::optional<camera_settings> pending_view_;
     // The actions asked for (viewer_actions: --input's action lines), performed in order at the next iterate (apply)
     std::deque<action> actions_;
+    // The glTF models the panel lists: those under assets/models, then those opened or dropped in this run
+    std::vector<std::string> models_;
+    std::deque<std::string> dropped_; // the paths --input's drop lines handed SDL, kept while their events live
 
     // The on-screen display: the numbers at the top, a note at the bottom, the help over the image. The rate and the
     // frame time are measured from one iterate to the next, over frames that rendered, and not over an interval that
@@ -819,6 +855,8 @@ private:
     void display_changed(const gpu::display_options& before);
     void draw_overlay();
     void set_panel(bool on);
+    void open_dialog();
+    SDL_AppResult open_model(const std::string& path);
     panel_state state_for_panel() const;
     std::optional<std::string> precision_refusal() const;
     std::vector<panel_choice> panel_scenes() const;
@@ -2480,6 +2518,11 @@ SDL_AppResult viewer::apply(const action& a)
             v.set_panel(p.on);
             return SDL_APP_CONTINUE;
         }
+        SDL_AppResult operator()(const open_file&) const
+        {
+            v.open_dialog();
+            return SDL_APP_CONTINUE;
+        }
     };
     return std::visit(performer{*this}, a);
 }
@@ -2584,6 +2627,90 @@ std::vector<panel_choice> viewer::panel_scenes() const
                                                                         : "Test scenes",
                           .tip = std::string(entry.description),
                           .refused = std::move(refused)});
+    }
+    // The models, before the test scenes; the one shown among them, if it came from the command line
+    std::vector<std::string> models = models_;
+    if (is_model_path(settings_.scene) && std::ranges::find(models, settings_.scene) == models.end())
+    {
+        models.push_back(settings_.scene);
+    }
+    const auto tests = std::ranges::find(result, std::string("Test scenes"), &panel_choice::group);
+    std::vector<panel_choice> listed;
+    for (const std::string& model : models)
+    {
+        listed.push_back({.name = model,
+                          .group = "Models",
+                          .tip = std::format("{} in the photo studio (OptiX)", model),
+                          .refused = settings_.fp64 ? "float32 only: F2 first" : ""});
+    }
+    result.insert(tests, listed.begin(), listed.end());
+    return result;
+}
+
+// The glTF models under the project's assets/models (found as the scenes find their assets), one folder deep, as
+// absolute paths in the order of their names
+std::vector<std::string> models_in_assets()
+{
+    std::vector<std::string> result;
+    std::error_code error;
+    const std::filesystem::path folder = std::filesystem::absolute(find_asset_folder() / "models", error);
+    if (error || !std::filesystem::is_directory(folder, error))
+    {
+        return result;
+    }
+    for (std::filesystem::recursive_directory_iterator it(folder, error), end; !error && it != end;
+         it.increment(error))
+    {
+        if (it.depth() <= 1 && it->is_regular_file(error) && is_model_path(to_utf8(it->path())))
+        {
+            result.push_back(to_utf8(it->path()));
+        }
+    }
+    std::ranges::sort(result);
+    return result;
+}
+
+// The panel's Open...: the system's dialog for a glTF file, in the folder of the models. The dialog runs beside the
+// window (the window goes on refining), and SDL calls back, maybe on a thread of its own, with the file chosen, which
+// an event of ours brings to the main thread: the window opens it there (open_model). A cancelled dialog does nothing.
+void viewer::open_dialog()
+{
+    if (!window_)
+    {
+        return;
+    }
+    static constexpr SDL_DialogFileFilter filters[] = {{"glTF 2.0 models", "gltf;glb"}};
+    const auto chosen = [](void*, const char* const* files, int) {
+        if (!files || !files[0])
+        {
+            return; // an error, or cancelled
+        }
+        SDL_Event event{};
+        event.type = opened_file_type;
+        event.user.data1 = new std::string(files[0]);
+        if (!SDL_PushEvent(&event))
+        {
+            delete static_cast<std::string*>(event.user.data1);
+        }
+    };
+    std::error_code error;
+    const std::string where = to_utf8(std::filesystem::absolute(find_asset_folder() / "models", error));
+    SDL_ShowOpenFileDialog(chosen, nullptr, window_, filters, 1, error ? nullptr : where.c_str(), false);
+}
+
+// A model's file to show, from the open dialog or dropped on the window: as a scene asked for by name. One that isn't
+// a glTF file, or that the loader refuses, leaves the scene shown, and says why. Once shown, the panel lists it.
+SDL_AppResult viewer::open_model(const std::string& path)
+{
+    if (!is_model_path(path))
+    {
+        tell(std::format("{} isn't a glTF 2.0 model (.gltf or .glb)", to_utf8(from_utf8(path).filename())));
+        return SDL_APP_CONTINUE;
+    }
+    const SDL_AppResult result = go_to_scene(path);
+    if (settings_.scene == path && std::ranges::find(models_, path) == models_.end())
+    {
+        models_.push_back(path);
     }
     return result;
 }
@@ -2952,6 +3079,7 @@ SDL_AppResult viewer::init()
         stats_ << "frame,wall_ms,dt_ms,gpu_ms,launches,longest_launch_ms,passes,rows,new_samples,presented,moving,"
                   "generation,width,height,strata,time_ms\n";
     }
+    models_ = models_in_assets();
     // The glTF files the first build read (the session's own build below finds them in gpu_scene's cache)
     report_models(*built);
     if (opts_.record)
@@ -3015,16 +3143,18 @@ SDL_AppResult viewer::init()
         {
             return fail(std::format("SDL couldn't turn on vsync: {}", SDL_GetError()));
         }
-        wake_type = SDL_RegisterEvents(2);
+        wake_type = SDL_RegisterEvents(3);
         if (wake_type == 0)
         {
             return fail(std::format("SDL has no events left for the program: {}", SDL_GetError()));
         }
         timed_input_type = wake_type + 1;
+        opened_file_type = wake_type + 2;
         // --input: key names SDL knows (the `after MS` events' timers start with the clock, below)
         for (const input_event& e : input_)
         {
-            if (e.kind != input_kind::click && !e.key.empty() && SDL_GetKeyFromName(e.key.c_str()) == SDLK_UNKNOWN)
+            if (e.kind != input_kind::click && e.kind != input_kind::drop && !e.key.empty() &&
+                SDL_GetKeyFromName(e.key.c_str()) == SDLK_UNKNOWN)
             {
                 return fail(std::format("{}: line {}: SDL knows no key '{}'", to_utf8(*opts_.input), e.line, e.key));
             }
@@ -3699,6 +3829,20 @@ std::expected<void, std::string> viewer::perform(const input_event& e)
         actions_.push_back(*e.act);
         event.type = wake_type;
         break;
+    case input_kind::drop:
+    {
+        // As Windows drops a file: its full path, here the input file's folder's when relative
+        std::filesystem::path file = from_utf8(e.key);
+        if (file.is_relative())
+        {
+            file = opts_.input->parent_path() / file;
+        }
+        dropped_.push_back(to_utf8(std::filesystem::absolute(file).lexically_normal()));
+        event.type = SDL_EVENT_DROP_FILE;
+        event.drop.windowID = window;
+        event.drop.data = dropped_.back().c_str();
+        break;
+    }
     case input_kind::click:
     {
         // The middle of the control where the panel drew it last: the mouse moves there, presses and lets go, three
@@ -3789,6 +3933,14 @@ std::expected<void, std::string> viewer::perform(const input_event& e)
 
 SDL_AppResult viewer::event(const SDL_Event& e)
 {
+    if (e.type == opened_file_type && opened_file_type != 0)
+    {
+        const std::unique_ptr<std::string> path(static_cast<std::string*>(e.user.data1));
+        if (const SDL_AppResult result = open_model(*path); result != SDL_APP_CONTINUE)
+        {
+            return result;
+        }
+    }
     if (e.type == timed_input_type && timed_input_type != 0)
     {
         if (const auto performed = perform(input_[static_cast<std::size_t>(e.user.code)]); !performed)
@@ -4123,6 +4275,15 @@ SDL_AppResult viewer::event(const SDL_Event& e)
             SDL_SetRenderVSync(renderer_, 1);
         }
         break;
+    case SDL_EVENT_DROP_FILE:
+        if (e.drop.data && !opts_.script)
+        {
+            if (const SDL_AppResult result = open_model(e.drop.data); result != SDL_APP_CONTINUE)
+            {
+                return result;
+            }
+        }
+        break;
     case SDL_EVENT_RENDER_DEVICE_RESET:
         // The renderer's textures are gone: a new one, with the last frame shown
         if (!make_texture(texture_width_, texture_height_) || !upload_shown())
@@ -4384,6 +4545,26 @@ SDL_AppResult SDL_AppInit(void** appstate, int argc, char* argv[])
     {
         print_usage();
         return SDL_APP_SUCCESS;
+    }
+    // Started with no arguments (a double-click in Explorer, a shortcut) somewhere the project's assets can't be found
+    // from: the program's own folder, if they can be found from there, becomes the current one, where P saves too
+    if (argc <= 1 && !std::filesystem::exists(find_asset_folder()))
+    {
+        if (const char* base = SDL_GetBasePath())
+        {
+            std::error_code error;
+            const std::filesystem::path before = std::filesystem::current_path(error);
+            std::filesystem::current_path(from_utf8(base), error);
+            if (!error && std::filesystem::exists(find_asset_folder()))
+            {
+                std::println("Note: the project's assets are found from the program's folder: files are saved in {}",
+                             to_utf8(std::filesystem::current_path()));
+            }
+            else if (!before.empty())
+            {
+                std::filesystem::current_path(before, error);
+            }
+        }
     }
     auto* app = new viewer(*opts);
     *appstate = app;

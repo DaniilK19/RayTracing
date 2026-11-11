@@ -31,6 +31,7 @@ import tone_options;
 //   save | copy                     save the image and print its command (P); copy the command (C)
 //   hud on | off | help on | off    the numbers on screen (I), the controls over the image (H)
 //   panel on | off                  the panel (F3)
+//   open                            the system's dialog to open a glTF model's file, shown as a scene
 // An action the window can't perform leaves it as it was and says why, as the key does.
 
 export struct show_scene
@@ -122,10 +123,15 @@ export struct show_panel
     bool operator==(const show_panel&) const = default;
 };
 
+export struct open_file
+{
+    bool operator==(const open_file&) const = default;
+};
+
 export using action =
     std::variant<show_scene, use_sampling, use_precision, use_optix, use_denoise, use_tone_map, use_exposure,
                  use_samples, use_pause, use_vfov, use_lens, use_focus, reset_view, save_image, copy_command, show_hud,
-                 show_help, show_panel>;
+                 show_help, show_panel, open_file>;
 
 // The most samples an action may ask for: the renderer numbers a view's passes with ints
 export constexpr std::int64_t max_action_samples = std::numeric_limits<std::int32_t>::max();
@@ -253,6 +259,10 @@ export std::expected<action, std::string> parse_action(std::span<const std::stri
     {
         return alone(copy_command{});
     }
+    if (verb == "open")
+    {
+        return alone(open_file{});
+    }
     return std::unexpected(std::format("unknown action '{}'", verb));
 }
 
@@ -296,6 +306,7 @@ struct action_writer
     std::string operator()(const show_hud& h) const { return std::format("hud {}", on_word(h.on)); }
     std::string operator()(const show_help& h) const { return std::format("help {}", on_word(h.on)); }
     std::string operator()(const show_panel& p) const { return std::format("panel {}", on_word(p.on)); }
+    std::string operator()(const open_file&) const { return "open"; }
 };
 }
 

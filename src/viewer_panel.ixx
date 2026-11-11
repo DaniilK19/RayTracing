@@ -155,7 +155,10 @@ void draw_scenes(const panel_state& state, std::vector<action>& asked)
             ImGui::SetNextItemOpen(group != "Test scenes", ImGuiCond_Once);
             open = ImGui::TreeNode(group.c_str());
         }
-        if (open && choice_line(c, c.name, c.name == state.scene_name, "scene"))
+        // A model by its file's name (its path in the tooltip and in the name a click line gives)
+        const std::string shown =
+            group == "Models" ? std::filesystem::path(c.name).filename().string() : c.name;
+        if (open && choice_line(c, shown, c.name == state.scene_name, "scene"))
         {
             asked.push_back(show_scene{c.name});
         }
@@ -412,6 +415,11 @@ export std::vector<action> draw_panel(const panel_state& state, float window_wid
         if (section("Scene", true))
         {
             draw_scenes(state, asked);
+            if (button("Open...", "open", "a glTF 2.0 model's file (.gltf, .glb), shown in the photo studio; a file "
+                                          "dropped on the window opens too"))
+            {
+                asked.push_back(open_file{});
+            }
         }
         if (section("Render", true))
         {

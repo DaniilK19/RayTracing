@@ -77,6 +77,7 @@ std::string_view kind_name(input_kind kind)
     case input_kind::quit: return "quit";
     case input_kind::action: return "action";
     case input_kind::click: return "click";
+    case input_kind::drop: return "drop";
     }
     return "?";
 }
@@ -152,6 +153,10 @@ void test_input(report& r)
     events("click", "at 9 click scene cornell",
            "[line 1 at 9 after -1 click key 'scene cornell' button 0 x 0 y 0 dx 0 dy 0 clicks 1]");
     events("click-without-a-control", "at 9 click", "error: line 1: click needs the name of a control of the panel");
+    events("drop", "at 3 drop \"..\\assets\\models\\a b.glb\"",
+           "[line 1 at 3 after -1 drop key '..\\assets\\models\\a b.glb' button 0 x 0 y 0 dx 0 dy 0 clicks 1]");
+    events("drop-two-files", "at 3 drop a.glb b.glb",
+           "error: line 1: drop needs one file (quoted, if its path holds spaces)");
     events("an-action's-bad-value", "at 0 quit\nat 2 action exposure high",
            "error: line 2: exposure needs a number of stops from -24 to 24");
 
@@ -236,6 +241,7 @@ void test_actions(report& r)
         {show_hud{false}, "hud off"},
         {show_help{true}, "help on"},
         {show_panel{false}, "panel off"},
+        {open_file{}, "open"},
     };
     for (const auto& [a, line] : lines)
     {
