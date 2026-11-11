@@ -4252,7 +4252,7 @@ SDL_AppResult viewer::event(const SDL_Event& e)
             }
             else
             {
-                tell("this build has no panel (Dear ImGui wasn't downloaded: see docs/building.md)");
+                tell("this build has no panel (built without Dear ImGui: see docs/building.md)");
             }
         }
         else if (e.key.key == SDLK_H || e.key.key == SDLK_F1)

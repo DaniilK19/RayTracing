@@ -13,7 +13,7 @@ public:
     static constexpr bool available() { return false; }
     std::expected<void, std::string> start(SDL_Window*, SDL_Renderer*)
     {
-        return std::unexpected("this build has no panel (Dear ImGui wasn't downloaded: see docs/building.md)");
+        return std::unexpected("this build has no panel (built without Dear ImGui: see docs/building.md)");
     }
     void stop() {}
     bool started() const { return false; }

@@ -3,8 +3,11 @@
 # The panel shows at 0.3 s; in a window 320 wide it is the right 192 pixels (60%), so (250, 60) is over it. A left drag
 # and a wheel step there move no camera: --stats shows one view (generation) to the end. The same events without the
 # panel (tests\window-panel-off.input) orbit and dolly the camera. The image has its 32 samples long before 2.5 s, so
-# from then to the quit at 4 s the window, the panel shown, draws no frame: --stats has no row in that time.
+# from then to the quit at 4 s the window, the panel shown, draws no frame: --stats has no row in that time. A device
+# reset at 0.45 s, the panel shown, must leave the window going.
 after 300 action panel on
+# The renderer's device reset (its textures lost), the panel shown: its font made again, the window going on
+after 450 device-reset
 after 600 mouse-move 250 60 0 0
 after 650 mouse-down left 250 60
 after 700 mouse-move 290 60 40 0
