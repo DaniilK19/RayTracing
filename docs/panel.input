@@ -1,0 +1,13 @@
+# The panel's pictures in the README and docs/viewer.md, taken from a live window driven by this file (scripted input,
+# docs/viewer.md), as the window draws itself, the panel on it (--frames-hud):
+#   RayTracingViewer still-life -w 1280 --height 720 -s 512 --denoise --input docs\panel.input --frames FOLDER --frames-hud
+# --frames saves a frame whenever the image has new samples. docs/panel.png is the last frame of the first 512
+# samples, denoised; docs/panel-sampling.png is the top of the panel's column in the run's last frame, 1024 samples: the
+# strategy's box open, the mouse on a strategy the window would refuse, its reason in the tooltip.
+at 0 action panel on
+# The strategy's box opened, the mouse left on uniform: greyed under OptiX, which takes material, nee and mis only
+after 5000 click sampling
+after 5300 click sampling uniform
+# More samples, so that the frames go on with the box open
+after 5600 action samples 1024
+after 15000 quit

@@ -4,6 +4,7 @@
 
 - [Requirements](#requirements)
 - [SDL3 for the window](#sdl3-for-the-window)
+- [Dear ImGui for the panel](#dear-imgui-for-the-panel)
 - [OptiX](#optix)
 - [Building](#building)
 - [RayTracing options](#raytracing-options)
@@ -16,7 +17,7 @@
 
 ## Requirements
 
-Visual Studio 2026 with the "Desktop development with C++" workload, which brings the MSVC compiler, CMake and Ninja. `RayTracingGPU`, `RayTracingViewer` and `GpuTests` also need an NVIDIA graphics card and the CUDA Toolkit 13; see [the CUDA renderer](gpu.md#building-and-running). `RayTracingViewer` also needs SDL3, which CMake downloads. `--optix`, the triangle meshes and the denoiser need nothing installed but a graphics driver for CUDA 13.4 or newer: CMake downloads OptiX's headers ([OptiX](#optix)). The two HDR photographs that light the scenes beyond the books are in the repository ([the environment maps](#the-environment-maps)), and so are the two glTF models.
+Visual Studio 2026 with the "Desktop development with C++" workload, which brings the MSVC compiler, CMake and Ninja. `RayTracingGPU`, `RayTracingViewer` and `GpuTests` also need an NVIDIA graphics card and the CUDA Toolkit 13; see [the CUDA renderer](gpu.md#building-and-running). `RayTracingViewer` also needs SDL3, which CMake downloads, and its panel Dear ImGui, which CMake downloads too. `--optix`, the triangle meshes and the denoiser need nothing installed but a graphics driver for CUDA 13.4 or newer: CMake downloads OptiX's headers ([OptiX](#optix)). The two HDR photographs that light the scenes beyond the books are in the repository ([the environment maps](#the-environment-maps)), and so are the two glTF models.
 
 ## SDL3 for the window
 
@@ -28,6 +29,17 @@ The download never stops the configure: if it fails, or gets the wrong bytes, CM
 cmake --preset x64-release -DRAYTRACING_SDL3_URL=file:///C:/Downloads/SDL3-3.4.18.tar.gz
 cmake --preset x64-release -DFETCHCONTENT_SOURCE_DIR_SDL3=C:/src/SDL3-3.4.18
 cmake --preset x64-release -DRAYTRACING_VIEWER=OFF
+```
+
+## Dear ImGui for the panel
+
+The viewer's [panel](viewer.md#the-panel) is drawn with [Dear ImGui 1.93.0](https://github.com/ocornut/imgui/releases/tag/v1.93.0) (MIT license). Where the viewer is built, the configure downloads the tag's archive from GitHub into `out/downloads`, beside SDL's, checks its SHA-256, and compiles four of its core files and its two backends for SDL 3 into a static library (the window uses the one that draws through SDL's renderer, and gives the panel its events itself), without its demo and debug windows (`cmake/imgui.cmake`). Its embedded font is the panel's, so no font file is needed either.
+
+A download that fails, or gets the wrong bytes, never stops the configure: CMake warns, and the viewer is built without its panel, everything else as before; F3 then says "this build has no panel". `ViewerTests` leaves out its checks of the panel. GitHub generates its tags' archives: should the bytes of this one ever change, the check fails the same way. Without a network, get `v1.93.0.tar.gz` from the release page by hand, or turn the panel off:
+
+```
+cmake --preset x64-release -DRAYTRACING_IMGUI_URL=file:///C:/Downloads/imgui-1.93.0.tar.gz
+cmake --preset x64-release -DRAYTRACING_PANEL=OFF
 ```
 
 ## OptiX
@@ -44,7 +56,7 @@ cmake --preset x64-release -DRAYTRACING_OPTIX=OFF
 
 ## Building
 
-**In Visual Studio:** open the project folder, select the `x64 Release` preset and the `RayTracing.exe` startup item, and press Ctrl+F5. The program renders the `final` scene, its default, and prints the path to the finished image. The `MonteCarlo.exe` startup item runs the Monte Carlo experiments, `ImageCompare.exe` compares two renders, `PfmStats.exe` measures them, and `MeshTests.exe` tests the model loader ([tests](#tests)). `RayTracingGPU.exe`, `RayTracingViewer.exe` and `GpuTests.exe` are there if the CUDA Toolkit is installed.
+**In Visual Studio:** open the project folder, select the `x64 Release` preset and the `RayTracing.exe` startup item, and press Ctrl+F5. The program renders the `final` scene, its default, and prints the path to the finished image. The `MonteCarlo.exe` startup item runs the Monte Carlo experiments, `ImageCompare.exe` compares two renders, `PfmStats.exe` measures them, and `MeshTests.exe` tests the model loader ([tests](#tests)). `RayTracingGPU.exe`, `RayTracingViewer.exe`, `ViewerTests.exe` and `GpuTests.exe` are there if the CUDA Toolkit is installed.
 
 To pass options when launching from Visual Studio, open **Debug → Debug and Launch Settings for RayTracing** and add `"args": ["cornell", "-s", "100"]` to the configuration.
 
@@ -173,11 +185,12 @@ The programs read them with stb_image, as linear radiance, and take maps of at m
 ## The other programs
 
 - **`RayTracingGPU`** takes the same options, with the [scenes beyond the books](#scenes-beyond-the-books) and two more strategies, and adds the image's height and the camera (`--height`, `--lookfrom`, `--lookat`, `--vfov`, `--defocus-angle`, `--focus-dist`), `--strata`, `--fp64`, `--all-books-kernel`, `--quality-kernel`, `--optix`, `--denoise`, `--tonemap`, `--exposure` and `--launch-ms`; see [the CUDA renderer](gpu.md#building-and-running) and [its options beyond the books](#raytracinggpus-options-beyond-the-books).
-- **`RayTracingViewer`** shows a scene or a glTF model in a window and refines it while the camera stands still, with `RayTracingGPU`'s options for the scene, the size, the camera, the sampling, the precision, OptiX, the denoiser and the display; see [the viewer](viewer.md).
+- **`RayTracingViewer`** shows a scene or a glTF model in a window and refines it while the camera stands still, with `RayTracingGPU`'s options for the scene, the size, the camera, the sampling, the precision, OptiX, the denoiser and the display, and a panel of controls that also renders the view to a file; see [the viewer](viewer.md).
 - **`ImageCompare A.pfm B.pfm`** tests whether two renders are the same picture up to noise; see [ImageCompare](image-compare.md).
 - **`PfmStats`** gives the numbers about renders that ImageCompare doesn't: the noise of one render, the RMS rule for two strategies, a patch's mean against a value, values exactly equal to a number, identical floats; see [tests](#tests) and [PfmStats](image-compare.md#pfmstats).
 - **`GpuTests`** tests the GPU renderer's device functions on the GPU: its samplers, densities and estimators, and OptiX's hits and programs; see [tests](#tests).
 - **`MeshTests`** tests the glTF loader and the generated meshes, with no GPU; see [tests](#tests).
+- **`ViewerTests`** tests the viewer's logic and its panel, with no window and no GPU; see [tests](#tests).
 - **`MonteCarlo [experiment...]`** runs the third book's numerical experiments; see [the MonteCarlo program](sampling.md#the-montecarlo-program).
 
 ### RayTracingGPU's options beyond the books
@@ -205,7 +218,7 @@ The program prints, besides [the lines RayTracing prints](#raytracing-options) a
 ctest --test-dir out\build\x64-release
 ```
 
-They are three: PfmStats' check of its own arithmetic (`PfmStats self-test`), the model loader's and the generated meshes' tests (`MeshTests`, with no GPU), and GpuTests' quick run (`GpuTests all --quick`), every test kernel on a few samples with the statistical verdicts skipped. On a computer without an NVIDIA graphics card GpuTests exits with 77, which ctest reports as skipped. The full statistical runs, the renders and [the verification scripts](#the-verification-scripts) are run by hand.
+They are four: PfmStats' check of its own arithmetic (`PfmStats self-test`), the model loader's and the generated meshes' tests (`MeshTests`, with no GPU), the window's logic and its panel (`ViewerTests`, with no window and no GPU, built where the viewer is), and GpuTests' quick run (`GpuTests all --quick`), every test kernel on a few samples with the statistical verdicts skipped. On a computer without an NVIDIA graphics card GpuTests exits with 77, which ctest reports as skipped. The full statistical runs, the renders and [the verification scripts](#the-verification-scripts) are run by hand.
 
 **`GpuTests`** tests the GPU renderer's device functions on the GPU: the samplers draw what their densities say, the densities integrate to 1, the estimators converge to known values. The suites of the features beyond the books check them against their written specifications, with references of their own rather than copies of the code they test.
 
@@ -239,6 +252,8 @@ The suites are in the files `tests/*_tests.cu`, several of which hold more than 
 
 Each check prints a line: its estimate, the expected value, the statistic and its limit, and PASS, FAIL or SKIP. A Monte Carlo mean must be within 4 standard errors of its exact value; Pearson's χ² test of drawn samples against a density needs a p-value of at least 1 − 0.99^(1/T) for the suite's T tests, so that a suite fails by chance in at most 1 run of 100; a test on samples wrong on purpose must reject them below p = 10⁻⁶; an exact identity must hold within a tolerance; and events that mustn't happen, a NaN or a draw of zero density, are counted. `--quick` runs every kernel on at most 10⁴ samples per check, for CUDA's memory checker, and skips the statistical verdicts. `--write` and `--check` give a suite a file: `GpuTests ggx-energy --check src\gpu\ggx_energy.cuh` computes the rough metals' energy table again and compares it with the committed file, and `--write` writes it. The exit code: 0 every check passes, 1 a check fails, 2 an error, 77 no CUDA device.
 
+**`ViewerTests`** checks the viewer's modules on the CPU, compiled from the very files the viewer is built from: the input files' lines into the events the window sends, the camera scripts and recordings read back bit for bit, every camera move and its limits, every action written and read back with its refusals, and the panel drawn by Dear ImGui's null backend (no window, no renderer) from made-up states of the window and clicked control by control: each asks for its action, and a greyed control, the current choice and a frame nobody touched ask for nothing. It exits with 0 when every check passes.
+
 **`PfmStats`** gives the numbers about renders saved as PFM files that ImageCompare doesn't: how noisy a render is, whether a white furnace is exactly 1, whether two renders are the same floats. Its commands, as its help lists them:
 
 ```
@@ -254,14 +269,15 @@ PfmStats self-test
 
 ## The verification scripts
 
-`scripts/verify/` holds the scripts that checked the fourth and fifth GPU milestones (`gpu-4` and `gpu-5`) while they were built ([the fourth](quality.md#how-it-was-verified), [the fifth](optix.md#how-it-was-verified)). They keep their state, the reference renders, the builds they compare with and a log of the GPU's time, in `out\m5\`, under the builds' folder `out`, which the repository doesn't hold, so they record how the checks were made more than they run on a fresh checkout. The first lines of each say what it does and how to call it.
+`scripts/verify/` holds the scripts that checked the fourth, fifth and sixth GPU milestones (`gpu-4`, `gpu-5` and `gpu-6`) while they were built ([the fourth](quality.md#how-it-was-verified), [the fifth](optix.md#how-it-was-verified), [the sixth](viewer.md#how-it-is-verified)). They keep their state, the reference renders, the builds they compare with and a log of the GPU's time, in `out\m5\` (the panel's runs in `out\m6\`), under the builds' folder `out`, which the repository doesn't hold, so they record how the checks were made more than they run on a fresh checkout. The first lines of each say what it does and how to call it.
 
 | Script | What it does |
 |---|---|
-| `frozen.ps1` | gate F: the files the books' kernels, the display kernel and the CPU programs are built from are unchanged since `gpu-3`, and the quality kernel's since `gpu-4`, with a few files pinned by their git blobs; the CMake rules reach neither the CPU programs nor the renderer's existing translation units; it renders nothing |
+| `frozen.ps1` | gate F: the files the books' kernels, the display kernel and the CPU programs are built from are unchanged since `gpu-3`, the quality kernel's since `gpu-4`, and all of `src/gpu` with OptiX's programs since `gpu-5`, with a few files pinned by their git blobs; the CMake rules reach neither the CPU programs nor the renderer's existing translation units; it renders nothing |
 | `sassgate.sh` | with `--all`, every function of the base build's `RayTracingGPU`, `RayTracingViewer` and `GpuTests` is in a new build as the same machine code, instruction for instruction and in its constants, read with cuobjdump; nothing runs on the GPU |
 | `irgate.ps1` | OptiX's device programs: the hashes and a cleaned diff of their PTX, no source path in them, and a Debug build's PTX equal to Release's |
 | `hostgate.ps1` | the GPU programs' host code behaves as before: what the command lines of `cli-cases.txt` print (with the window scripts in `cli-scripts\`), the window's frames of `tests\regress-viewer.txt` and `tests\regress-tone.txt`, the window's recorded sessions, five small renders and the README GIF's tour, against the previous build's; OptiX's sections carry a stamp of the driver and the programs |
+| `panel.ps1` | the panel's gate, live in windows of 320×180 to 1280×720: actions lead where the keys lead, clicks where the actions lead, what happens over the panel is the panel's, files dropped, Esc, and renders to a file equal to their `RayTracingGPU` commands' bytes ([how the window is verified](viewer.md#how-it-is-verified)) |
 | `compare.ps1` | the ImageCompare protocol for two strategies or two kernels: two seeds each, a control of each with itself, two cross-seed tests and the RMS rule ([comparing two strategies](image-compare.md#comparing-two-strategies)) |
 | `carry.ps1` | configurations once verified statistically still render the same bytes, so their verification carries forward |
 | `references.ps1` | the references of the statistical checks, rendered once by the previous milestone's build: at `gpu-5`, the quality kernel's references for the protocols and the denoiser's evaluation |
