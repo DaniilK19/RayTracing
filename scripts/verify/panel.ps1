@@ -9,7 +9,11 @@
 #     with its command, and the files P and the save action wrote, byte for byte. The console's Scene, View, Display
 #     and Note lines of the actions' run must be lines of the keys' run, in the same order: keys step, and print each
 #     state they pass (M past uniform to material), where an action prints the one it names.
-#   powershell -ExecutionPolicy Bypass -File scripts\verify\panel.ps1 -Step 100 [-Only actions]
+#   panel (Step 101): tests\window-panel.input shows the panel, then drags and turns the wheel over it: --stats must
+#     show one view to the end (the camera never moved), and no frame in the 1.4 s after the image is done (the
+#     window, the panel shown, sleeps). tests\window-panel-off.input, the same events without the panel, must move the
+#     camera: the check can fail. The last frame of the window as it was (--frames-hud) is named for review.
+#   powershell -ExecutionPolicy Bypass -File scripts\verify\panel.ps1 -Step 101 [-Only actions,panel]
 # Exit code 0 when everything matches ("Panel gate: PASS"), 1 when something differs ("Panel gate: FAIL (n)"), 2 for an
 # error ("Panel gate: ERROR"), 4 when a live window is postponed ("Panel gate: POSTPONED").
 param(
@@ -37,7 +41,7 @@ if (-not (Test-Path -LiteralPath $viewer)) { throw "panel: no $viewer" }
 $run = Join-Path (Get-FullPath $State) ("runs\step{0}\panel" -f $Step)
 $script:failures = 0
 
-$allParts = @("actions")
+$allParts = @("actions", "panel")
 $named = @(($Only -join ",") -split '[,\s]+' | Where-Object { $_ })
 foreach ($part in $named) {
     if ($allParts -notcontains $part) { throw "panel: -Only takes $($allParts -join ', '), not '$part'" }
@@ -163,6 +167,57 @@ if ($runParts -contains "actions") {
     $keys.console | ForEach-Object { Write-Output "    | $_" }
     $keys.settings | ForEach-Object { Write-Output "    r $_" }
     Write-Output "    r $($keys.last)"
+}
+
+# --- panel: what happens over the panel is the panel's, and the window sleeps under it -------------------------------
+
+# A live run of an input file with --stats and the frames as the window shows them (--frames-hud): the stats' rows
+function Get-PanelRun([string]$name, [string]$inputFile) {
+    $folder = Join-Path $run $name
+    $console = Invoke-Window "window-$name" $folder @("cornell", "-w", "320", "--height", "180", "-s", "32",
+        "--input", (Join-Path $project $inputFile), "--stats", "stats.csv", "--frames", "frames", "--frames-hud")
+    if ($null -eq $console) { return $null }
+    return @{ folder = $folder; rows = @(Import-Csv -LiteralPath (Join-Path $folder "stats.csv")) }
+}
+
+if ($runParts -contains "panel") {
+    Write-Output "panel: tests\window-panel.input and tests\window-panel-off.input, each live in a window"
+    $on = Get-PanelRun "panel" "tests\window-panel.input"
+    $off = if ($null -ne $on) { Get-PanelRun "panel-off" "tests\window-panel-off.input" } else { $null }
+    if ($null -eq $on -or $null -eq $off) {
+        Write-Output ("panel: postponed: the queue opens no window while a fullscreen application is in front (or " +
+            "the GPU is too hot): run it again later")
+        Write-Output "Panel gate: POSTPONED"
+        exit 4
+    }
+    $views = @($on.rows | ForEach-Object { $_.generation } | Sort-Object -Unique)
+    if ($views.Count -eq 1) {
+        Write-Output "  a drag and a wheel step over the panel: one view to the end (generation $($views[0])), PASS"
+    }
+    else {
+        Write-Output "  a drag and a wheel step over the panel: $($views.Count) views, the camera moved, FAIL"
+        $script:failures++
+    }
+    $offViews = @($off.rows | ForEach-Object { $_.generation } | Sort-Object -Unique)
+    if ($offViews.Count -gt 1) {
+        Write-Output "  the same without the panel: $($offViews.Count) views (the check can fail), PASS"
+    }
+    else {
+        Write-Output "  the same without the panel: one view: the events never reached the camera, FAIL"
+        $script:failures++
+    }
+    $late = @($on.rows | Where-Object { [double]$_.time_ms -ge 2500 -and [double]$_.time_ms -lt 3900 })
+    if ($late.Count -eq 0) {
+        Write-Output ("  the image done, the panel shown: no frame from 2.5 s to 3.9 s ({0} frames before), PASS" -f
+            $on.rows.Count)
+    }
+    else {
+        Write-Output ("  the image done, the panel shown: {0} frames from 2.5 s to 3.9 s, the window doesn't sleep, " +
+            "FAIL" -f $late.Count)
+        $script:failures++
+    }
+    $frames = @(Get-ChildItem -LiteralPath (Join-Path $on.folder "frames") -Filter "*.png" | Sort-Object Name)
+    if ($frames.Count -gt 0) { Write-Output "  the window as it was, for review: $($frames[-1].FullName)" }
 }
 
 if ($script:failures -gt 0) {

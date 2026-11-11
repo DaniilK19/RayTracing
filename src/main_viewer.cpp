@@ -37,6 +37,7 @@ import vec3;
 import view_options;
 import viewer_actions;
 import viewer_camera;
+import viewer_panel_host;
 import viewer_script;
 
 namespace
@@ -71,6 +72,7 @@ struct options
     bool headless = false;                       // without a window
     std::optional<std::filesystem::path> record; // write the frames shown as a script
     std::optional<std::filesystem::path> input;  // scripted mouse, keyboard and window events
+    bool no_panel = false; // the panel hidden at the start, in a window someone watches (F3 shows it)
     bool help = false;
 };
 
@@ -111,6 +113,7 @@ Options:
                        window and of a .png; a .pfm stays linear
       --exposure EV    the light times 2^EV before the tone map, from {} to {}; not with books
       --exit-when-done close the window when the image has its samples (after saving -o)
+      --no-panel       start with the panel hidden (F3 shows it)
   -h, --help           show this help
 
 In the window:
@@ -139,6 +142,8 @@ In the window:
   Enter, Shift+Enter   twice or half the samples to refine to, in whole rounds of strata
   I                    the numbers on screen
   H, F1                this list in the window
+  F3                   the panel: the image's numbers at the window's right edge (shown at the start
+                       of a window someone watches, unless --no-panel)
   R                    back to the start view
   P                    save the image as <scene>-view-NNN.png and .pfm in the current folder,
                        and print the RayTracingGPU command that renders it; with N on, also
@@ -242,9 +247,11 @@ std::expected<options, std::string> parse_options(std::span<char* const> args)
             continue;
         }
         if (arg == "--fp64" || arg == "--all-books-kernel" || arg == "--quality-kernel" || arg == "--exit-when-done" ||
-            arg == "--headless" || arg == "--frames-hud" || arg == "--optix" || arg == "--denoise")
+            arg == "--headless" || arg == "--frames-hud" || arg == "--optix" || arg == "--denoise" ||
+            arg == "--no-panel")
         {
             (arg == "--fp64"               ? opts.fp64
+             : arg == "--no-panel"         ? opts.no_panel
              : arg == "--all-books-kernel" ? opts.all_books_kernel
              : arg == "--quality-kernel"   ? opts.quality_kernel
              : arg == "--headless"         ? opts.headless
@@ -664,6 +671,11 @@ private:
     // frame time are measured from one iterate to the next, over frames that rendered, and not over an interval that
     // holds other work: a wait for events, a switch of scene or precision, the pass P and C finish, a scripted resize.
     bool hud_ = true;                    // the numbers (I)
+    // The panel (F3, viewer_panel_host): shown from the start in a window someone watches, unless --no-panel; in a run
+    // that ends by itself only when its input asks for it (action panel on), so those runs draw what they drew before
+    panel_host panel_;
+    bool panel_shown_ = false;
+    int panel_frames_ = 0; // frames still to draw after an event: Dear ImGui settles hovers and clicks over a few
     bool help_ = false;                  // the controls (H, F1)
     std::string note_;                   // such as "nothing there to focus on" after a double-click on the sky
     std::uint64_t note_until_ns_ = 0;    // when the note goes (a timer wakes the loop then)
@@ -763,6 +775,8 @@ private:
     void change_exposure(std::optional<double> step);
     void display_changed(const gpu::display_options& before);
     void draw_overlay();
+    void set_panel(bool on);
+    panel_state state_for_panel() const;
     void say(std::string message);
 };
 
@@ -770,6 +784,7 @@ viewer::~viewer()
 {
     session_.reset(); // the GPU's memory first, while CUDA is still up
     optix_.reset();   // then OptiX's programs and context, after every session that traced with them
+    panel_.stop(); // Dear ImGui's textures are the renderer's
     if (texture_)
     {
         SDL_DestroyTexture(texture_);
@@ -2407,8 +2422,72 @@ SDL_AppResult viewer::apply(const action& a)
             v.help_ = h.on;
             return SDL_APP_CONTINUE;
         }
+        SDL_AppResult operator()(const show_panel& p) const
+        {
+            v.set_panel(p.on);
+            return SDL_APP_CONTINUE;
+        }
     };
     return std::visit(performer{*this}, a);
+}
+
+// F3, an action: the panel shown or hidden. It starts at its first showing (Dear ImGui and its font, a few
+// milliseconds); a build without it says so.
+void viewer::set_panel(bool on)
+{
+    if (on == panel_shown_ || !window_)
+    {
+        return;
+    }
+    if (on && !panel_.started())
+    {
+        if (const auto started = panel_.start(window_, renderer_); !started)
+        {
+            tell(started.error());
+            return;
+        }
+    }
+    panel_shown_ = on;
+    panel_frames_ = 2;
+    present_needed_ = true;
+}
+
+// What the panel shows (viewer_panel draws from it alone): the numbers of the bar at the top of the window
+panel_state viewer::state_for_panel() const
+{
+    const gpu::accumulation state = session_->state();
+    const gpu::display_options shown = shown_display();
+    std::string renderer;
+    if (traces_with_optix(settings_, *build_))
+    {
+        renderer = "OptiX";
+    }
+    else if (gpu::uses_quality_integrator(session_->kernel()))
+    {
+        renderer = "the quality kernel";
+    }
+    return {
+        .scene = scene_label(settings_.scene),
+        .width = width_,
+        .height = height_,
+        .fp64 = settings_.fp64,
+        .strata = settings_.strata,
+        .sampling = std::string(strategy_name(build_->sampling)),
+        .renderer = renderer,
+        .passes = state.passes,
+        .target = target_,
+        .paused = paused_,
+        .samples_per_second = samples_per_second_,
+        .frame_ms = frame_ms_,
+        .denoised = denoise_tag(),
+        .vfov = view_.vfov,
+        .lens = view_.defocus_angle,
+        .focus = view_.focus_dist,
+        .tone_map = std::string(tone_map_name(shown.op)),
+        .exposure = shown.exposure,
+        .has_exposure = shown.op != gpu::tone_map::books,
+        .note = !note_.empty() && SDL_GetTicksNS() < note_until_ns_ ? note_ : std::string(),
+    };
 }
 
 // The numbers at the top of the window, a note at the bottom and the help, in SDL's built-in 8×8 font, scaled with the
@@ -2442,6 +2521,7 @@ void viewer::draw_overlay()
         "P                   save the image, print its command",
         "C                   copy the RayTracingGPU command",
         "I                   the numbers on screen",
+        "F3                  the panel",
     };
     constexpr float line = 10; // 8 pixels of text and 2 of space
     constexpr float bar_height = 3 * line + 6;
@@ -2467,7 +2547,8 @@ void viewer::draw_overlay()
                                                  std::floor(w / widest), std::floor(h / (bar_height + note_height + 8))}));
     // The help between the numbers and the note, at their scale or smaller where the window is short (the numbers keep
     // their size when it opens); at 1 it shows as many lines as fit, the way out first
-    const float top = (hud_ ? bar_height + 6 : 8) * scale; // in the window's pixels
+    const bool top_bar = hud_ && !panel_shown_;           // the panel shows the numbers itself
+    const float top = (top_bar ? bar_height + 6 : 8) * scale; // in the window's pixels
     const float help_height = static_cast<float>(std::size(help)) * line + 4;
     const float help_scale = std::max(1.0f, std::min(scale, std::floor((h - top - note_height * scale) / help_height)));
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
@@ -2492,7 +2573,7 @@ void viewer::draw_overlay()
     SDL_SetRenderScale(renderer_, scale, scale);
     const float width = w / scale;
     const float height = h / scale;
-    if (hud_)
+    if (top_bar)
     {
         // A script's frames have the samples it asks for, and it takes no keys: no target, no "Enter: more"
         const gpu::accumulation state = session_->state();
@@ -2872,6 +2953,10 @@ SDL_AppResult viewer::init()
     {
         return SDL_APP_FAILURE;
     }
+    if (interactive() && !opts_.no_panel && panel_host::available())
+    {
+        set_panel(true);
+    }
     if (const auto sent = send_input(0); !sent)
     {
         return fail(sent.error());
@@ -2930,6 +3015,14 @@ bool viewer::draw_and_present(bool new_samples)
         return false;
     }
     draw_overlay();
+    if (panel_shown_)
+    {
+        // What was asked for in it is performed at the next iterate, as an input file's actions are
+        for (action& asked : panel_.frame(state_for_panel()))
+        {
+            actions_.push_back(std::move(asked));
+        }
+    }
     if (new_samples && opts_.frames && !minimized_ && opts_.frames_hud && !save_frame_from_window())
     {
         return false;
@@ -3579,6 +3672,19 @@ SDL_AppResult viewer::event(const SDL_Event& e)
             return SDL_APP_CONTINUE;
         }
     }
+    // The panel sees the window's events first, and draws a few frames after each of the mouse's and the keyboard's
+    // (Dear ImGui shows a hover or a click a frame after it comes)
+    if (panel_shown_)
+    {
+        panel_.event(e);
+        if ((e.type >= SDL_EVENT_KEY_DOWN && e.type <= SDL_EVENT_TEXT_INPUT) ||
+            (e.type >= SDL_EVENT_MOUSE_MOTION && e.type <= SDL_EVENT_MOUSE_WHEEL) ||
+            e.type == SDL_EVENT_WINDOW_MOUSE_LEAVE)
+        {
+            panel_frames_ = 3;
+            present_needed_ = true;
+        }
+    }
     switch (e.type)
     {
     case SDL_EVENT_QUIT:
@@ -3599,9 +3705,9 @@ SDL_AppResult viewer::event(const SDL_Event& e)
             held_[e.key.scancode] = down;
         }
         mods_ = e.key.mod;
-        if (!down)
+        if (!down || (panel_shown_ && panel_.typing()))
         {
-            break;
+            break; // a key typed into a field of the panel is the field's
         }
         if (e.key.key == SDLK_ESCAPE && !e.key.repeat)
         {
@@ -3665,6 +3771,17 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         {
             hud_ = !hud_;
             present_needed_ = true;
+        }
+        else if (e.key.key == SDLK_F3)
+        {
+            if (panel_host::available())
+            {
+                set_panel(!panel_shown_);
+            }
+            else
+            {
+                tell("this build has no panel (Dear ImGui wasn't downloaded: see docs/building.md)");
+            }
         }
         else if (e.key.key == SDLK_H || e.key.key == SDLK_F1)
         {
@@ -3746,6 +3863,10 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         {
             break; // a second button during a drag does nothing
         }
+        if (panel_shown_ && panel_.over_panel(e.button.x, e.button.y))
+        {
+            break; // the panel's: no drag starts (one that started on the image goes on over it)
+        }
         drag_button_ = e.button.button;
         if (e.button.button == SDL_BUTTON_LEFT && e.button.clicks == 2)
         {
@@ -3807,7 +3928,7 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         }
         break;
     case SDL_EVENT_MOUSE_WHEEL:
-        if (!opts_.script)
+        if (!opts_.script && !(panel_shown_ && panel_.over_panel(e.wheel.mouse_x, e.wheel.mouse_y)))
         {
             const double steps = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
             const camera_settings from = current_view();
@@ -3869,6 +3990,7 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         {
             return SDL_APP_FAILURE;
         }
+        panel_.device_reset();
         present_needed_ = true;
         break;
     case SDL_EVENT_RENDER_DEVICE_LOST:
@@ -3900,6 +4022,11 @@ SDL_AppResult viewer::iterate()
     const auto samples_in = [&](const gpu::accumulation& state) {
         return static_cast<double>(width_) * (static_cast<double>(state.passes) * height_ + state.rows);
     };
+    if (panel_frames_ > 0)
+    {
+        --panel_frames_;
+        present_needed_ = true;
+    }
     try
     {
         // What was asked for by name since the last frame, in order, before the frame renders
@@ -4052,7 +4179,7 @@ SDL_AppResult viewer::iterate()
         // calls iterate again, and the program sleeps (not while scripted input waits for its frames or a fly key is
         // held). The timers of the `after MS` events, and the one that takes a note off the screen, end the wait.
         if ((minimized_pause || ((done || paused_) && !present_needed_ && !flying())) && pending_width_ == 0 &&
-            !pending_view_ && input_next_ == input_.size())
+            !pending_view_ && input_next_ == input_.size() && panel_frames_ == 0 && actions_.empty())
         {
             SDL_SetHint(SDL_HINT_MAIN_CALLBACK_RATE, "waitevent");
             skip_interval_ = true;

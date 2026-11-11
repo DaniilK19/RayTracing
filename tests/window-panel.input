@@ -1,0 +1,13 @@
+# The panel takes what happens over it, and the window sleeps under it (scripts\verify\panel.ps1, part panel), live:
+#   RayTracingViewer cornell -w 320 --height 180 -s 32 --input tests\window-panel.input --stats s.csv --frames F --frames-hud
+# The panel shows at 0.3 s; in a window 320 wide it is the right 192 pixels (60%), so (250, 60) is over it. A left drag
+# and a wheel step there move no camera: --stats shows one view (generation) to the end. The same events without the
+# panel (tests\window-panel-off.input) orbit and dolly the camera. The image has its 32 samples long before 2.5 s, so
+# from then to the quit at 4 s the window, the panel shown, draws no frame: --stats has no row in that time.
+after 300 action panel on
+after 600 mouse-move 250 60 0 0
+after 650 mouse-down left 250 60
+after 700 mouse-move 290 60 40 0
+after 750 mouse-up left 290 60
+after 800 wheel 2
+after 4000 quit

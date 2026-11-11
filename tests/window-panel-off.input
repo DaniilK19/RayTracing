@@ -1,0 +1,8 @@
+# tests\window-panel.input without the panel: the same drag and wheel step, which now orbit and dolly the camera (see
+# that file). It shows that the check there can fail.
+after 600 mouse-move 250 60 0 0
+after 650 mouse-down left 250 60
+after 700 mouse-move 290 60 40 0
+after 750 mouse-up left 290 60
+after 800 wheel 2
+after 2000 quit

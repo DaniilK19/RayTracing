@@ -30,6 +30,7 @@ import tone_options;
 //   reset-view                      back to the scene's starting view (R)
 //   save | copy                     save the image and print its command (P); copy the command (C)
 //   hud on | off | help on | off    the numbers on screen (I), the controls over the image (H)
+//   panel on | off                  the panel (F3)
 // An action the window can't perform leaves it as it was and says why, as the key does.
 
 export struct show_scene
@@ -115,10 +116,16 @@ export struct show_help
     bool operator==(const show_help&) const = default;
 };
 
+export struct show_panel
+{
+    bool on;
+    bool operator==(const show_panel&) const = default;
+};
+
 export using action =
     std::variant<show_scene, use_sampling, use_precision, use_optix, use_denoise, use_tone_map, use_exposure,
                  use_samples, use_pause, use_vfov, use_lens, use_focus, reset_view, save_image, copy_command, show_hud,
-                 show_help>;
+                 show_help, show_panel>;
 
 // The most samples an action may ask for: the renderer numbers a view's passes with ints
 export constexpr std::int64_t max_action_samples = std::numeric_limits<std::int32_t>::max();
@@ -179,7 +186,8 @@ export std::expected<action, std::string> parse_action(std::span<const std::stri
         }
         return use_precision{w[1] == "double"};
     }
-    if (verb == "optix" || verb == "denoise" || verb == "pause" || verb == "hud" || verb == "help")
+    if (verb == "optix" || verb == "denoise" || verb == "pause" || verb == "hud" || verb == "help" ||
+        verb == "panel")
     {
         const std::optional<bool> on = on_or_off();
         if (!on)
@@ -190,7 +198,8 @@ export std::expected<action, std::string> parse_action(std::span<const std::stri
                : verb == "denoise" ? action(use_denoise{*on})
                : verb == "pause"   ? action(use_pause{*on})
                : verb == "hud"     ? action(show_hud{*on})
-                                   : action(show_help{*on});
+               : verb == "help"    ? action(show_help{*on})
+                                   : action(show_panel{*on});
     }
     if (verb == "tonemap")
     {
@@ -286,6 +295,7 @@ struct action_writer
     std::string operator()(const copy_command&) const { return "copy"; }
     std::string operator()(const show_hud& h) const { return std::format("hud {}", on_word(h.on)); }
     std::string operator()(const show_help& h) const { return std::format("help {}", on_word(h.on)); }
+    std::string operator()(const show_panel& p) const { return std::format("panel {}", on_word(p.on)); }
 };
 }
 
@@ -307,3 +317,34 @@ export std::int64_t whole_rounds(std::int64_t samples, int strata)
     const std::int64_t rounds = (std::max<std::int64_t>(samples, 1) + round - 1) / round;
     return std::clamp(rounds, std::int64_t{1}, most) * round;
 }
+
+// --- The panel's view of the window -------------------------------------------------------------------------------
+//
+// What the panel shows, as plain values: the window fills one of these before each frame it draws the panel in
+// (viewer::state_for_panel in main_viewer.cpp), and the panel draws from it alone (viewer_panel), so the panel can be
+// drawn, and tested, without a window, a scene or a GPU. What it asks for comes back as actions.
+
+export struct panel_state
+{
+    // The image: what the bar at the top of the window shows when the panel is hidden
+    std::string scene;              // its name, or a model's file name
+    int width = 0;                  // the image's size in pixels
+    int height = 0;
+    bool fp64 = false;
+    int strata = 0;
+    std::string sampling;           // the strategy the scene renders with
+    std::string renderer;           // "the quality kernel", "OptiX", or empty for the books' kernels
+    std::int64_t passes = 0;        // complete passes so far
+    std::int64_t target = 0;        // and the samples to refine to
+    bool paused = false;
+    double samples_per_second = 0;  // 0: none measured yet
+    double frame_ms = 0;
+    std::string denoised;           // what a denoised frame says ("denoised at 64 of 100 passes"), or empty
+    double vfov = 0;                // the camera: the field of view and the lens's angle in degrees, the focus
+    double lens = 0;                // distance
+    double focus = 0;
+    std::string tone_map;           // the display: its tone map's name, and its exposure in stops (none with books)
+    double exposure = 0;
+    bool has_exposure = false;
+    std::string note;               // the note at the bottom of the window, while it shows
+};

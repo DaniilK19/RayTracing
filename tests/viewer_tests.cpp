@@ -229,6 +229,7 @@ void test_actions(report& r)
         {copy_command{}, "copy"},
         {show_hud{false}, "hud off"},
         {show_help{true}, "help on"},
+        {show_panel{false}, "panel off"},
     };
     for (const auto& [a, line] : lines)
     {
@@ -265,6 +266,7 @@ void test_actions(report& r)
     refused("focus-dist inf", "focus-dist needs a distance greater than zero");
     refused("reset-view now", "reset-view takes no values");
     refused("save all", "save takes no values");
+    refused("panel", "panel is on or off");
 
     // The samples to refine to: whole rounds of strata, rounded up, from one round up
     r.same("actions.rounds.exact", whole_rounds(128, 8), std::int64_t{128});

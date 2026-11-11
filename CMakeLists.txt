@@ -217,3 +217,6 @@ include(cmake/meshes.cmake)
 
 # What the viewer gains after cmake/sdl3.cmake, and ViewerTests, the checks of its logic without a window: last
 include(cmake/viewer.cmake)
+
+# Its panel, with Dear ImGui, which CMake downloads once (the window without it if that fails)
+include(cmake/imgui.cmake)
