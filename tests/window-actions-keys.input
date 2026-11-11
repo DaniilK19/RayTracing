@@ -1,0 +1,34 @@
+# The keys' half of the check that an action leads where its key leads (scripts\verify\panel.ps1, part actions): this
+# file reaches a state by keys, tests\window-actions.input the same state by actions, each run live in a window:
+#   RayTracingViewer cornell -w 320 --height 180 -s 32 --input tests\window-actions-keys.input --record r.txt
+# The two recordings must hold the same settings in the same order (their lines other than frames, which the clock
+# doesn't change), end on the same frame, and P's files must be the same bytes. Every key waits 20 frames for the
+# image before it to be done; two keys at one frame step twice with no frame between, so the recording shows only
+# where they led.
+#
+# M, M: from the Cornell box's own strategy past uniform to material
+at 20 key M
+at 20 key M
+# T, T: from the books' bytes past none to agx; then a stop of exposure up, in two half stops
+at 40 key T
+at 40 key T
+at 60 key .
+at 60 key .
+# Shift+Tab: the scene before cornell, light, which takes material along
+at 80 key-down Left Shift
+at 80 key Tab
+at 80 key-up Left Shift
+# F2: refused, agx computes in float32 only
+at 100 key F2
+# Enter: 32 samples asked for, rounded up to a round of 64 and doubled: 128
+at 120 key Return
+# ]: the lens opens to a quarter of a degree; R: back to the start view; =: the field of view times 0.9, 20 to 18
+at 160 key ]
+at 180 key R
+at 200 key =
+# Space, Space: paused, and on again
+at 220 key Space
+at 230 key Space
+# P: the image saved once it is done, as light-view-001.png and .pfm, with its command
+at 300 key P
+at 320 quit

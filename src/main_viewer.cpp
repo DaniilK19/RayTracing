@@ -35,6 +35,7 @@ import strategy_options;
 import tone_options;
 import vec3;
 import view_options;
+import viewer_actions;
 import viewer_camera;
 import viewer_script;
 
@@ -656,6 +657,8 @@ private:
     bool paused_ = false; // Space: no refining
     // A camera moved by this batch of events, shown at the next iterate: one new view for all of a frame's mouse moves
     std::optional<camera_settings> pending_view_;
+    // The actions asked for (viewer_actions: --input's action lines), performed in order at the next iterate (apply)
+    std::deque<action> actions_;
 
     // The on-screen display: the numbers at the top, a note at the bottom, the help over the image. The rate and the
     // frame time are measured from one iterate to the next, over frames that rendered, and not over an interval that
@@ -718,7 +721,27 @@ private:
     std::optional<camera_settings> pick_focus_optix(const camera_settings& view, const ray& r, int i, int j);
     camera_settings moved(const move& m, double t) const;
     void save_view();
+    void copy_view_command();
+    // A scene the window could go to, built and checked while nothing changes yet (attempt_scene)
+    struct scene_attempt
+    {
+        render_settings settings;                    // as it would be shown: with the strategy named, or its own
+        std::expected<gpu_build, std::string> built; // the scene built, or why the window can't show it
+        std::string shown;                           // that reason as the screen's note gives it
+        std::string own_note;                        // "<scene> can't take <strategy>": its own strategy instead
+    };
+    scene_attempt attempt_scene(render_settings next, const gpu_scene_entry* entry);
     SDL_AppResult switch_scene(int step);
+    SDL_AppResult go_to_scene(const std::string& name);
+    SDL_AppResult set_strategy(std::optional<strategy> sampling);
+    SDL_AppResult set_optix(bool on);
+    void show_tone_map(gpu::tone_map op);
+    void show_exposure(double exposure);
+    void set_target(std::int64_t samples);
+    void reach_target(std::int64_t target);
+    void set_view(const camera_settings& to);
+    void tell(const std::string& note);
+    SDL_AppResult apply(const action& a);
     SDL_AppResult switch_precision();
     SDL_AppResult switch_strategy(int step);
     SDL_AppResult switch_optix();
@@ -1411,6 +1434,27 @@ void viewer::save_view()
                  command_word(name + "-gpu.pfm"));
 }
 
+// C: P's command, copied: the view on screen, its pass in progress finished
+void viewer::copy_view_command()
+{
+    if (const auto state = complete_pass(); state)
+    {
+        const std::string command = gpu_command(state->passes, denoising());
+        if (SDL_SetClipboardText(command.c_str()))
+        {
+            std::println("Copied: {}", command);
+        }
+        else
+        {
+            std::println("Error: SDL couldn't copy the command ({}): {}", SDL_GetError(), command);
+        }
+    }
+    else
+    {
+        std::println("Error: {}", state.error());
+    }
+}
+
 // A message on screen for two seconds. A loop waiting for events wouldn't take it off, so a timer wakes it then.
 void viewer::say(std::string message)
 {
@@ -1518,42 +1562,17 @@ SDL_AppResult viewer::switch_scene(int step)
         {
             break; // around the cycle
         }
-        // The scenes beyond the books, which the quality kernel renders, in float32 only: refused without a build
-        if (entry.role == scene_role::showcase && next.kernel == kernel_choice::all_books)
+        // Built and checked while nothing changes yet (attempt_scene): refused, it is skipped
+        scene_attempt attempt = attempt_scene(std::move(next), &entry);
+        if (!attempt.built)
         {
-            skip(next.scene, "the quality kernel renders it, and --all-books-kernel picks the books' kernel",
-                 "the quality kernel's, not --all-books-kernel's");
+            skip(attempt.settings.scene, attempt.built.error(), attempt.shown);
             continue;
         }
-        if (entry.role == scene_role::showcase && next.fp64)
-        {
-            skip(next.scene, "the quality kernel renders it, in float32 only", "float32 only: F2 first");
-            continue;
-        }
-        auto built = build_for(next);
-        std::string own_note;
-        if (!built && next.sampling)
-        {
-            render_settings own = next;
-            own.sampling.reset();
-            auto own_built = build_for(own);
-            if (!own_built)
-            {
-                skip(next.scene, own_built.error(), own_built.error());
-                continue;
-            }
-            std::println("Note: {}: {}; its own strategy instead", next.scene, built.error());
-            own_note = std::format("{} can't take {}", next.scene, strategy_name(*next.sampling));
-            next = std::move(own);
-            built = std::move(own_built);
-        }
-        if (!built)
-        {
-            skip(next.scene, built.error(), built.error());
-            continue;
-        }
+        next = std::move(attempt.settings);
+        const std::string own_note = std::move(attempt.own_note);
         const SDL_AppResult result =
-            switched(use_build(next, std::move(*built)), std::format("can't show {}", next.scene));
+            switched(use_build(next, std::move(*attempt.built)), std::format("can't show {}", next.scene));
         if (result == SDL_APP_CONTINUE && session_ && settings_ == next && (!own_note.empty() || !skipped.empty()))
         {
             const std::string skip_note = skipped.empty() ? "" : std::format("skipped {}: {}", skipped, why);
@@ -1569,6 +1588,92 @@ SDL_AppResult viewer::switch_scene(int step)
     std::println("Note: {}", note);
     say(note);
     return SDL_APP_CONTINUE;
+}
+
+// A scene the window could go to, for Tab and for a scene asked for by name (go_to_scene): built with the settings
+// `next` and checked as a new session would render it (build_for), while nothing changes yet. The scenes beyond the
+// books that the quality kernel renders, in float32 only, are refused without a build; those with triangle meshes
+// aren't, since their own refusal says what OptiX can't do (build_for's; in Tab's cycle they come up only in a session
+// that traces with OptiX, in float32). A scene that refuses the strategy named renders with its own instead, and the
+// console says so; `own_note` is the screen's part of that.
+viewer::scene_attempt viewer::attempt_scene(render_settings next, const gpu_scene_entry* entry)
+{
+    scene_attempt result{.settings = std::move(next), .built = std::unexpected(std::string())};
+    render_settings& settings = result.settings;
+    const bool quality_only = entry && entry->role == scene_role::showcase && !has_triangle_meshes(*entry) &&
+                              !is_model_path(settings.scene);
+    if (quality_only && settings.kernel == kernel_choice::all_books)
+    {
+        result.built =
+            std::unexpected("the quality kernel renders it, and --all-books-kernel picks the books' kernel");
+        result.shown = "the quality kernel's, not --all-books-kernel's";
+        return result;
+    }
+    if (quality_only && settings.fp64)
+    {
+        result.built = std::unexpected("the quality kernel renders it, in float32 only");
+        result.shown = "float32 only: F2 first";
+        return result;
+    }
+    result.built = build_for(settings);
+    if (!result.built && settings.sampling)
+    {
+        render_settings own = settings;
+        own.sampling.reset();
+        auto own_built = build_for(own);
+        if (!own_built)
+        {
+            result.shown = own_built.error();
+            result.built = std::move(own_built);
+            return result;
+        }
+        std::println("Note: {}: {}; its own strategy instead", settings.scene, result.built.error());
+        result.own_note = std::format("{} can't take {}", settings.scene, strategy_name(*settings.sampling));
+        settings = std::move(own);
+        result.built = std::move(own_built);
+    }
+    if (!result.built)
+    {
+        result.shown = result.built.error();
+    }
+    return result;
+}
+
+// A scene by its name, or a glTF model's file: what Tab does for the next scene, for this one, at the window's size.
+// The strategy named (-p, M, an action) goes along, and a scene that refuses it renders with its own and says so. The
+// kernel is the one asked for: OptiX stays where --optix or O chose it, and a scene with triangle meshes traces with
+// it in any case, without making it the choice for the scenes after it. A scene the window can't show here leaves the
+// one shown, with the reason on screen and on the console.
+SDL_AppResult viewer::go_to_scene(const std::string& name)
+{
+    if (name == settings_.scene)
+    {
+        return SDL_APP_CONTINUE;
+    }
+    if (const auto known = check_scene(name); !known)
+    {
+        tell(known.error());
+        return SDL_APP_CONTINUE;
+    }
+    render_settings next = settings_;
+    next.scene = name;
+    next.sampling = named_sampling_;
+    scene_attempt attempt = attempt_scene(std::move(next), scene_entry(name));
+    const std::string label = scene_label(name);
+    if (!attempt.built)
+    {
+        std::println("Note: can't show {}: {}", label, attempt.built.error());
+        say(std::format("can't show {}: {}", label, attempt.shown));
+        return SDL_APP_CONTINUE;
+    }
+    const render_settings shown = attempt.settings;
+    const SDL_AppResult result =
+        switched(use_build(shown, std::move(*attempt.built)), std::format("can't show {}", label));
+    if (result == SDL_APP_CONTINUE && session_ && settings_ == shown && !attempt.own_note.empty())
+    {
+        say(std::format("sampling: {}, the scene's own ({})", strategy_name(build_->sampling), attempt.own_note));
+    }
+    return result;
 }
 
 // F2: the other precision, in a new session at the same view (the moves still waiting are shown first). The quality
@@ -1710,6 +1815,47 @@ SDL_AppResult viewer::switch_optix()
         say(on ? "OptiX on" : "OptiX off");
     }
     return result;
+}
+
+// A strategy by its name, or the scene's own (empty): what M does for the next one, for this one. One the scene can't
+// take as asked, refused or one it would fall back from, leaves the strategy shown and says why.
+SDL_AppResult viewer::set_strategy(std::optional<strategy> sampling)
+{
+    if (sampling == settings_.sampling)
+    {
+        return SDL_APP_CONTINUE;
+    }
+    render_settings next = settings_;
+    next.sampling = sampling;
+    auto built = build_for(next);
+    if (!built || (sampling && built->sampling != *sampling))
+    {
+        const std::string_view name = sampling ? strategy_name(*sampling) : std::string_view("the scene's own");
+        const std::string why =
+            built ? std::format("{} renders it as {}", next.scene, strategy_name(built->sampling)) : built.error();
+        std::println("Note: {} refused: {}", name, why);
+        say(std::format("sampling {}: {}", name, why));
+        return SDL_APP_CONTINUE;
+    }
+    if (const auto applied = apply_pending_view(); !applied)
+    {
+        return fail(applied.error());
+    }
+    const SDL_AppResult result = switched(use_build(next, std::move(*built)), "can't change the strategy");
+    if (result == SDL_APP_CONTINUE && session_ && settings_ == next)
+    {
+        named_sampling_ = next.sampling;
+        say(std::format("sampling: {}{}", strategy_name(build_->sampling), next.sampling ? "" : ", the scene's own"));
+    }
+    return result;
+}
+
+// OptiX on or off by name: O's switch when the session isn't there already. A scene with triangle meshes always
+// traces with OptiX: on is where it is, and off says so, as O does.
+SDL_AppResult viewer::set_optix(bool on)
+{
+    const bool now = has_meshes(*build_) || settings_.kernel == kernel_choice::optix;
+    return on == now ? SDL_APP_CONTINUE : switch_optix();
 }
 
 // N: the denoiser on or off, for every scene after it, as a display chosen holds. On, a still view's frames show its
@@ -2036,7 +2182,22 @@ void viewer::change_target(bool more)
     const std::int64_t rounds = (target_ + round - 1) / round;
     const std::int64_t most = std::max<std::int64_t>(std::numeric_limits<std::int32_t>::max() / round, 1);
     const std::int64_t next = std::clamp(more ? rounds * 2 : rounds / 2, std::int64_t{1}, most) * round;
-    target_ = more ? std::max(next, target_) : std::min(next, target_);
+    reach_target(more ? std::max(next, target_) : std::min(next, target_));
+}
+
+// A number of samples to refine to, by name: rounded up to whole rounds of strata (whole_rounds)
+void viewer::set_target(std::int64_t samples)
+{
+    if (const std::int64_t target = whole_rounds(samples, settings_.strata); target != target_)
+    {
+        reach_target(target);
+    }
+}
+
+// The samples to refine to, changed: the image goes on to them, or has them
+void viewer::reach_target(std::int64_t target)
+{
+    target_ = target;
     const std::int64_t passes = session_->state().passes;
     if (passes < target_)
     {
@@ -2064,8 +2225,13 @@ gpu::display_options viewer::shown_display() const
 // window keeps the books' bytes and says so.
 void viewer::step_display(int step)
 {
+    show_tone_map(step_tone_map(shown_display().op, step));
+}
+
+// A tone map by name: T's, for this one
+void viewer::show_tone_map(gpu::tone_map next)
+{
     const gpu::display_options before = shown_display();
-    const gpu::tone_map next = step_tone_map(before.op, step);
     if (settings_.fp64 && next != gpu::tone_map::books)
     {
         const std::string note = std::format("{} works in float32 only: F2 first", tone_map_name(next));
@@ -2081,6 +2247,12 @@ void viewer::step_display(int step)
 // no exposure: under books the keys change nothing and say so.
 void viewer::change_exposure(std::optional<double> step)
 {
+    show_exposure(step ? shown_display().exposure + *step : 0.0);
+}
+
+// An exposure by its value, kept within the exposure keys' range: theirs, for this one
+void viewer::show_exposure(double exposure)
+{
     const gpu::display_options before = shown_display();
     if (before.op == gpu::tone_map::books)
     {
@@ -2089,7 +2261,7 @@ void viewer::change_exposure(std::optional<double> step)
         say(note);
         return;
     }
-    display_.exposure = step ? std::clamp(before.exposure + *step, -max_exposure, max_exposure) : 0.0;
+    display_.exposure = std::clamp(exposure, -max_exposure, max_exposure);
     display_changed(before);
 }
 
@@ -2105,6 +2277,138 @@ void viewer::display_changed(const gpu::display_options& before)
     std::println("Display: {}, {}", tone_map_name(now.op), format_exposure(now.exposure));
     redisplay_ = true;
     present_needed_ = true;
+}
+
+// --- Actions ---------------------------------------------------------------------------------------------------
+
+// A note on the console and on screen: why something asked for didn't happen
+void viewer::tell(const std::string& note)
+{
+    std::println("Note: {}", note);
+    say(note);
+}
+
+// A view by its values (an action's field of view, lens or focus): taken when the camera can render it, as a move is;
+// one it can't render stays where it is, and says why. The same view again starts nothing over.
+void viewer::set_view(const camera_settings& to)
+{
+    const camera_settings from = current_view();
+    if (to.vfov == from.vfov && to.defocus_angle == from.defocus_angle && to.focus_dist == from.focus_dist)
+    {
+        return;
+    }
+    if (const auto checked = check_view(settings_for(to, width_, height_)); !checked)
+    {
+        tell(checked.error());
+        return;
+    }
+    move_camera(to);
+}
+
+// An action (viewer_actions), performed: the one place where the window does what it is asked for by name and value.
+// Each leads where its key leads, through the key's own function where it is a switch, or through that function's
+// twin that takes the value (go_to_scene beside switch_scene, show_exposure beside change_exposure...), so the checks,
+// the console's lines and the notes are the key's. A script moves the camera and chooses the settings alone: under
+// --script actions do nothing, as keys do. The result is the switch's: an action ends the program only where a
+// switch left no session.
+SDL_AppResult viewer::apply(const action& a)
+{
+    if (opts_.script)
+    {
+        return SDL_APP_CONTINUE;
+    }
+    struct performer
+    {
+        viewer& v;
+        SDL_AppResult operator()(const show_scene& s) const { return v.go_to_scene(s.name); }
+        SDL_AppResult operator()(const use_sampling& s) const { return v.set_strategy(s.sampling); }
+        SDL_AppResult operator()(const use_precision& p) const
+        {
+            return p.fp64 == v.settings_.fp64 ? SDL_APP_CONTINUE : v.switch_precision();
+        }
+        SDL_AppResult operator()(const use_optix& o) const { return v.set_optix(o.on); }
+        SDL_AppResult operator()(const use_denoise& d) const
+        {
+            if (d.on != v.denoise_)
+            {
+                v.switch_denoise();
+            }
+            return SDL_APP_CONTINUE;
+        }
+        SDL_AppResult operator()(const use_tone_map& t) const
+        {
+            v.show_tone_map(t.op);
+            return SDL_APP_CONTINUE;
+        }
+        SDL_AppResult operator()(const use_exposure& e) const
+        {
+            v.show_exposure(e.exposure);
+            return SDL_APP_CONTINUE;
+        }
+        SDL_AppResult operator()(const use_samples& s) const
+        {
+            v.set_target(s.samples);
+            return SDL_APP_CONTINUE;
+        }
+        SDL_AppResult operator()(const use_pause& p) const
+        {
+            if (p.on != v.paused_)
+            {
+                v.paused_ = p.on;
+                v.present_needed_ = true; // and, under the denoiser, a paused image is denoised as it stands
+            }
+            return SDL_APP_CONTINUE;
+        }
+        // The field of view within the wheel's range, the lens within the bracket keys', the focus within the range
+        // a view allows
+        SDL_AppResult operator()(const use_vfov& f) const
+        {
+            camera_settings to = v.current_view();
+            to.vfov = std::clamp(f.degrees, 1.0, 160.0);
+            v.set_view(to);
+            return SDL_APP_CONTINUE;
+        }
+        SDL_AppResult operator()(const use_lens& l) const
+        {
+            camera_settings to = v.current_view();
+            to.defocus_angle = std::clamp(l.degrees, 0.0, 30.0);
+            v.set_view(to);
+            return SDL_APP_CONTINUE;
+        }
+        SDL_AppResult operator()(const use_focus& f) const
+        {
+            v.set_view(with_focus(v.current_view(), f.distance));
+            return SDL_APP_CONTINUE;
+        }
+        SDL_AppResult operator()(const reset_view&) const
+        {
+            v.move_camera(v.start_view_);
+            return SDL_APP_CONTINUE;
+        }
+        SDL_AppResult operator()(const save_image&) const
+        {
+            v.save_view();
+            return SDL_APP_CONTINUE;
+        }
+        SDL_AppResult operator()(const copy_command&) const
+        {
+            v.copy_view_command();
+            return SDL_APP_CONTINUE;
+        }
+        SDL_AppResult operator()(const show_hud& h) const
+        {
+            v.present_needed_ = v.present_needed_ || v.hud_ != h.on;
+            v.hud_ = h.on;
+            return SDL_APP_CONTINUE;
+        }
+        SDL_AppResult operator()(const show_help& h) const
+        {
+            v.present_needed_ = v.present_needed_ || v.help_ != h.on;
+            v.help_ = h.on;
+            return SDL_APP_CONTINUE;
+        }
+    };
+    return std::visit(performer{*this}, a);
 }
 
 // The numbers at the top of the window, a note at the bottom and the help, in SDL's built-in 8×8 font, scaled with the
@@ -3180,6 +3484,12 @@ std::expected<void, std::string> viewer::perform(const input_event& e)
     case input_kind::quit:
         event.type = SDL_EVENT_QUIT;
         break;
+    case input_kind::action:
+        // Not SDL's: the window performs it itself at the next iterate, which an event of our own makes sure comes
+        // (the loop may be about to wait for one)
+        actions_.push_back(*e.act);
+        event.type = wake_type;
+        break;
     case input_kind::key_down:
     case input_kind::key_up:
     {
@@ -3371,23 +3681,7 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         }
         else if (e.key.key == SDLK_C)
         {
-            // P's command: the view on screen, its pass in progress finished
-            if (const auto state = complete_pass(); state)
-            {
-                const std::string command = gpu_command(state->passes, denoising());
-                if (SDL_SetClipboardText(command.c_str()))
-                {
-                    std::println("Copied: {}", command);
-                }
-                else
-                {
-                    std::println("Error: SDL couldn't copy the command ({}): {}", SDL_GetError(), command);
-                }
-            }
-            else
-            {
-                std::println("Error: {}", state.error());
-            }
+            copy_view_command();
         }
         // The display: the image shown again through it, without new samples (see redisplay_). , . and 0 by their
         // character or by their place on a US keyboard, as - = [ ] above
@@ -3608,6 +3902,16 @@ SDL_AppResult viewer::iterate()
     };
     try
     {
+        // What was asked for by name since the last frame, in order, before the frame renders
+        while (!actions_.empty())
+        {
+            const action next = std::move(actions_.front());
+            actions_.pop_front();
+            if (const SDL_AppResult result = apply(next); result != SDL_APP_CONTINUE)
+            {
+                return result;
+            }
+        }
         gpu::render_report report;
         bool new_samples = false;
         bool redisplayed = false; // the same samples through another display: a frame too (--frames, --record)

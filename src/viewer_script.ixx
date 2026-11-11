@@ -11,6 +11,7 @@ import cli;
 import strategy_options;
 import tone_options;
 import vec3;
+import viewer_actions;
 import viewer_camera;
 
 // --- Scripts -------------------------------------------------------------------------------------------------------
@@ -624,6 +625,8 @@ export std::string format_frame(std::int64_t passes, int rows, std::uint64_t gen
 //   mouse-down left|middle|right X Y [CLICKS] | mouse-up left|middle|right X Y [CLICKS] | mouse-move X Y DX DY
 //   wheel DY [shift|ctrl]                           (a modifier is pressed around the wheel step)
 //   resize W H | device-reset | quit
+//   action WORDS                                    an action by name and value (viewer_actions: scene cornell,
+//                                                   exposure 0.5, samples 256...), performed before the next frame
 
 export enum class input_kind
 {
@@ -636,6 +639,7 @@ export enum class input_kind
     resize,
     device_reset,
     quit,
+    action, // performed by the window itself, not sent through SDL
 };
 
 export struct input_event
@@ -651,6 +655,7 @@ export struct input_event
     double dx = 0;      // mouse-move: the motion
     double dy = 0;      // mouse-move: the motion; wheel: the steps
     int clicks = 1;     // mouse-down, mouse-up
+    std::optional<::action> act; // action: what to perform
 };
 
 export std::expected<std::vector<input_event>, std::string> parse_input(std::string_view text)
@@ -816,6 +821,16 @@ export std::expected<std::vector<input_event>, std::string> parse_input(std::str
             e.kind = input_kind::resize;
             e.x = *width;
             e.y = *height;
+        }
+        else if (verb == "action")
+        {
+            auto read = parse_action(args);
+            if (!read)
+            {
+                return fail(read.error());
+            }
+            e.kind = input_kind::action;
+            e.act = std::move(*read);
         }
         else if (verb == "device-reset" || verb == "quit")
         {

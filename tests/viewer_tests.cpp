@@ -2,6 +2,8 @@
 // RayTracingViewer is built from besides main_viewer.cpp. It checks
 //   - viewer_script's input files (--input): every event's line read into the events the window sends, a key's press
 //     and release, a wheel step's modifier around it, the order of the frames, and what is refused, with the line;
+//   - viewer_actions' actions: every action written as its line and read back to the same action, what is refused
+//     and why, and the samples to refine to as whole rounds of strata;
 //   - viewer_script's camera scripts: settings and frames read, and a recorded frame line (format_frame) read back to
 //     the very numbers it was written from, bit for bit: a recording replays the view the window showed;
 //   - viewer_camera's moves: a move by nothing returns the settings unchanged, bit for bit; each move changes what it
@@ -14,7 +16,10 @@
 // fails.
 import std;
 import camera;
+import strategy_options;
+import tone_options;
 import vec3;
+import viewer_actions;
 import viewer_camera;
 import viewer_script;
 
@@ -68,6 +73,7 @@ std::string_view kind_name(input_kind kind)
     case input_kind::resize: return "resize";
     case input_kind::device_reset: return "device-reset";
     case input_kind::quit: return "quit";
+    case input_kind::action: return "action";
     }
     return "?";
 }
@@ -75,8 +81,9 @@ std::string_view kind_name(input_kind kind)
 // An event as one line of text, every field: what the checks compare
 std::string describe(const input_event& e)
 {
-    return std::format("line {} at {} after {} {} key '{}' button {} x {} y {} dx {} dy {} clicks {}", e.line,
-                       e.at_frame, e.after_ms, kind_name(e.kind), e.key, e.button, e.x, e.y, e.dx, e.dy, e.clicks);
+    return std::format("line {} at {} after {} {} key '{}' button {} x {} y {} dx {} dy {} clicks {}{}", e.line,
+                       e.at_frame, e.after_ms, kind_name(e.kind), e.key, e.button, e.x, e.y, e.dx, e.dy, e.clicks,
+                       e.act ? std::format(" does '{}'", format_action(*e.act)) : std::string());
 }
 
 std::string describe(const std::expected<std::vector<input_event>, std::string>& parsed)
@@ -131,6 +138,17 @@ void test_input(report& r)
            "[line 1 at 5 after -1 key-up key 'A' button 0 x 0 y 0 dx 0 dy 0 clicks 1] "
            "[line 2 at 5 after -1 quit key '' button 0 x 0 y 0 dx 0 dy 0 clicks 1]");
 
+    // An action: its words read by viewer_actions, a quoted file as one word
+    events("action", "at 6 action exposure -1.5",
+           "[line 1 at 6 after -1 action key '' button 0 x 0 y 0 dx 0 dy 0 clicks 1 does 'exposure -1.5']");
+    events("action-with-a-file", "after 10 action scene \"C:\\My models\\bust (1).glb\"  # a model",
+           "[line 1 at -1 after 10 action key '' button 0 x 0 y 0 dx 0 dy 0 clicks 1 does "
+           "'scene \"C:\\My models\\bust (1).glb\"']");
+    events("an-action-without-a-name", "at 0 action", "error: line 1: an action needs its name");
+    events("an-unknown-action", "at 0 action fly", "error: line 1: unknown action 'fly'");
+    events("an-action's-bad-value", "at 0 quit\nat 2 action exposure high",
+           "error: line 2: exposure needs a number of stops from -24 to 24");
+
     // Refusals: each names its line
     events("no-time", "key P", "error: line 1: an event starts with 'at FRAME' or 'after MS'");
     events("a-negative-frame", "at -1 quit", "error: line 1: at needs a frame number from 0");
@@ -149,6 +167,112 @@ void test_input(report& r)
     events("quit-with-a-value", "at 0 quit now", "error: line 1: quit takes no values");
     events("an-unknown-event", "at 7 jump", "error: line 1: unknown event 'jump'");
     events("the-second-line's-error", "at 0 quit\nat 1 jump", "error: line 2: unknown event 'jump'");
+}
+
+// --- Actions --------------------------------------------------------------------------------------------------------
+
+// A line's words as the input files split them: at blanks, a quoted word whole and without its quotes
+std::vector<std::string> split(std::string_view line)
+{
+    std::vector<std::string> result;
+    std::size_t i = 0;
+    while (i < line.size())
+    {
+        if (line[i] == ' ')
+        {
+            ++i;
+            continue;
+        }
+        std::size_t end = line[i] == '"' ? line.find('"', i + 1) : std::string_view::npos;
+        if (end != std::string_view::npos)
+        {
+            result.emplace_back(line.substr(i + 1, end - i - 1));
+            i = end + 1;
+            continue;
+        }
+        end = std::min(line.find(' ', i), line.size());
+        result.emplace_back(line.substr(i, end - i));
+        i = end;
+    }
+    return result;
+}
+
+std::expected<action, std::string> read_action(std::string_view line)
+{
+    const std::vector<std::string> words = split(line);
+    const std::vector<std::string_view> views(words.begin(), words.end());
+    return parse_action(views);
+}
+
+void test_actions(report& r)
+{
+    // Every action, written and read back: the same action, and the same line
+    const std::pair<action, std::string_view> lines[] = {
+        {show_scene{"cornell"}, "scene cornell"},
+        {show_scene{"C:\\My models\\bust (1).glb"}, "scene \"C:\\My models\\bust (1).glb\""},
+        {use_sampling{strategy::mis}, "sampling mis"},
+        {use_sampling{}, "sampling scene"},
+        {use_precision{true}, "precision double"},
+        {use_precision{false}, "precision float"},
+        {use_optix{true}, "optix on"},
+        {use_denoise{false}, "denoise off"},
+        {use_tone_map{tone_map::agx}, "tonemap agx"},
+        {use_exposure{-1.5}, "exposure -1.5"},
+        {use_exposure{0.1}, "exposure 0.1"},
+        {use_samples{4096}, "samples 4096"},
+        {use_pause{true}, "pause on"},
+        {use_vfov{37.5}, "vfov 37.5"},
+        {use_lens{0.6}, "defocus-angle 0.6"},
+        {use_focus{2.0 / 3.0}, "focus-dist 0.6666666666666666"}, // every digit a double needs
+        {reset_view{}, "reset-view"},
+        {save_image{}, "save"},
+        {copy_command{}, "copy"},
+        {show_hud{false}, "hud off"},
+        {show_help{true}, "help on"},
+    };
+    for (const auto& [a, line] : lines)
+    {
+        const std::string written = format_action(a);
+        r.same(std::format("actions.write.{}", line), written, std::string(line));
+        const auto read = read_action(written);
+        r.check(std::format("actions.read-back.{}", line), read && *read == a,
+                read ? format_action(*read) : read.error(), line);
+    }
+    // What is refused, and why
+    const auto refused = [&](std::string_view line, std::string_view why) {
+        const auto read = read_action(line);
+        r.same(std::format("actions.refused.{}", line.empty() ? "nothing" : line),
+               read ? std::format("read as '{}'", format_action(*read)) : read.error(), std::string(why));
+    };
+    refused("", "an action needs its name");
+    refused("fly", "unknown action 'fly'");
+    refused("scene", "scene needs a scene's name or a model's file");
+    refused("scene a b", "scene needs a scene's name or a model's file");
+    refused("sampling fast", "sampling needs a strategy's name, or scene");
+    refused("precision half", "precision is float or double");
+    refused("optix", "optix is on or off");
+    refused("denoise maybe", "denoise is on or off");
+    refused("pause on off", "pause is on or off");
+    refused("tonemap film", std::format("tonemap is {}", tone_map_names()));
+    refused("exposure 25", "exposure needs a number of stops from -24 to 24");
+    refused("exposure nan", "exposure needs a number of stops from -24 to 24");
+    refused("samples 0", "samples needs a whole number from 1 to 2147483647");
+    refused("samples 2147483648", "samples needs a whole number from 1 to 2147483647");
+    refused("samples 1.5", "samples needs a whole number from 1 to 2147483647");
+    refused("vfov -1", "vfov needs an angle in degrees, from 0");
+    refused("defocus-angle wide", "defocus-angle needs an angle in degrees, from 0");
+    refused("focus-dist 0", "focus-dist needs a distance greater than zero");
+    refused("focus-dist inf", "focus-dist needs a distance greater than zero");
+    refused("reset-view now", "reset-view takes no values");
+    refused("save all", "save takes no values");
+
+    // The samples to refine to: whole rounds of strata, rounded up, from one round up
+    r.same("actions.rounds.exact", whole_rounds(128, 8), std::int64_t{128});
+    r.same("actions.rounds.up", whole_rounds(100, 8), std::int64_t{128});
+    r.same("actions.rounds.one-sample", whole_rounds(1, 8), std::int64_t{64});
+    r.same("actions.rounds.strata-1", whole_rounds(7, 1), std::int64_t{7});
+    r.same("actions.rounds.the-most", whole_rounds(2147483647, 8), std::int64_t{2147483647 / 64 * 64});
+    r.same("actions.rounds.a-round-larger-than-an-int", whole_rounds(5, 46340), std::int64_t{46340} * 46340);
 }
 
 // --- Camera scripts -------------------------------------------------------------------------------------------------
@@ -360,6 +484,7 @@ int main()
 {
     report r;
     test_input(r);
+    test_actions(r);
     test_script(r);
     test_camera(r);
     std::println("\nViewerTests: {} checks, {} failed", r.checks(), r.failures());

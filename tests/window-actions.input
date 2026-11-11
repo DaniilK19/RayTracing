@@ -1,0 +1,19 @@
+# The actions' half of the check that an action leads where its key leads (scripts\verify\panel.ps1, part actions):
+# the state tests\window-actions-keys.input reaches by keys, reached by actions (src\viewer_actions.ixx), live in a
+# window:
+#   RayTracingViewer cornell -w 320 --height 180 -s 32 --input tests\window-actions.input --record r.txt
+# See that file for what is compared. Each action names where the keys' steps led.
+at 20 action sampling material
+at 40 action tonemap agx
+at 60 action exposure 1
+at 80 action scene light
+# refused, as F2 is: agx computes in float32 only
+at 100 action precision double
+at 120 action samples 128
+at 160 action defocus-angle 0.25
+at 180 action reset-view
+at 200 action vfov 18
+at 220 action pause on
+at 230 action pause off
+at 300 action save
+at 320 quit
