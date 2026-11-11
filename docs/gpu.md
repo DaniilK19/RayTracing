@@ -47,7 +47,13 @@ The CPU and the GPU draw unrelated random numbers, so their renders can share a 
 
 ### One picture, in detail
 
-[The README](../README.md#verified-against-the-cpu) shows `final` as both programs render it. These are its two maps:
+`final` as both programs render it:
+
+| CPU | GPU, `float` |
+|---|---|
+| ![The second book's final scene rendered on the CPU](gpu/final-cpu.png) | ![The second book's final scene rendered on the GPU](gpu/scenes/final.png) |
+
+These are its two maps:
 
 | ImageCompare: CPU against CPU with another seed (the noise alone) | ImageCompare: CPU against GPU, `float` |
 |---|---|

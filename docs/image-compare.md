@@ -62,7 +62,7 @@ ImageCompare A.pfm B.pfm [options]
   -h, --help       show this help
 ```
 
-The exit code gives the verdict to scripts: 0 consistent, 1 different, 2 an error. The README shows [two such maps](../README.md#verified-against-the-cpu), of a CPU render against another CPU render and against a GPU render.
+The exit code gives the verdict to scripts: 0 consistent, 1 different, 2 an error. The CUDA renderer's page shows [two such maps](gpu.md#one-picture-in-detail), of a CPU render against another CPU render and against a GPU render.
 
 ## How it decides
 

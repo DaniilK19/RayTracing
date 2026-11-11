@@ -3,10 +3,12 @@
 [RayTracing](../README.md) › Architecture
 
 - [Features](#features)
+- [Project structure](#project-structure)
 - [Library and programs](#library-and-programs)
 - [Modules](#modules)
 - [The CUDA renderer's files](#the-cuda-renderers-files)
 - [Modern C++](#modern-c)
+- [Development history](#development-history)
 - [Third-party code and credits](#third-party-code-and-credits)
 
 ## Features
@@ -76,6 +78,26 @@ The CPU renderer implements the techniques of [the three books](#third-party-cod
   - `ViewerTests`, with no window and no GPU, tests the viewer's input files, scripts, camera moves and actions, and clicks through the panel drawn by Dear ImGui's null backend;
   - `PfmStats` gives the numbers about renders that `ImageCompare` doesn't: the noise of one render from two seeds, the RMS rule for two strategies of unequal noise, a patch's mean against a value, how many values are exactly 1, whether two renders are the same bytes, and the error of a denoised image against references;
   - the scripts in `scripts/verify` prove the books' kernels unchanged by their sources and their machine code (disassembled by `cuobjdump`), without rendering them, and the programs' host behavior by small renders and replays of the window ([the gates](gpu.md#the-books-kernels-unchanged)); they also run `ImageCompare`'s protocol for two strategies and compute-sanitizer's memory checks, every GPU run through one queue that logs it.
+
+## Project structure
+
+| Path | Contents |
+|---|---|
+| `src/*.ixx` | 37 C++ module files (four of them partitions of `gpu_scenes`). Twenty, compiled once into the static library `raytracer`, are the renderer (vectors, shapes, BVH, materials, textures, densities, camera, images, scenes) and the programs' shared command-line helpers; two read models (below); the other fifteen belong to the GPU programs (below) |
+| `src/main.cpp` | `RayTracing`: renders a scene on the CPU |
+| `src/main_gpu.cpp`, `src/gpu/` | `RayTracingGPU`: renders a scene with the CUDA renderer. Its C++20 headers mirror the modules they port; `renderer.cu` holds the books' two kernels, `quality.cu` the third (its path in `quality_path.cuh`, with the lamps, the shadow rays, the weights, GGX and the environment map in headers of their own), `display.cu` and `tonemap.cu` turn the image into bytes, and `lamp_table.cu` and `environment_table.cu` build the light set's tables on the CPU |
+| `src/gpu/optix/` | the OptiX path: its device programs (`programs.cu`, the integrator's ray-generation program, the books' intersection programs, the triangles' surfaces), the host code that starts OptiX and builds its hierarchies, the meshes' tables and the denoiser |
+| `src/meshes.ixx`, `src/gltf.ixx` | the library `mesh_io`: meshes made in code and glTF 2.0 models read with cgltf, tested without a GPU by `MeshTests` |
+| `src/gpu_scene.ixx`, `src/gpu_scene_parts.ixx`, `src/gpu_scenes*.ixx`, `src/strategy_options.ixx`, `src/view_options.ixx`, `src/tone_options.ixx` | shared by the GPU programs: a scene built with the same modules and turned into plain numbers, the programs' own lists of scenes (the books' 13, the seven beyond them and the test scenes) and of sampling strategies, and the camera's and the display's options |
+| `src/main_viewer.cpp`, `src/viewer_*.ixx` | `RayTracingViewer`: the window, its camera moves, its scripts, its actions, and the panel (`viewer_panel.ixx` draws it with Dear ImGui from a snapshot of the window; `viewer_panel_host.ixx` puts it in the window, or `viewer_panel_absent.ixx` in a build without it) |
+| `src/image_compare.cpp` | `ImageCompare`: are two renders the same picture up to noise? |
+| `src/monte_carlo.cpp` | `MonteCarlo`: the third book's numerical experiments, and a test of the light sampling |
+| `tests` | `GpuTests`, numerical tests of the GPU's own functions (densities, samplers, weights, tables, OptiX's hits and the denoiser) run on the GPU with fixed seeds; `MeshTests`, the loader's and the generators' tests, with no GPU; `PfmStats`, statistics of renders; `ViewerTests`, the window's logic and its panel, with no window and no GPU; the window's regression scripts and scripted input |
+| `scripts/verify` | the gates that prove the books' kernels unchanged without rendering them, and the protocols that compare renders, each run through a queue that logs its GPU time |
+| `external/stb`, `external/cgltf`, `assets` | stb_image and stb_image_write; cgltf; the Earth texture, two HDR environment maps and, in `assets/models`, two glTF models |
+| `cmake/sdl3.cmake`, `cmake/imgui.cmake`, `cmake/optix.cmake` | download SDL3 and Dear ImGui and build them as static libraries, for the window and its panel; download NVIDIA's OptiX headers |
+| `scripts/make-gif.ps1` | remakes the GIF of the window from its camera script |
+| `docs` | these pages, the renders and the GIF |
 
 ## Library and programs
 
@@ -260,6 +282,16 @@ Where each one is used, and why:
 - **`std::bit_cast` and `std::byteswap`** (C++20, C++23) for the byte order of a PFM file, and **`std::print` into a stream** (C++23) for its header (`image.ixx`).
 - **`dynamic_cast`** asks the CPU's objects what they really are when the GPU programs translate them into plain numbers, walking lists, BVHs and instances (`gpu_scene.ixx`), and when the viewer's click-to-focus looks through smoke (`main_viewer.cpp`). `std::conditional_t` gives each of the GPU's two kernels its own scene type, and a defaulted `operator==` (C++20) compares the lights list's shapes with the world's (`src/gpu`).
 - **UTF-8 everywhere:** `/utf-8` for sources and strings, and the `src/utf8.manifest` manifest switches the process to UTF-8 (Windows 10 1903+), so paths with Cyrillic characters work in arguments too.
+
+## Development history
+
+The project was built in 107 incremental steps, one commit each, with a message that records what was done and why. The three books came first, on the CPU. Then came the first book's `materials` scene and the tools that make renders comparable: seeds, PFM files, ray counters and `ImageCompare`. The CUDA port followed: the first book, then the other two a feature at a time, each verified against the CPU. A last round of the second GPU milestone (`gpu-2`) won back the speed the first book's kernel had lost and measured the kernels' occupancy and determinism.
+
+The third GPU milestone (`gpu-3`) put the GPU renderer in a window: a session keeps the scene on the GPU and refines the image pass by pass in rounds of strata, and every frame the window shows can be rendered again offline, bit for bit. The fourth (`gpu-4`) went past the books in a third kernel, a feature at a time, each checked by numerical tests on the GPU and by `ImageCompare` against the strategies it improves on. It began with the tools that let the books' kernels stay as they are: a gate on their source and a comparison of their compiled machine code with the previous milestone's, which show them unchanged without rendering them, and small renders and replays of the window for the programs around them.
+
+The fifth (`gpu-5`) put that kernel's integrator on OptiX as a second tracer, unchanged, first the books' shapes, checked ray by ray against the BVH, then triangles and glTF materials, each held to the quads and the scene materials they replace by `ImageCompare`, and the denoiser; every earlier kernel stayed the same, instruction for instruction. The sixth (`gpu-6`) gave the window a panel without touching the renderer: first actions, the window's settings asked for by name and value and shown to lead exactly where the keys lead, then the panel that asks for them, models opened and dropped, and renders to a file held to the bytes of their `RayTracingGPU` commands.
+
+The milestones are tagged ([the list](../README.md#development-history)): `git log --reverse` lists the steps in order; `git switch --detach gpu-1` (or any other tag) checks out a milestone, and `git switch main` comes back.
 
 ## Third-party code and credits
 

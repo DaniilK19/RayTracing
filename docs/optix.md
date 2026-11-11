@@ -117,6 +117,12 @@ OptiX's AI denoiser is a neural network that estimates the converged image from 
 
 *`RayTracingGPU cornell-bust -w 540 --height 540 -s 4096`: the bust's marble under the box's lamp, `-p mis` and AgX.*
 
+| ![The bust and the vase at 16 samples per pixel: grainy, the floor speckled](optix/still-life-16.png) | ![The same 16 samples denoised: smooth floor and clean surfaces](optix/still-life-16-denoised.png) |
+|---|---|
+| *`RayTracingGPU still-life -w 960 --height 540 -s 16 --denoise`: the plain image, 16 samples per pixel.* | *The same 16 samples through the denoiser, `still-life-16-denoised.png`.* |
+
+*The same illustration on the textured models of `still-life` ([its 1024-sample image](optix/still-life.png)).*
+
 **The guides.** The denoiser takes a noisy beauty and two guides, an albedo and a world-space normal, from a pass of their own, so the quality kernel is unchanged. `guide_sample` follows the integrator's own camera ray, with its lens point and time, 16 samples per pixel summed pairwise, once per view at its first denoise, through either tracer: a CUDA kernel for the CUDA sessions and `__raygen__guides` for OptiX's. A matte surface, a particle, a glossy coat, a GGX metal of roughness 0.1 or more and the books' fuzzy metal stop there, with their color and shading normal (a particle has no normal, so it gives the reverse of the ray). A mirror, glass and a smoother metal pass the ray on, their weight multiplied in, up to eight such vertices. A lamp gives its color scaled into [0, 1], a miss the background clamped to [0, 1] and no normal.
 
 **The network.** OptiX's AOV model with both guides, the intensity and the average color computed over the whole image before each invoke. An image of at most 2048 on a side is tried first as one invoke. If that plan doesn't fit, or the image is larger, tiles of 2048, 1024 and 512 with the network's overlap are tried in turn, and the first plan that fits within 1024 MiB with 256 MiB of the GPU's memory left free is taken. The beauty comes from the display's two bands, with NaN set to 0 and values clamped to [0, 10⁴]. The denoised floats go through the display kernels that already exist, so a denoised PNG is the display's bytes for those floats, under any tone map, and the exposure and the tone map apply after the denoiser.
