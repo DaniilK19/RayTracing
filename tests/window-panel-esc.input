@@ -1,0 +1,12 @@
+# Esc with a box of the panel open closes the box, not the window (scripts\verify\panel.ps1, part esc), live:
+#   RayTracingViewer cornell -w 640 --height 360 -s 32 --input tests\window-panel-esc.input
+# After Esc the strategy's box is opened again and material chosen in it, then the view saved. Had Esc closed the
+# window, nothing would follow; had the box stayed open, the second click on its control would close it, and the
+# click on material would find no such control on screen: an error that ends the run.
+at 0 action panel on
+at 20 click sampling
+at 30 key Escape
+at 40 click sampling
+at 50 click sampling material
+at 70 action save
+at 90 quit

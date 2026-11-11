@@ -9,6 +9,7 @@ module;
 #include <SDL3/SDL.h>
 #include "imgui.h"
 #include "imgui_impl_sdlrenderer3.h"
+#include "imgui_internal.h" // ClosePopupsExceptModals: Esc closes an open box (close_popups)
 export module viewer_panel_host;
 
 import std;
@@ -203,6 +204,14 @@ public:
     // Whether a field of the panel has the keyboard: the window's keys then type into it
     bool typing() const { return context_ && ImGui::GetIO().WantTextInput; }
 
+    // Whether a box of the panel is open (a list's, such as the strategy's): Esc then closes it, at the next frame,
+    // rather than the window. The window's keys never reach Dear ImGui outside a field, so it wouldn't see that Esc.
+    bool popup_open() const
+    {
+        return context_ && ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel);
+    }
+    void close_popups() { close_popups_ = true; }
+
     // A frame of the panel over what the renderer holds: drawn from `state`, and what was asked for in it
     std::vector<action> frame(const panel_state& state)
     {
@@ -232,6 +241,11 @@ public:
 
         ImGui_ImplSDLRenderer3_NewFrame();
         ImGui::NewFrame();
+        if (close_popups_)
+        {
+            ImGui::ClosePopupsExceptModals();
+            close_popups_ = false;
+        }
         std::vector<action> asked =
             draw_panel(state, static_cast<float>(w), static_cast<float>(h), scale_);
         ImGui::Render();
@@ -263,5 +277,6 @@ private:
     SDL_Renderer* renderer_ = nullptr;
     float scale_ = 1;
     std::uint64_t last_ns_ = 0;
+    bool close_popups_ = false;
     bool text_input_ = false;
 };

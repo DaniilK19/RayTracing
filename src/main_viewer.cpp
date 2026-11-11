@@ -4164,8 +4164,15 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         }
         if (e.key.key == SDLK_ESCAPE && !e.key.repeat)
         {
-            // Esc closes the help first, then lets the mouse go, then stops a render to a file, and only then closes
-            // the window
+            // Esc closes an open box of the panel first (a text field takes Esc itself, above), then the help, then
+            // stops a render to a file, then lets the mouse go, and only then closes the window
+            if (panel_shown_ && panel_.popup_open())
+            {
+                panel_.close_popups();
+                panel_frames_ = 3;
+                present_needed_ = true;
+                break;
+            }
             if (help_)
             {
                 help_ = false;

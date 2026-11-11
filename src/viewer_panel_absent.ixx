@@ -20,6 +20,8 @@ public:
     void event(const SDL_Event&) {}
     bool over_panel(float, float) const { return false; }
     bool typing() const { return false; }
+    bool popup_open() const { return false; }
+    void close_popups() {}
     std::optional<std::array<float, 4>> item(std::string_view) const { return std::nullopt; }
     std::vector<action> frame(const panel_state&) { return {}; }
     void device_reset() {}

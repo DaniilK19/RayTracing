@@ -22,7 +22,9 @@
 #     still-life under OptiX with its denoised copy, each at 96x54; every file must be the bytes of the RayTracingGPU
 #     command the window printed for it, run here; a render cancelled saves nothing; the window's own view comes
 #     back at its own size.
-#   powershell -ExecutionPolicy Bypass -File scripts\verify\panel.ps1 -Step 104 [-Only actions,panel,clicks,drop,render]
+#   esc (Step 106): tests\window-panel-esc.input presses Esc with the strategy's box open: the box closes and the
+#     window stays (the box opened again, material chosen in it, the view saved).
+#   powershell -ExecutionPolicy Bypass -File scripts\verify\panel.ps1 -Step 106 [-Only actions,panel,clicks,drop,esc,render]
 # Exit code 0 when everything matches ("Panel gate: PASS"), 1 when something differs ("Panel gate: FAIL (n)"), 2 for an
 # error ("Panel gate: ERROR"), 4 when a live window is postponed ("Panel gate: POSTPONED").
 param(
@@ -50,7 +52,7 @@ if (-not (Test-Path -LiteralPath $viewer)) { throw "panel: no $viewer" }
 $run = Join-Path (Get-FullPath $State) ("runs\step{0}\panel" -f $Step)
 $script:failures = 0
 
-$allParts = @("actions", "panel", "clicks", "drop", "render")
+$allParts = @("actions", "panel", "clicks", "drop", "esc", "render")
 $named = @(($Only -join ",") -split '[,\s]+' | Where-Object { $_ })
 foreach ($part in $named) {
     if ($allParts -notcontains $part) { throw "panel: -Only takes $($allParts -join ', '), not '$part'" }
@@ -283,6 +285,33 @@ if ($runParts -contains "drop") {
     Write-Output "  its console, for review:"
     $console | Where-Object { $_ -match '^(Scene|View|Display|Note|Error|Saved|Warning):' } |
         ForEach-Object { Write-Output "    | $_" }
+}
+
+# --- esc: Esc closes an open box of the panel, not the window ---------------------------------------------------------
+
+if ($runParts -contains "esc") {
+    Write-Output "esc: tests\window-panel-esc.input, live in a window"
+    $folder = Join-Path $run "esc"
+    $console = Invoke-Window "window-panel-esc" $folder @("cornell", "-w", "640", "--height", "360", "-s", "32",
+        "--input", (Join-Path $project "tests\window-panel-esc.input"))
+    if ($null -eq $console) {
+        Write-Output ("esc: postponed: the queue opens no window while a fullscreen application is in front (or the " +
+            "GPU is too hot): run it again later")
+        Write-Output "Panel gate: POSTPONED"
+        exit 4
+    }
+    $scenes = @($console | Where-Object { $_ -like "Scene: *" })
+    $expect = @(
+        @{ what = "after Esc, the box opened again and material chosen in it"; ok = ($scenes.Count -eq 2 -and
+                $scenes[1] -like "Scene: cornell, sampling: material,*") },
+        @{ what = "the window still open to save its view"; ok = (Test-Path -LiteralPath (Join-Path $folder "cornell-view-001.png")) }
+    )
+    foreach ($e in $expect) {
+        if ($e.ok) { Write-Output "  $($e.what): PASS" }
+        else { Write-Output "  $($e.what): FAIL"; $script:failures++ }
+    }
+    Write-Output "  its console, for review:"
+    $console | Where-Object { $_ -match '^(Scene|View|Note|Error|Saved):' } | ForEach-Object { Write-Output "    | $_" }
 }
 
 # --- render: renders to a file are the bytes of their RayTracingGPU commands ------------------------------------------
