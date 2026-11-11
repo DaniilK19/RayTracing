@@ -627,6 +627,10 @@ export std::string format_frame(std::int64_t passes, int rows, std::uint64_t gen
 //   resize W H | device-reset | quit
 //   action WORDS                                    an action by name and value (viewer_actions: scene cornell,
 //                                                   exposure 0.5, samples 256...), performed before the next frame
+//   click NAME                                      a left click at the middle of the panel's control of that name,
+//                                                   where the panel drew it last (viewer_panel's panel_item: scene
+//                                                   cornell, sampling, sampling mis, optix, save...): the mouse moves
+//                                                   there, presses and lets go, as real events do
 
 export enum class input_kind
 {
@@ -640,6 +644,7 @@ export enum class input_kind
     device_reset,
     quit,
     action, // performed by the window itself, not sent through SDL
+    click,  // a click on the panel's control named `key`
 };
 
 export struct input_event
@@ -831,6 +836,19 @@ export std::expected<std::vector<input_event>, std::string> parse_input(std::str
             }
             e.kind = input_kind::action;
             e.act = std::move(*read);
+        }
+        else if (verb == "click")
+        {
+            if (args.empty())
+            {
+                return fail("click needs the name of a control of the panel");
+            }
+            // A control's name may have spaces ("scene cornell"): the rest of the line
+            for (const std::string_view part : args)
+            {
+                e.key += (e.key.empty() ? "" : " ") + std::string(part);
+            }
+            e.kind = input_kind::click;
         }
         else if (verb == "device-reset" || verb == "quit")
         {

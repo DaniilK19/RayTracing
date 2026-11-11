@@ -456,6 +456,49 @@ std::pair<int, int> default_size(double aspect, SDL_DisplayID display)
     return {std::max(64, static_cast<int>(width)), std::max(36, static_cast<int>(height))};
 }
 
+// The controls, as the help over the image lists them (H) and the panel's Keys section
+constexpr std::string_view help_lines[] = {
+    "H, F1, Esc          close this help",
+    "left drag           orbit about the point looked at",
+    "right drag          look around",
+    "middle drag         pan",
+    "Shift+left drag     pan",
+    "wheel               move closer or farther",
+    "Ctrl+wheel, - =     zoom",
+    "Shift+wheel         focus nearer or farther",
+    "double-click        focus on what is under the cursor",
+    "[ ]                 a narrower or wider lens",
+    "W A S D Q E         fly (Shift faster, Ctrl slower)",
+    "R                   back to the start view",
+    "Tab, Shift+Tab      the next or previous scene",
+    "M, Shift+M          the next or previous strategy",
+    "F2                  float32 or float64",
+    "O                   OptiX on or off",
+    "N                   denoised image, for the eye",
+    "T, Shift+T          the next or previous tone map",
+    ", .                 exposure -/+ 0.5 EV",
+    "0                   exposure back to 0 EV",
+    "Space               pause or go on refining",
+    "Enter, Shift+Enter  twice or half the samples",
+    "P                   save the image, print its command",
+    "C                   copy the RayTracingGPU command",
+    "I                   the numbers on screen",
+    "F3                  the panel",
+};
+
+// What each tone map is, for the panel's tooltips
+std::string tone_map_tip(gpu::tone_map op)
+{
+    switch (op)
+    {
+    case gpu::tone_map::books: return "the books' square root, clamped: their scenes' own bytes";
+    case gpu::tone_map::none: return "the sRGB curve, clipped";
+    case gpu::tone_map::agx: return "AgX: highlights roll off to white";
+    case gpu::tone_map::neutral: return "Khronos PBR Neutral: colors as they are, highlights compressed";
+    }
+    return "";
+}
+
 // --- The viewer ------------------------------------------------------------------------------------------------
 
 // The program's own events, registered with SDL when the window opens: one wakes SDL's loop (see iterate), the other
@@ -777,6 +820,10 @@ private:
     void draw_overlay();
     void set_panel(bool on);
     panel_state state_for_panel() const;
+    std::optional<std::string> precision_refusal() const;
+    std::vector<panel_choice> panel_scenes() const;
+    std::vector<panel_choice> panel_strategies() const;
+    std::vector<panel_choice> panel_tone_maps() const;
     void say(std::string message);
 };
 
@@ -1694,37 +1741,43 @@ SDL_AppResult viewer::go_to_scene(const std::string& name)
 // F2: the other precision, in a new session at the same view (the moves still waiting are shown first). The quality
 // kernel's integrator (in the quality kernel or in OptiX), and a tone map other than books, compute in float32 only:
 // there F2 stays and says so, with the way out.
-SDL_AppResult viewer::switch_precision()
+// Why F2 can't go to float64 from here, with the way out, or nothing when it can (or when the session is in float64
+// already: back to float32 is always open). The panel greys its precision with the same words.
+std::optional<std::string> viewer::precision_refusal() const
 {
-    if (!settings_.fp64 && session_ && gpu::uses_quality_integrator(session_->kernel()))
+    if (settings_.fp64)
+    {
+        return std::nullopt;
+    }
+    if (session_ && gpu::uses_quality_integrator(session_->kernel()))
     {
         // A book scene renders with the quality kernel under nee and mis (or --quality-kernel); the others always do.
         // OptiX was asked for (O turns it off), or the scene's triangle meshes need it.
         const gpu_scene_entry* entry = scene_entry(settings_.scene);
-        const std::string note =
-            has_meshes(*build_) ? std::format("{} has triangle meshes, which only OptiX renders, in float32",
-                                              scene_label(settings_.scene))
-            : settings_.kernel == kernel_choice::optix ? "OptiX computes in float32 only: O to turn it off first"
-            : settings_.kernel == kernel_choice::quality ? "--quality-kernel works in float32 only"
-            : entry && entry->role == scene_role::book
-                ? "the quality kernel works in float32 only: M to a books' strategy first"
-                : std::format("{} renders with the quality kernel, in float32 only", settings_.scene);
-        std::println("Note: {}", note);
-        say(note);
-        return SDL_APP_CONTINUE;
+        return has_meshes(*build_) ? std::format("{} has triangle meshes, which only OptiX renders, in float32",
+                                                 scene_label(settings_.scene))
+               : settings_.kernel == kernel_choice::optix ? "OptiX computes in float32 only: O to turn it off first"
+               : settings_.kernel == kernel_choice::quality ? "--quality-kernel works in float32 only"
+               : entry && entry->role == scene_role::book
+                   ? "the quality kernel works in float32 only: M to a books' strategy first"
+                   : std::format("{} renders with the quality kernel, in float32 only", settings_.scene);
     }
-    if (const gpu::display_options shown = shown_display(); !settings_.fp64 && shown.op != gpu::tone_map::books)
+    if (const gpu::display_options shown = shown_display(); shown.op != gpu::tone_map::books)
     {
-        const std::string note = std::format("{} works in float32 only: T to books first", tone_map_name(shown.op));
-        std::println("Note: {}", note);
-        say(note);
-        return SDL_APP_CONTINUE;
+        return std::format("{} works in float32 only: T to books first", tone_map_name(shown.op));
     }
-    if (!settings_.fp64 && denoise_)
+    if (denoise_)
     {
-        const std::string note = "OptiX's denoiser works in float32 only: N to turn it off first";
-        std::println("Note: {}", note);
-        say(note);
+        return "OptiX's denoiser works in float32 only: N to turn it off first";
+    }
+    return std::nullopt;
+}
+
+SDL_AppResult viewer::switch_precision()
+{
+    if (const std::optional<std::string> refused = precision_refusal())
+    {
+        tell(*refused);
         return SDL_APP_CONTINUE;
     }
     if (const auto applied = apply_pending_view(); !applied)
@@ -2487,7 +2540,98 @@ panel_state viewer::state_for_panel() const
         .exposure = shown.exposure,
         .has_exposure = shown.op != gpu::tone_map::books,
         .note = !note_.empty() && SDL_GetTicksNS() < note_until_ns_ ? note_ : std::string(),
+        .scene_name = settings_.scene,
+        .scenes = panel_scenes(),
+        .strategies = panel_strategies(),
+        .sampling_named = settings_.sampling ? std::string(strategy_name(*settings_.sampling)) : std::string(),
+        .tone_maps = panel_tone_maps(),
+        .optix = traces_with_optix(settings_, *build_),
+        .optix_refused = has_meshes(*build_)
+                             ? std::format("{} has triangle meshes: always OptiX", scene_label(settings_.scene))
+                         : settings_.fp64 ? "OptiX computes in float32 only: F2 first"
+                                          : std::string(),
+        .denoise = denoise_,
+        .denoise_refused = settings_.fp64 && !denoise_ ? "OptiX's denoiser works in float32 only: F2 first" : "",
+        .precision_refused = precision_refusal().value_or(""),
+        .exposure_refused = shown.op == gpu::tone_map::books ? "exposure applies to a tone map: T picks one" : "",
+        .focus_min = min_focus_,
+        .focus_max = std::max(10 * (view_.lookfrom - view_.lookat).length(), view_.focus_dist),
+        .keys = {std::begin(help_lines), std::end(help_lines)},
     };
+}
+
+// The scenes the panel lists, in their groups, each greyed with the reason the window would refuse it for, where that
+// reason is known without building the scene: the scenes beyond the books in float64 and under --all-books-kernel,
+// whose renderers compute in float32 only. Whatever else stops a scene is said when it is chosen, as with Tab.
+std::vector<panel_choice> viewer::panel_scenes() const
+{
+    std::vector<panel_choice> result;
+    for (const gpu_scene_entry& entry : gpu_scene_list())
+    {
+        std::string refused;
+        if (entry.role != scene_role::book && settings_.fp64)
+        {
+            refused = "float32 only: F2 first";
+        }
+        else if (entry.role != scene_role::book && settings_.kernel == kernel_choice::all_books &&
+                 !has_triangle_meshes(entry))
+        {
+            refused = "the quality kernel's, not --all-books-kernel's";
+        }
+        result.push_back({.name = std::string(entry.name),
+                          .group = entry.role == scene_role::book       ? "The books"
+                                   : entry.role == scene_role::showcase ? "Beyond the books"
+                                                                        : "Test scenes",
+                          .tip = std::string(entry.description),
+                          .refused = std::move(refused)});
+    }
+    return result;
+}
+
+// The strategies M steps through: the scene's own, then the list. Greyed where the reason is known without a build:
+// nee and mis in float64 or under --all-books-kernel, the books' strategies but the material's where the quality
+// kernel's integrator renders (the scenes beyond the books, --quality-kernel, OptiX)
+std::vector<panel_choice> viewer::panel_strategies() const
+{
+    const gpu_scene_entry* entry = scene_entry(settings_.scene);
+    const bool integrator = (entry && entry->role != scene_role::book) || settings_.kernel == kernel_choice::quality ||
+                            traces_with_optix(settings_, *build_);
+    std::vector<panel_choice> result{{.name = "scene",
+                                      .group = std::format("the scene's own ({})", strategy_name(build_->sampling)),
+                                      .tip = "the strategy the scene renders with by itself"}};
+    for (const strategy_entry& s : strategy_list)
+    {
+        std::string refused;
+        if (!s.books && settings_.fp64)
+        {
+            refused = "nee and mis in float32 only: F2 first";
+        }
+        else if (!s.books && settings_.kernel == kernel_choice::all_books)
+        {
+            refused = "--all-books-kernel renders the books' strategies";
+        }
+        else if (s.books && s.value != strategy::material && integrator)
+        {
+            refused = "the quality kernel's integrator takes material, nee and mis";
+        }
+        result.push_back({.name = std::string(s.name), .group = std::string(s.name),
+                          .tip = std::string(s.description), .refused = std::move(refused)});
+    }
+    return result;
+}
+
+// The tone maps T steps through, those beyond the books' bytes greyed in float64
+std::vector<panel_choice> viewer::panel_tone_maps() const
+{
+    std::vector<panel_choice> result;
+    for (const tone_map_entry& t : tone_map_list)
+    {
+        result.push_back({.name = std::string(t.name), .group = std::string(t.name), .tip = tone_map_tip(t.value),
+                          .refused = settings_.fp64 && t.value != gpu::tone_map::books
+                                         ? std::format("{} works in float32 only: F2 first", t.name)
+                                         : std::string()});
+    }
+    return result;
 }
 
 // The numbers at the top of the window, a note at the bottom and the help, in SDL's built-in 8×8 font, scaled with the
@@ -2495,34 +2639,6 @@ panel_state viewer::state_for_panel() const
 // the image's numbers.
 void viewer::draw_overlay()
 {
-    static constexpr std::string_view help[] = {
-        "H, F1, Esc          close this help",
-        "left drag           orbit about the point looked at",
-        "right drag          look around",
-        "middle drag         pan",
-        "Shift+left drag     pan",
-        "wheel               move closer or farther",
-        "Ctrl+wheel, - =     zoom",
-        "Shift+wheel         focus nearer or farther",
-        "double-click        focus on what is under the cursor",
-        "[ ]                 a narrower or wider lens",
-        "W A S D Q E         fly (Shift faster, Ctrl slower)",
-        "R                   back to the start view",
-        "Tab, Shift+Tab      the next or previous scene",
-        "M, Shift+M          the next or previous strategy",
-        "F2                  float32 or float64",
-        "O                   OptiX on or off",
-        "N                   denoised image, for the eye",
-        "T, Shift+T          the next or previous tone map",
-        ", .                 exposure -/+ 0.5 EV",
-        "0                   exposure back to 0 EV",
-        "Space               pause or go on refining",
-        "Enter, Shift+Enter  twice or half the samples",
-        "P                   save the image, print its command",
-        "C                   copy the RayTracingGPU command",
-        "I                   the numbers on screen",
-        "F3                  the panel",
-    };
     constexpr float line = 10; // 8 pixels of text and 2 of space
     constexpr float bar_height = 3 * line + 6;
     constexpr float note_height = line + 6;
@@ -2549,7 +2665,7 @@ void viewer::draw_overlay()
     // their size when it opens); at 1 it shows as many lines as fit, the way out first
     const bool top_bar = hud_ && !panel_shown_;           // the panel shows the numbers itself
     const float top = (top_bar ? bar_height + 6 : 8) * scale; // in the window's pixels
-    const float help_height = static_cast<float>(std::size(help)) * line + 4;
+    const float help_height = static_cast<float>(std::size(help_lines)) * line + 4;
     const float help_scale = std::max(1.0f, std::min(scale, std::floor((h - top - note_height * scale) / help_height)));
     SDL_SetRenderDrawBlendMode(renderer_, SDL_BLENDMODE_BLEND);
     const auto text = [&](float x, float y, const std::string& s) {
@@ -2564,7 +2680,7 @@ void viewer::draw_overlay()
         const SDL_FRect box{0, 0, w / help_scale, h / help_scale};
         SDL_RenderFillRect(renderer_, &box);
         float y = top / help_scale;
-        for (const std::string_view entry : help)
+        for (const std::string_view entry : help_lines)
         {
             text(8, y, std::string(entry));
             y += line;
@@ -2908,7 +3024,7 @@ SDL_AppResult viewer::init()
         // --input: key names SDL knows (the `after MS` events' timers start with the clock, below)
         for (const input_event& e : input_)
         {
-            if (!e.key.empty() && SDL_GetKeyFromName(e.key.c_str()) == SDLK_UNKNOWN)
+            if (e.kind != input_kind::click && !e.key.empty() && SDL_GetKeyFromName(e.key.c_str()) == SDLK_UNKNOWN)
             {
                 return fail(std::format("{}: line {}: SDL knows no key '{}'", to_utf8(*opts_.input), e.line, e.key));
             }
@@ -3583,6 +3699,29 @@ std::expected<void, std::string> viewer::perform(const input_event& e)
         actions_.push_back(*e.act);
         event.type = wake_type;
         break;
+    case input_kind::click:
+    {
+        // The middle of the control where the panel drew it last: the mouse moves there, presses and lets go, three
+        // events Dear ImGui takes a frame each
+        const std::optional<std::array<float, 4>> place = panel_shown_ ? panel_.item(e.key) : std::nullopt;
+        if (!place)
+        {
+            return std::unexpected(std::format("{}: line {}: the panel has no control '{}' on screen",
+                                               to_utf8(*opts_.input), e.line, e.key));
+        }
+        const double x = ((*place)[0] + (*place)[2]) / 2;
+        const double y = ((*place)[1] + (*place)[3]) / 2;
+        for (const input_kind kind : {input_kind::mouse_move, input_kind::mouse_down, input_kind::mouse_up})
+        {
+            const input_event step{.line = e.line, .at_frame = e.at_frame, .after_ms = e.after_ms, .kind = kind,
+                                   .button = 1, .x = x, .y = y, .dx = x - input_x_, .dy = y - input_y_};
+            if (const auto sent = perform(step); !sent)
+            {
+                return sent;
+            }
+        }
+        return {};
+    }
     case input_kind::key_down:
     case input_kind::key_up:
     {

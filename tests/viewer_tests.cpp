@@ -4,6 +4,8 @@
 //     and release, a wheel step's modifier around it, the order of the frames, and what is refused, with the line;
 //   - viewer_actions' actions: every action written as its line and read back to the same action, what is refused
 //     and why, and the samples to refine to as whole rounds of strata;
+//   - the panel (tests/panel_tests.cpp, where the build has Dear ImGui): drawn without a window, clicked, and what it
+//     asks for;
 //   - viewer_script's camera scripts: settings and frames read, and a recorded frame line (format_frame) read back to
 //     the very numbers it was written from, bit for bit: a recording replays the view the window showed;
 //   - viewer_camera's moves: a move by nothing returns the settings unchanged, bit for bit; each move changes what it
@@ -74,6 +76,7 @@ std::string_view kind_name(input_kind kind)
     case input_kind::device_reset: return "device-reset";
     case input_kind::quit: return "quit";
     case input_kind::action: return "action";
+    case input_kind::click: return "click";
     }
     return "?";
 }
@@ -146,6 +149,9 @@ void test_input(report& r)
            "'scene \"C:\\My models\\bust (1).glb\"']");
     events("an-action-without-a-name", "at 0 action", "error: line 1: an action needs its name");
     events("an-unknown-action", "at 0 action fly", "error: line 1: unknown action 'fly'");
+    events("click", "at 9 click scene cornell",
+           "[line 1 at 9 after -1 click key 'scene cornell' button 0 x 0 y 0 dx 0 dy 0 clicks 1]");
+    events("click-without-a-control", "at 9 click", "error: line 1: click needs the name of a control of the panel");
     events("an-action's-bad-value", "at 0 quit\nat 2 action exposure high",
            "error: line 2: exposure needs a number of stops from -24 to 24");
 
@@ -482,6 +488,11 @@ void test_camera(report& r)
 }
 }
 
+#ifdef VIEWER_TESTS_PANEL
+// The panel's checks (tests/panel_tests.cpp), where the build has Dear ImGui
+void test_panel(const std::function<void(std::string_view, bool, std::string_view, std::string_view)>& check);
+#endif
+
 int main()
 {
     report r;
@@ -489,6 +500,13 @@ int main()
     test_actions(r);
     test_script(r);
     test_camera(r);
+#ifdef VIEWER_TESTS_PANEL
+    test_panel([&](std::string_view name, bool pass, std::string_view found, std::string_view expected) {
+        r.check(name, pass, found, expected);
+    });
+#else
+    std::println("panel: not in this build (no Dear ImGui), INFO");
+#endif
     std::println("\nViewerTests: {} checks, {} failed", r.checks(), r.failures());
     return r.failures() == 0 ? 0 : 1;
 }

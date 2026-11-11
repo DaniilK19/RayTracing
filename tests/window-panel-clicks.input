@@ -1,0 +1,21 @@
+# The panel's controls, clicked (scripts\verify\panel.ps1, part clicks), live:
+#   RayTracingViewer cornell -w 1280 --height 720 -s 32 --input tests\window-panel-clicks.input --record r.txt
+# tests\window-panel-asked.input asks for the same by actions, at the same frames; the two recordings must hold the
+# same settings in the same order and end on the same frame, and the two saves must be the same bytes. A click is
+# three events (the mouse moves to the control's middle, presses, lets go), which the panel takes over two frames.
+at 0 action panel on
+# The scene list: checker, a book scene in sight in the list's box
+at 20 click scene checker
+# The strategy's box opened, then material in it
+at 50 click sampling
+at 55 click sampling material
+# The tone map's box, agx; the exposure up twice
+at 80 click tonemap
+at 85 click tonemap agx
+at 110 click exposure up
+at 120 click exposure up
+# Twice the samples; the lens's slider is left alone, which must change nothing
+at 140 click samples twice
+# Saved once the image is done
+at 260 click save
+at 280 quit

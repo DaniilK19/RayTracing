@@ -194,6 +194,12 @@ public:
                ImGui::GetIO().WantCaptureMouse;
     }
 
+    // Where the panel drew its control of that name in its last frame (an input file's click line), or nothing
+    std::optional<std::array<float, 4>> item(std::string_view name) const
+    {
+        return context_ ? panel_item(name) : std::nullopt;
+    }
+
     // Whether a field of the panel has the keyboard: the window's keys then type into it
     bool typing() const { return context_ && ImGui::GetIO().WantTextInput; }
 

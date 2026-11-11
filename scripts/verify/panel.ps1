@@ -13,7 +13,10 @@
 #     show one view to the end (the camera never moved), and no frame in the 1.4 s after the image is done (the
 #     window, the panel shown, sleeps). tests\window-panel-off.input, the same events without the panel, must move the
 #     camera: the check can fail. The last frame of the window as it was (--frames-hud) is named for review.
-#   powershell -ExecutionPolicy Bypass -File scripts\verify\panel.ps1 -Step 101 [-Only actions,panel]
+#   clicks (Step 102): tests\window-panel-clicks.input clicks the panel's controls (a scene, the strategy's and the
+#     tone map's boxes, the exposure, the samples, Save) in a 1280x720 window, tests\window-panel-asked.input asks for
+#     the same by actions at the same frames: the same settings, the same last frame, the same files saved.
+#   powershell -ExecutionPolicy Bypass -File scripts\verify\panel.ps1 -Step 102 [-Only actions,panel,clicks]
 # Exit code 0 when everything matches ("Panel gate: PASS"), 1 when something differs ("Panel gate: FAIL (n)"), 2 for an
 # error ("Panel gate: ERROR"), 4 when a live window is postponed ("Panel gate: POSTPONED").
 param(
@@ -41,7 +44,7 @@ if (-not (Test-Path -LiteralPath $viewer)) { throw "panel: no $viewer" }
 $run = Join-Path (Get-FullPath $State) ("runs\step{0}\panel" -f $Step)
 $script:failures = 0
 
-$allParts = @("actions", "panel")
+$allParts = @("actions", "panel", "clicks")
 $named = @(($Only -join ",") -split '[,\s]+' | Where-Object { $_ })
 foreach ($part in $named) {
     if ($allParts -notcontains $part) { throw "panel: -Only takes $($allParts -join ', '), not '$part'" }
@@ -112,9 +115,31 @@ function Get-Sha256([string]$path) {
 
 # --- actions: the same state by keys and by actions ------------------------------------------------------------------
 
-function Get-ActionsRun([string]$name, [string]$inputFile) {
+# Two runs that must end in the same state: the recordings' settings and last frame, what was saved, and its bytes
+function Test-SameState($a, $b, [string]$stem = "light") {
+    Test-Equal "the recordings' settings" $a.settings $b.settings
+    Test-Equal "the last frame recorded" @($a.last) @($b.last)
+    Test-Equal "what was saved, and its command" $a.saved $b.saved
+    foreach ($file in @("$stem-view-001.png", "$stem-view-001.pfm")) {
+        $x = Join-Path $a.folder $file
+        $y = Join-Path $b.folder $file
+        if (-not (Test-Path -LiteralPath $x) -or -not (Test-Path -LiteralPath $y)) {
+            Write-Output "  ${file}: MISSING, FAIL"
+            $script:failures++
+        }
+        elseif ((Get-Sha256 $x) -ceq (Get-Sha256 $y)) {
+            Write-Output ("  {0}: the same bytes ({1}), PASS" -f $file, (Get-Sha256 $x).Substring(0, 16))
+        }
+        else {
+            Write-Output "  ${file}: DIFFERENT bytes, FAIL"
+            $script:failures++
+        }
+    }
+}
+
+function Get-ActionsRun([string]$name, [string]$inputFile, [string]$width = "320", [string]$height = "180") {
     $folder = Join-Path $run $name
-    $console = Invoke-Window "window-$name" $folder @("cornell", "-w", "320", "--height", "180", "-s", "32",
+    $console = Invoke-Window "window-$name" $folder @("cornell", "-w", $width, "--height", $height, "-s", "32",
         "--input", (Join-Path $project $inputFile), "--record", "record.txt")
     if ($null -eq $console) { return $null }
     $record = @(Get-Content -LiteralPath (Join-Path $folder "record.txt"))
@@ -144,25 +169,8 @@ if ($runParts -contains "actions") {
         Write-Output "Panel gate: POSTPONED"
         exit 4
     }
-    Test-Equal "the recordings' settings" $keys.settings $acts.settings
-    Test-Equal "the last frame recorded" @($keys.last) @($acts.last)
+    Test-SameState $keys $acts
     Test-Within "the actions' Scene, View, Display and Note lines" $acts.console $keys.console
-    Test-Equal "what was saved, and its command" $keys.saved $acts.saved
-    foreach ($file in @("light-view-001.png", "light-view-001.pfm")) {
-        $a = Join-Path $keys.folder $file
-        $b = Join-Path $acts.folder $file
-        if (-not (Test-Path -LiteralPath $a) -or -not (Test-Path -LiteralPath $b)) {
-            Write-Output "  ${file}: MISSING, FAIL"
-            $script:failures++
-        }
-        elseif ((Get-Sha256 $a) -ceq (Get-Sha256 $b)) {
-            Write-Output ("  {0}: the same bytes ({1}), PASS" -f $file, (Get-Sha256 $a).Substring(0, 16))
-        }
-        else {
-            Write-Output "  ${file}: DIFFERENT bytes, FAIL"
-            $script:failures++
-        }
-    }
     Write-Output "  the keys' run, for review:"
     $keys.console | ForEach-Object { Write-Output "    | $_" }
     $keys.settings | ForEach-Object { Write-Output "    r $_" }
@@ -218,6 +226,25 @@ if ($runParts -contains "panel") {
     }
     $frames = @(Get-ChildItem -LiteralPath (Join-Path $on.folder "frames") -Filter "*.png" | Sort-Object Name)
     if ($frames.Count -gt 0) { Write-Output "  the window as it was, for review: $($frames[-1].FullName)" }
+}
+
+# --- clicks: the panel's controls clicked lead where the actions lead -------------------------------------------------
+
+if ($runParts -contains "clicks") {
+    Write-Output "clicks: tests\window-panel-clicks.input against tests\window-panel-asked.input, each live in a window"
+    $clicked = Get-ActionsRun "clicks" "tests\window-panel-clicks.input" "1280" "720"
+    $asked = if ($null -ne $clicked) { Get-ActionsRun "asked" "tests\window-panel-asked.input" "1280" "720" } else { $null }
+    if ($null -eq $clicked -or $null -eq $asked) {
+        Write-Output ("clicks: postponed: the queue opens no window while a fullscreen application is in front (or " +
+            "the GPU is too hot): run it again later")
+        Write-Output "Panel gate: POSTPONED"
+        exit 4
+    }
+    Test-SameState $clicked $asked "checker"
+    Write-Output "  the clicks' run, for review:"
+    $clicked.console | ForEach-Object { Write-Output "    | $_" }
+    $clicked.settings | ForEach-Object { Write-Output "    r $_" }
+    Write-Output "    r $($clicked.last)"
 }
 
 if ($script:failures -gt 0) {

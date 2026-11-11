@@ -324,6 +324,16 @@ export std::int64_t whole_rounds(std::int64_t samples, int strata)
 // (viewer::state_for_panel in main_viewer.cpp), and the panel draws from it alone (viewer_panel), so the panel can be
 // drawn, and tested, without a window, a scene or a GPU. What it asks for comes back as actions.
 
+// A choice of a list the panel shows (a scene, a strategy, a tone map): its name as an action names it, the text the
+// panel shows for it (or its group, for a scene), a tooltip, and why the window would refuse it, or nothing
+export struct panel_choice
+{
+    std::string name;
+    std::string group;
+    std::string tip;
+    std::string refused;
+};
+
 export struct panel_state
 {
     // The image: what the bar at the top of the window shows when the panel is hidden
@@ -347,4 +357,20 @@ export struct panel_state
     double exposure = 0;
     bool has_exposure = false;
     std::string note;               // the note at the bottom of the window, while it shows
+
+    // The controls: what each list holds, what is chosen, and what the window would refuse
+    std::string scene_name;                // the scene as an action names it (a model's file: its path)
+    std::vector<panel_choice> scenes;      // every scene, in its group
+    std::vector<panel_choice> strategies;  // "scene" (the scene's own, its text in `group`), then the list
+    std::string sampling_named;            // the strategy asked for, or empty for the scene's own
+    std::vector<panel_choice> tone_maps;
+    bool optix = false;                    // the image is traced with OptiX
+    std::string optix_refused;             // why it can't change here
+    bool denoise = false;
+    std::string denoise_refused;
+    std::string precision_refused;         // why float64 can't be chosen here
+    std::string exposure_refused;          // why the exposure doesn't apply
+    double focus_min = 0;                  // the focus slider's range
+    double focus_max = 0;
+    std::vector<std::string_view> keys;    // the controls' list, as the help shows it
 };

@@ -1,0 +1,12 @@
+# What tests\window-panel-clicks.input clicks, asked for by actions at the same frames (scripts\verify\panel.ps1, part
+# clicks), live:
+#   RayTracingViewer cornell -w 1280 --height 720 -s 32 --input tests\window-panel-asked.input --record r.txt
+at 0 action panel on
+at 20 action scene checker
+at 55 action sampling material
+at 85 action tonemap agx
+at 110 action exposure 0.5
+at 120 action exposure 1
+at 140 action samples 64
+at 260 action save
+at 280 quit
