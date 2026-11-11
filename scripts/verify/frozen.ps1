@@ -7,6 +7,9 @@
 #       65f297b (Step 85): every header beyond the books' that the quality and
 #         tone-map kernels compile, the tone maps, the lamp and environment tables, the nine test suites of milestone 4
 #         and the headers and regression lists they share, the HDR environment maps;
+#       83b1b4b (Step 98): everything the GPU renders with, for the steps that add the window's panel and change no
+#         kernel: the whole of src/gpu (the kernels, OptiX's programs and their host code, renderer.h), the test
+#         suites' kernels and their device headers, the CMake modules that compile and embed OptiX's programs, cgltf;
 #   - the blob pins below: a file frozen by the step that wrote it (a commit can't name its own hash) is still that
 #     blob: `git hash-object` of the working file, through git's own line-end filters, equals the pinned SHA-1; a
 #     pinned file that is missing or untracked fails too;
@@ -100,6 +103,12 @@ $frozenSets = @(
             "tests/harness_tests.cu", "tests/lamp_tests.cu", "tests/routing_tests.cu", "tests/services_tests.cu",
             "tests/tone_tests.cu", "tests/gpu_test.cuh", "tests/statistics.h", "tests/test_scene.h",
             "tests/regress-viewer.txt", "tests/regress-tone.txt", "assets/*.hdr")
+    },
+    @{
+        base = "83b1b4b"; name = "Step 98"
+        paths = @(
+            "src/gpu", "tests/*.cu", "tests/*.cuh", "tests/optix_fixture.h", "tests/tracer_check_layout.h",
+            "cmake/optix.cmake", "cmake/embed.cmake", "external/cgltf")
     })
 
 # ---- BLOB PINS: (path, git blob SHA-1 of the file as committed) ------------------------------------------------------
@@ -156,6 +165,14 @@ $selfTestCases = @(
        plant = { param($w) Edit-OneByte $w "docs/viewer.gif" } },
     @{ name = "one byte of $selfTestPin changed (blob-pinned for the self-test)"; expect = "FAIL"
        plant = { param($w) Edit-OneByte $w $selfTestPin } },
+    @{ name = "a line appended to src/gpu/optix/programs.cu (frozen since Step 98)"; expect = "FAIL"
+       plant = { param($w) Add-LineTo $w "src/gpu/optix/programs.cu" "// planted by frozen.ps1 -SelfTest" } },
+    @{ name = "a line appended to src/gpu/renderer.h (frozen since Step 98)"; expect = "FAIL"
+       plant = { param($w) Add-LineTo $w "src/gpu/renderer.h" "// planted by frozen.ps1 -SelfTest" } },
+    @{ name = "an untracked src/gpu/x.cuh"; expect = "FAIL"
+       plant = { param($w) New-FileIn $w "src/gpu/x.cuh" "// planted by frozen.ps1 -SelfTest`n" } },
+    @{ name = "an untracked src/viewer_x.cpp (the window's host code, beside src/gpu)"; expect = "PASS"
+       plant = { param($w) New-FileIn $w "src/viewer_x.cpp" "// planted by frozen.ps1 -SelfTest`n" } },
     @{ name = "an untracked external/stb/x.h"; expect = "FAIL"
        plant = { param($w) New-FileIn $w "external/stb/x.h" "// planted by frozen.ps1 -SelfTest`n" } },
     @{ name = "an untracked external/x.h (outside external/stb)"; expect = "PASS"
@@ -198,6 +215,16 @@ $cmakeCases = @(
     @{ expect = "PASS"; file = "cmake/x.cmake"; text = 'target_sources(GpuTests PRIVATE tests/x.cpp)' },
     @{ expect = "PASS"; file = "CMakeLists.txt"
        text = 'target_include_directories(GpuTests PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})' },
+    @{ expect = "PASS"; file = "cmake/x.cmake"
+       name = "cmake/x.cmake: the viewer's lines (cmake/viewer.cmake's kind): a test program with copies of its modules"
+       text = (@(
+           'if(TARGET RayTracingViewer)',
+           '    add_executable(ViewerTests2 tests/viewer_tests.cpp src/utf8.manifest)',
+           '    target_sources(ViewerTests2 PRIVATE FILE_SET CXX_MODULES FILES src/viewer_camera.ixx)',
+           '    target_link_libraries(ViewerTests2 PRIVATE gpu_scene)',
+           '    target_compile_options(ViewerTests2 PRIVATE /W4)',
+           '    target_sources(RayTracingViewer PRIVATE src/viewer_x.cpp)',
+           'endif()') -join "`n") },
     @{ expect = "PASS"; file = "cmake/x.cmake"
        name = "cmake/x.cmake: OptiX's lines (cmake/optix.cmake's kind), and nvcc's folder read from CMAKE_CUDA_COMPILER"
        text = (@(

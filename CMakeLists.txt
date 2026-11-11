@@ -214,3 +214,6 @@ endif()
 # NVIDIA's OptiX for --optix, triangle meshes and the denoiser: a file of its own, after the lines above, which stay
 include(cmake/optix.cmake)
 include(cmake/meshes.cmake)
+
+# What the viewer gains after cmake/sdl3.cmake, and ViewerTests, the checks of its logic without a window: last
+include(cmake/viewer.cmake)
