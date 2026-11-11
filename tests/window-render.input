@@ -1,0 +1,18 @@
+# Renders to a file from the window (scripts\verify\panel.ps1, part render), live:
+#   RayTracingViewer cornell -w 320 --height 180 -s 16 --input tests\window-render.input
+# Each render's files must be the bytes of the RayTracingGPU command it printed, run; the window's own view must come
+# back at its own size after each; a render cancelled must save nothing.
+#
+# The Cornell box (CUDA) at 96x54 and 64 samples: cornell-render-001.png and .pfm
+at 0 action render 96 54 64
+# still-life (OptiX) at 96x54, 16 samples asked for, rendered as a whole round of 64, with its denoised copy:
+# still-life-render-002.png, .pfm and -denoised.png (the files of a run are numbered in turn, whatever the scene)
+at 60 action scene still-life
+at 90 action render 96 54 16 denoised
+# Back to the Cornell box: a render far too long, cancelled after a few frames
+at 150 action scene cornell
+at 170 action render 1920 1080 1000000
+at 176 action render-cancel
+# The window's own view, saved as P saves it: 320x180 again
+at 200 action save
+at 220 quit

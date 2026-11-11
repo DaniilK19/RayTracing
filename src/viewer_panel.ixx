@@ -365,6 +365,120 @@ void draw_display(const panel_state& state, std::vector<action>& asked)
                 [&](bool on) { asked.push_back(use_denoise{on}); });
 }
 
+// The render to a file's choices, kept between frames (the panel's own, not the window's: they become an action only
+// when Render is pressed). Zero: not chosen yet, the window's own then.
+struct render_choice
+{
+    int preset = 0; // 0 the window's size, then the presets below, then custom
+    int width = 0;
+    int height = 0;
+    std::int64_t samples = 0;
+    bool denoised = false;
+};
+render_choice chosen_render;
+
+constexpr std::array<std::pair<int, int>, 4> render_presets{{{1280, 720}, {1920, 1080}, {2560, 1440}, {3840, 2160}}};
+
+void draw_render_to_file(const panel_state& state, std::vector<action>& asked)
+{
+    if (state.rendering)
+    {
+        const float done = state.render_target > 0 ? static_cast<float>(state.render_passes) /
+                                                         static_cast<float>(state.render_target)
+                                                   : 0.0f;
+        text(std::format("rendering {}x{}", state.render_width, state.render_height));
+        ImGui::ProgressBar(done, ImVec2(-1, 0),
+                           std::format("{} / {} samples", state.render_passes, state.render_target).c_str());
+        const double left = state.render_passes > 0
+                                ? state.render_seconds * static_cast<double>(state.render_target - state.render_passes) /
+                                      static_cast<double>(state.render_passes)
+                                : 0;
+        text(state.render_passes > 0 ? std::format("{:.0f} s, about {:.0f} s left", state.render_seconds, left)
+                                     : std::format("{:.0f} s", state.render_seconds));
+        if (button("Cancel", "render-cancel", "stop, and save nothing (Esc)"))
+        {
+            asked.push_back(cancel_render{});
+        }
+        return;
+    }
+    render_choice& c = chosen_render;
+    if (c.samples == 0)
+    {
+        c.samples = state.target;
+    }
+    // The size: the window's, a preset, or typed
+    const std::string window = std::format("the window's ({}x{})", state.width, state.height);
+    const auto preset_name = [&](int k) {
+        return k == 0                              ? window
+               : k <= std::ssize(render_presets) ? std::format("{}x{}", render_presets[k - 1].first,
+                                                                 render_presets[k - 1].second)
+                                                   : std::string("custom");
+    };
+    label("size");
+    const bool opened = ImGui::BeginCombo("##render-size", preset_name(c.preset).c_str());
+    remember("render size");
+    if (opened)
+    {
+        for (int k = 0; k <= std::ssize(render_presets) + 1; ++k)
+        {
+            if (ImGui::Selectable(preset_name(k).c_str(), k == c.preset))
+            {
+                c.preset = k;
+            }
+            remember(std::format("render size {}", preset_name(k)));
+        }
+        ImGui::EndCombo();
+    }
+    int width = c.preset == 0 ? state.width : c.preset <= std::ssize(render_presets) ? render_presets[c.preset - 1].first
+                                                                                     : c.width;
+    int height = c.preset == 0 ? state.height
+                 : c.preset <= std::ssize(render_presets) ? render_presets[c.preset - 1].second
+                                                          : c.height;
+    if (c.preset == std::ssize(render_presets) + 1)
+    {
+        if (c.width == 0)
+        {
+            c.width = state.width;
+            c.height = state.height;
+        }
+        label("width");
+        ImGui::InputInt("##render-width", &c.width, 0);
+        label("height");
+        ImGui::InputInt("##render-height", &c.height, 0);
+        width = c.width;
+        height = c.height;
+    }
+    label("samples");
+    ImGui::InputScalar("##render-samples", ImGuiDataType_S64, &c.samples);
+    remember("render samples");
+    tip("samples per pixel, rounded up to whole rounds of strata");
+    ImGui::BeginDisabled(!state.denoise_refused.empty());
+    ImGui::Checkbox("denoised copy too", &c.denoised);
+    ImGui::EndDisabled();
+    remember("render denoised");
+    tip(state.denoise_refused.empty() ? "also <scene>-render-NNN-denoised.png, OptiX's AI denoiser's (biased: for the eye)"
+                                      : state.denoise_refused);
+    const bool fits = width >= min_render_side && width <= max_render_side && height >= min_render_side &&
+                      height <= max_render_side && std::int64_t{width} * height <= max_render_pixels &&
+                      c.samples >= 1 && c.samples <= max_action_samples;
+    const std::string refused = !state.render_refused.empty() ? state.render_refused
+                                : !fits ? std::format("sides from {} to {} pixels, {} pixels at most in all; "
+                                                      "samples from 1",
+                                                      min_render_side, max_render_side, max_render_pixels)
+                                        : std::string();
+    ImGui::BeginDisabled(!refused.empty());
+    const bool pressed = ImGui::Button("Render to file");
+    ImGui::EndDisabled();
+    remember("render");
+    tip(refused.empty() ? "this view at this size, saved as <scene>-render-NNN.png and .pfm in the current folder, "
+                          "with the RayTracingGPU command that renders it again; the window shows it growing"
+                        : refused);
+    if (pressed && refused.empty())
+    {
+        asked.push_back(render_image{width, height, c.samples, c.denoised && state.denoise_refused.empty()});
+    }
+}
+
 void draw_output(std::vector<action>& asked)
 {
     if (button("Save image", "save", "the image as <scene>-view-NNN.png and .pfm, and its RayTracingGPU command (P)"))
@@ -436,6 +550,10 @@ export std::vector<action> draw_panel(const panel_state& state, float window_wid
         if (section("Output", true))
         {
             draw_output(asked);
+        }
+        if (section("Render to file", true))
+        {
+            draw_render_to_file(state, asked);
         }
         if (section("Keys", false))
         {

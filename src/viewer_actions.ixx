@@ -32,6 +32,11 @@ import tone_options;
 //   hud on | off | help on | off    the numbers on screen (I), the controls over the image (H)
 //   panel on | off                  the panel (F3)
 //   open                            the system's dialog to open a glTF model's file, shown as a scene
+//   render W H N [denoised]         the view rendered to a file of W×H pixels and N samples per pixel (rounded up
+//                                   to whole rounds of strata), saved as <scene>-render-NNN.png and .pfm with its
+//                                   RayTracingGPU command, and denoised too; the window shows it growing, then its own
+//                                   view again
+//   render-cancel                   the render to a file stopped, nothing saved
 // An action the window can't perform leaves it as it was and says why, as the key does.
 
 export struct show_scene
@@ -128,10 +133,29 @@ export struct open_file
     bool operator==(const open_file&) const = default;
 };
 
+export struct render_image
+{
+    int width;
+    int height;
+    std::int64_t samples;
+    bool denoised = false;
+    bool operator==(const render_image&) const = default;
+};
+export struct cancel_render
+{
+    bool operator==(const cancel_render&) const = default;
+};
+
+// The sizes a render to a file may have: each side from 16 to 16384 pixels, and no more pixels than 8K UHD's
+// (7680×4320), which the window's session holds in about 1.3 GB of the GPU's memory
+export constexpr int min_render_side = 16;
+export constexpr int max_render_side = 16384;
+export constexpr std::int64_t max_render_pixels = std::int64_t{7680} * 4320;
+
 export using action =
     std::variant<show_scene, use_sampling, use_precision, use_optix, use_denoise, use_tone_map, use_exposure,
                  use_samples, use_pause, use_vfov, use_lens, use_focus, reset_view, save_image, copy_command, show_hud,
-                 show_help, show_panel, open_file>;
+                 show_help, show_panel, open_file, render_image, cancel_render>;
 
 // The most samples an action may ask for: the renderer numbers a view's passes with ints
 export constexpr std::int64_t max_action_samples = std::numeric_limits<std::int32_t>::max();
@@ -263,6 +287,33 @@ export std::expected<action, std::string> parse_action(std::span<const std::stri
     {
         return alone(open_file{});
     }
+    if (verb == "render-cancel")
+    {
+        return alone(cancel_render{});
+    }
+    if (verb == "render")
+    {
+        const std::optional<int> width = w.size() >= 3 ? parse_number<int>(w[1]) : std::nullopt;
+        const std::optional<int> height = w.size() >= 3 ? parse_number<int>(w[2]) : std::nullopt;
+        const std::optional<std::int64_t> samples =
+            w.size() >= 4 ? parse_number<std::int64_t>(w[3]) : std::nullopt;
+        const bool denoised = w.size() == 5 && w[4] == "denoised";
+        if (!width || !height || !samples || w.size() > 5 || (w.size() == 5 && !denoised))
+        {
+            return std::unexpected("render needs W H N, and maybe denoised");
+        }
+        if (*width < min_render_side || *width > max_render_side || *height < min_render_side ||
+            *height > max_render_side || std::int64_t{*width} * *height > max_render_pixels)
+        {
+            return std::unexpected(std::format("render's sides are from {} to {} pixels, {} pixels at most in all",
+                                               min_render_side, max_render_side, max_render_pixels));
+        }
+        if (*samples < 1 || *samples > max_action_samples)
+        {
+            return std::unexpected(std::format("render needs samples from 1 to {}", max_action_samples));
+        }
+        return render_image{*width, *height, *samples, denoised};
+    }
     return std::unexpected(std::format("unknown action '{}'", verb));
 }
 
@@ -307,6 +358,11 @@ struct action_writer
     std::string operator()(const show_help& h) const { return std::format("help {}", on_word(h.on)); }
     std::string operator()(const show_panel& p) const { return std::format("panel {}", on_word(p.on)); }
     std::string operator()(const open_file&) const { return "open"; }
+    std::string operator()(const render_image& r) const
+    {
+        return std::format("render {} {} {}{}", r.width, r.height, r.samples, r.denoised ? " denoised" : "");
+    }
+    std::string operator()(const cancel_render&) const { return "render-cancel"; }
 };
 }
 
@@ -384,4 +440,13 @@ export struct panel_state
     double focus_min = 0;                  // the focus slider's range
     double focus_max = 0;
     std::vector<std::string_view> keys;    // the controls' list, as the help shows it
+
+    // Render to a file: why it can't start here, or what it is doing
+    std::string render_refused;
+    bool rendering = false;
+    int render_width = 0;
+    int render_height = 0;
+    std::int64_t render_passes = 0;        // complete passes so far
+    std::int64_t render_target = 0;
+    double render_seconds = 0;             // since it started
 };

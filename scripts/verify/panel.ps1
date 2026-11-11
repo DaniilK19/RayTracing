@@ -18,7 +18,11 @@
 #     the same by actions at the same frames: the same settings, the same last frame, the same files saved.
 #   drop (Step 103): tests\window-drop.input drops a glTF model on a live window (shown, with OptiX), then README.md
 #     and a .glb cut short (each refused with its reason, the model still shown), and saves the model's image.
-#   powershell -ExecutionPolicy Bypass -File scripts\verify\panel.ps1 -Step 103 [-Only actions,panel,clicks,drop]
+#   render (Step 104): tests\window-render.input renders to files from a live window: the Cornell box under CUDA, and
+#     still-life under OptiX with its denoised copy, each at 96x54; every file must be the bytes of the RayTracingGPU
+#     command the window printed for it, run here; a render cancelled saves nothing; the window's own view comes
+#     back at its own size.
+#   powershell -ExecutionPolicy Bypass -File scripts\verify\panel.ps1 -Step 104 [-Only actions,panel,clicks,drop,render]
 # Exit code 0 when everything matches ("Panel gate: PASS"), 1 when something differs ("Panel gate: FAIL (n)"), 2 for an
 # error ("Panel gate: ERROR"), 4 when a live window is postponed ("Panel gate: POSTPONED").
 param(
@@ -46,7 +50,7 @@ if (-not (Test-Path -LiteralPath $viewer)) { throw "panel: no $viewer" }
 $run = Join-Path (Get-FullPath $State) ("runs\step{0}\panel" -f $Step)
 $script:failures = 0
 
-$allParts = @("actions", "panel", "clicks", "drop")
+$allParts = @("actions", "panel", "clicks", "drop", "render")
 $named = @(($Only -join ",") -split '[,\s]+' | Where-Object { $_ })
 foreach ($part in $named) {
     if ($allParts -notcontains $part) { throw "panel: -Only takes $($allParts -join ', '), not '$part'" }
@@ -278,6 +282,75 @@ if ($runParts -contains "drop") {
     }
     Write-Output "  its console, for review:"
     $console | Where-Object { $_ -match '^(Scene|View|Display|Note|Error|Saved|Warning):' } |
+        ForEach-Object { Write-Output "    | $_" }
+}
+
+# --- render: renders to a file are the bytes of their RayTracingGPU commands ------------------------------------------
+
+# A command line's words, as the C runtime reads them: a "quoted part" is one word, its quotes dropped
+function Split-Command([string]$line) {
+    return @([regex]::Matches($line, '"([^"]*)"|(\S+)') | ForEach-Object {
+            if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } })
+}
+
+if ($runParts -contains "render") {
+    Write-Output "render: tests\window-render.input, live in a window, and each render's RayTracingGPU command"
+    $folder = Join-Path $run "render"
+    $console = Invoke-Window "window-render" $folder @("cornell", "-w", "320", "--height", "180", "-s", "16",
+        "--input", (Join-Path $project "tests\window-render.input"))
+    if ($null -eq $console) {
+        Write-Output ("render: postponed: the queue opens no window while a fullscreen application is in front (or " +
+            "the GPU is too hot): run it again later")
+        Write-Output "Panel gate: POSTPONED"
+        exit 4
+    }
+    $gpuExe = Join-Path (Get-FullPath $Build) "RayTracingGPU.exe"
+    # Each Saved line is followed by its command
+    for ($i = 0; $i -lt $console.Count - 1; $i++) {
+        # "Saved <folder>\NAME.png and .pfm" or "Saved <folder>\NAME.png, .pfm and -denoised.png"
+        if ($console[$i] -notmatch '^Saved .*[\\/]([^\\/,]+?)\.png(,| and)') { continue }
+        $name = $Matches[1]
+        $words = @(Split-Command $console[$i + 1])
+        if ($words.Count -lt 2 -or $words[0] -ne "RayTracingGPU") { throw "panel: no command after '$($console[$i])'" }
+        Push-Location -LiteralPath $folder
+        try {
+            $all = @("-Step", "$Step", "-Label", "render-command $name", "--", $gpuExe) + $words[1..($words.Count - 1)]
+            $out = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $gpuScript @all)
+            if ($LASTEXITCODE -ne 0) { $out | ForEach-Object { Write-Output "  | $_" }; throw "panel: $name's command failed" }
+        }
+        finally { Pop-Location }
+        $pairs = @(, @("$name.pfm", "$name-gpu.pfm"))
+        if (Test-Path -LiteralPath (Join-Path $folder "$name-gpu.png")) { $pairs += , @("$name.png", "$name-gpu.png") }
+        if (Test-Path -LiteralPath (Join-Path $folder "$name-denoised.png")) {
+            $pairs += , @("$name-denoised.png", "$name-gpu-denoised.png")
+        }
+        foreach ($pair in $pairs) {
+            $a = Join-Path $folder $pair[0]
+            $b = Join-Path $folder $pair[1]
+            if ((Test-Path -LiteralPath $a) -and (Test-Path -LiteralPath $b) -and ((Get-Sha256 $a) -ceq (Get-Sha256 $b))) {
+                Write-Output ("  {0} = its command's {1}, PASS" -f $pair[0], $pair[1])
+            }
+            else {
+                Write-Output ("  {0} against its command's {1}: DIFFERENT or MISSING, FAIL" -f $pair[0], $pair[1])
+                $script:failures++
+            }
+        }
+    }
+    $expect = @(
+        @{ what = "cornell-render-001 saved at 96x54"; ok = [bool]($console | Where-Object {
+                    $_ -like "RayTracingGPU cornell -w 96 --height 54 *-s 64 *" }) },
+        @{ what = "still-life's render saved with its denoised copy"; ok = (Test-Path -LiteralPath (Join-Path $folder "still-life-render-002-denoised.png")) },
+        @{ what = "the cancelled render saved nothing"; ok = ([bool]($console | Where-Object { $_ -ceq "Render cancelled: nothing saved" }) -and
+                @(Get-ChildItem -LiteralPath $folder -Filter "*-render-*.pfm" | Where-Object { $_.Name -notlike "*-gpu*" }).Count -eq 2) },
+        @{ what = "the window's own view back at 320x180"; ok = [bool]($console | Where-Object {
+                    $_ -like "RayTracingGPU cornell -w 320 --height 180 *-o cornell-view-001-gpu.pfm" }) }
+    )
+    foreach ($e in $expect) {
+        if ($e.ok) { Write-Output "  $($e.what): PASS" }
+        else { Write-Output "  $($e.what): FAIL"; $script:failures++ }
+    }
+    Write-Output "  its console, for review:"
+    $console | Where-Object { $_ -match '^(Scene|Render|Saved|RayTracingGPU|Note|Error|Denoised)' } |
         ForEach-Object { Write-Output "    | $_" }
 }
 

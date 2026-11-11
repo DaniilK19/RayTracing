@@ -242,6 +242,9 @@ void test_actions(report& r)
         {show_help{true}, "help on"},
         {show_panel{false}, "panel off"},
         {open_file{}, "open"},
+        {render_image{1920, 1080, 256, false}, "render 1920 1080 256"},
+        {render_image{96, 54, 16, true}, "render 96 54 16 denoised"},
+        {cancel_render{}, "render-cancel"},
     };
     for (const auto& [a, line] : lines)
     {
@@ -279,6 +282,12 @@ void test_actions(report& r)
     refused("reset-view now", "reset-view takes no values");
     refused("save all", "save takes no values");
     refused("panel", "panel is on or off");
+    refused("render 1920 1080", "render needs W H N, and maybe denoised");
+    refused("render 1920 1080 16 twice", "render needs W H N, and maybe denoised");
+    refused("render 15 1080 16", "render's sides are from 16 to 16384 pixels, 33177600 pixels at most in all");
+    refused("render 16384 16384 16", "render's sides are from 16 to 16384 pixels, 33177600 pixels at most in all");
+    refused("render 1920 1080 0", "render needs samples from 1 to 2147483647");
+    refused("render-cancel now", "render-cancel takes no values");
 
     // The samples to refine to: whole rounds of strata, rounded up, from one round up
     r.same("actions.rounds.exact", whole_rounds(128, 8), std::int64_t{128});

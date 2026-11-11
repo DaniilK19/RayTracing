@@ -146,6 +146,9 @@ In the window:
                        of a window someone watches, unless --no-panel)
   a glTF file dropped on the window, or the panel's Open...
                        shows the model in the photo studio
+  the panel's Render to file
+                       the view at another size and samples, saved as <scene>-render-NNN.png and .pfm with
+                       its RayTracingGPU command, as P saves (Esc stops it)
   R                    back to the start view
   P                    save the image as <scene>-view-NNN.png and .pfm in the current folder,
                        and print the RayTracingGPU command that renders it; with N on, also
@@ -737,6 +740,21 @@ private:
     SDL_Keymod mods_ = SDL_KMOD_NONE;
     std::uint64_t fly_since_ns_ = 0; // the time the flight's last step covered up to
     int views_saved_ = 0;
+    int renders_saved_ = 0;
+    // A render to a file (an action render, the panel's Render to file): the window's session renders the view at the
+    // file's size, to its samples, in the frames' launches, and saves it as P saves (save_view); then the window's own
+    // size, samples and image come back. What the window was when it started is kept here.
+    struct render_job
+    {
+        int width;
+        int height;
+        bool denoised;
+        int window_width;
+        int window_height;
+        std::int64_t window_target;
+        std::uint64_t start_ns;
+    };
+    std::optional<render_job> job_;
     bool paused_ = false; // Space: no refining
     // A camera moved by this batch of events, shown at the next iterate: one new view for all of a frame's mouse moves
     std::optional<camera_settings> pending_view_;
@@ -811,7 +829,10 @@ private:
     std::optional<camera_settings> pick_focus(double x, double y); // not const: a miss says so on screen
     std::optional<camera_settings> pick_focus_optix(const camera_settings& view, const ray& r, int i, int j);
     camera_settings moved(const move& m, double t) const;
-    void save_view();
+    void save_view(std::string_view kind = "view");
+    SDL_AppResult start_render(const render_image& r);
+    SDL_AppResult finish_render();
+    SDL_AppResult end_render(const std::string& why);
     void copy_view_command();
     // A scene the window could go to, built and checked while nothing changes yet (attempt_scene)
     struct scene_attempt
@@ -1372,6 +1393,10 @@ std::optional<camera_settings> viewer::pick_focus_optix(const camera_settings& v
 // The camera the last events moved, and the window's new size, given to the session
 std::expected<void, std::string> viewer::apply_pending_view()
 {
+    if (job_)
+    {
+        return {}; // a render to a file has the image's size and view: the window's wait until it ends
+    }
     const int width = pending_width_ > 0 ? pending_width_ : width_;
     const int height = pending_width_ > 0 ? pending_height_ : height_;
     pending_width_ = 0;
@@ -1445,7 +1470,7 @@ std::expected<gpu::accumulation, std::string> viewer::complete_pass()
 // (with N on, also <scene>-view-NNN-denoised.png: the bytes of the denoised image of those passes, as RayTracingGPU
 // --denoise writes NAME-denoised.png, shown in the window first: unless the frame on screen is that image already, a
 // frame denoised now, which a recording marks)
-void viewer::save_view()
+void viewer::save_view(std::string_view kind)
 {
     const auto state = complete_pass();
     if (!state)
@@ -1504,7 +1529,8 @@ void viewer::save_view()
     std::string name;
     do
     {
-        name = std::format("{}-view-{:03}", scene_stem(settings_.scene), ++views_saved_);
+        name = std::format("{}-{}-{:03}", scene_stem(settings_.scene), kind,
+                           kind == "render" ? ++renders_saved_ : ++views_saved_);
     } while (std::filesystem::exists(name + ".png") || std::filesystem::exists(name + ".pfm") ||
              (denoised_png && std::filesystem::exists(name + "-denoised.png")));
     for (const std::string_view extension : {".png", ".pfm", "-denoised.png"})
@@ -2423,6 +2449,14 @@ SDL_AppResult viewer::apply(const action& a)
     {
         return SDL_APP_CONTINUE;
     }
+    // While a render to a file runs, the window's settings and view stay as they are: only the panel, the numbers, the
+    // help, and the render's own cancel
+    if (job_ && !std::holds_alternative<cancel_render>(a) && !std::holds_alternative<show_panel>(a) &&
+        !std::holds_alternative<show_hud>(a) && !std::holds_alternative<show_help>(a))
+    {
+        tell("rendering to a file: Esc or the panel's Cancel stops it");
+        return SDL_APP_CONTINUE;
+    }
     struct performer
     {
         viewer& v;
@@ -2523,8 +2557,109 @@ SDL_AppResult viewer::apply(const action& a)
             v.open_dialog();
             return SDL_APP_CONTINUE;
         }
+        SDL_AppResult operator()(const render_image& r) const { return v.start_render(r); }
+        SDL_AppResult operator()(const cancel_render&) const
+        {
+            if (!v.job_)
+            {
+                return SDL_APP_CONTINUE;
+            }
+            std::println("Render cancelled: nothing saved");
+            const SDL_AppResult result = v.end_render("render cancelled: nothing saved");
+            return result;
+        }
     };
     return std::visit(performer{*this}, a);
+}
+
+// --- Render to a file ----------------------------------------------------------------------------------------------
+
+// A render to a file starts: the view, its moves still waiting shown first, set at the file's size in the window's
+// session, to the samples asked for in whole rounds of strata. It is refused where the window saves its frames
+// (--record, --frames: a frame of another size would be one of them), while another runs, and in float64 for a
+// denoised copy. If the GPU can't hold an image of that size, the window's own view comes back, and the note says why.
+SDL_AppResult viewer::start_render(const render_image& r)
+{
+    if (job_)
+    {
+        tell("a render to a file is running already");
+        return SDL_APP_CONTINUE;
+    }
+    if (opts_.record || opts_.frames)
+    {
+        tell("no render to a file while --record or --frames saves the window's frames");
+        return SDL_APP_CONTINUE;
+    }
+    if (r.denoised && settings_.fp64)
+    {
+        tell("OptiX's denoiser works in float32 only: F2 first");
+        return SDL_APP_CONTINUE;
+    }
+    if (const auto applied = apply_pending_view(); !applied)
+    {
+        tell(applied.error());
+        return SDL_APP_CONTINUE;
+    }
+    job_ = render_job{.width = r.width, .height = r.height, .denoised = r.denoised, .window_width = width_,
+                      .window_height = height_, .window_target = target_, .start_ns = SDL_GetTicksNS()};
+    target_ = whole_rounds(r.samples, settings_.strata);
+    if (const auto shown = show_view(view_, r.width, r.height, true); !shown)
+    {
+        std::println("Error: can't render {}x{}: {}", r.width, r.height, shown.error());
+        return end_render(std::format("can't render {}x{}: {}", r.width, r.height, shown.error()));
+    }
+    std::println("Render: {}x{}, {} samples per pixel{}", r.width, r.height, target_,
+                 r.denoised ? ", and denoised" : "");
+    done_reported_ = true; // the window's Done line is its own image's
+    skip_interval_ = true;
+    samples_per_second_ = 0;
+    present_needed_ = true;
+    return SDL_APP_CONTINUE;
+}
+
+// The render to a file has its samples: saved as P saves the view (save_view), as <scene>-render-NNN, with the
+// denoised copy if asked for (OptiX's runtime given to the session for it, if it hasn't one; the plain files are saved
+// whatever the denoiser does). Then the window's own view comes back.
+SDL_AppResult viewer::finish_render()
+{
+    const bool denoised_before = denoise_;
+    if (job_->denoised && !denoise_)
+    {
+        denoise_ = true;
+        if (const auto attached = attach_denoiser(); !attached)
+        {
+            denoise_ = false;
+            std::println("Error: {}", attached.error());
+        }
+    }
+    save_view("render");
+    if (denoise_ && !denoised_before)
+    {
+        denoise_ = false;
+        drop_denoiser();
+    }
+    const double seconds = static_cast<double>(SDL_GetTicksNS() - job_->start_ns) / 1e9;
+    return end_render(std::format("rendered {}x{} in {:.1f} s: saved", job_->width, job_->height, seconds));
+}
+
+// The window's own view at its own size again, its samples to refine to as they were, the image started over; the
+// note says how the render ended. If not even the window's view can come back, the program ends.
+SDL_AppResult viewer::end_render(const std::string& why)
+{
+    const render_job job = *job_;
+    job_.reset();
+    target_ = job.window_target;
+    if (const auto shown = show_view(view_, job.window_width, job.window_height, true); !shown)
+    {
+        return fail(std::format("{}; and the window's view couldn't come back: {}", why, shown.error()));
+    }
+    done_reported_ = false;
+    skip_interval_ = true;
+    samples_per_second_ = 0;
+    moving_until_ns_ = SDL_GetTicksNS() + moving_ns;
+    present_needed_ = true;
+    say(why);
+    return SDL_APP_CONTINUE;
 }
 
 // F3, an action: the panel shown or hidden. It starts at its first showing (Dear ImGui and its font, a few
@@ -2600,6 +2735,14 @@ panel_state viewer::state_for_panel() const
         .focus_min = min_focus_,
         .focus_max = std::max(10 * (view_.lookfrom - view_.lookat).length(), view_.focus_dist),
         .keys = {std::begin(help_lines), std::end(help_lines)},
+        .render_refused = opts_.record || opts_.frames ? "not while --record or --frames saves the window's frames"
+                                                       : "",
+        .rendering = job_.has_value(),
+        .render_width = job_ ? job_->width : 0,
+        .render_height = job_ ? job_->height : 0,
+        .render_passes = job_ ? state.passes : 0,
+        .render_target = job_ ? target_ : 0,
+        .render_seconds = job_ ? static_cast<double>(SDL_GetTicksNS() - job_->start_ns) / 1e9 : 0,
     };
 }
 
@@ -2769,8 +2912,12 @@ void viewer::draw_overlay()
     constexpr float line = 10; // 8 pixels of text and 2 of space
     constexpr float bar_height = 3 * line + 6;
     constexpr float note_height = line + 6;
-    const auto w = static_cast<float>(width_);
-    const auto h = static_cast<float>(height_);
+    // The window's size: the image's, but for a render to a file's, which is drawn to fit the window
+    int output_width = width_;
+    int output_height = height_;
+    SDL_GetCurrentRenderOutputSize(renderer_, &output_width, &output_height);
+    const auto w = static_cast<float>(output_width);
+    const auto h = static_cast<float>(output_height);
     // The quality kernel's integrator's strategy is named on the first line ("  mis"), as a tone map is on the third
     // ("  agx +0.5 EV"), and OptiX after it ("  optix"): the books' scenes, under their own kernels and bytes, show
     // the numbers they showed
@@ -3253,8 +3400,23 @@ bool viewer::draw_and_present(bool new_samples)
     SDL_RenderClear(renderer_);
     if (!shown_.empty() && shown_width_ == texture_width_ && shown_height_ == texture_height_)
     {
-        const SDL_FRect where{0, 0, static_cast<float>(texture_width_), static_cast<float>(texture_height_)};
+        SDL_FRect where{0, 0, static_cast<float>(texture_width_), static_cast<float>(texture_height_)};
+        if (job_)
+        {
+            // A render to a file's image, of its own size: scaled to fit the window, smoothly, centered
+            int w = 0;
+            int h = 0;
+            SDL_GetCurrentRenderOutputSize(renderer_, &w, &h);
+            const float scale = std::min(static_cast<float>(w) / where.w, static_cast<float>(h) / where.h);
+            where = {(static_cast<float>(w) - where.w * scale) / 2, (static_cast<float>(h) - where.h * scale) / 2,
+                     where.w * scale, where.h * scale};
+            SDL_SetTextureScaleMode(texture_, SDL_SCALEMODE_LINEAR);
+        }
         SDL_RenderTexture(renderer_, texture_, nullptr, &where);
+        if (job_)
+        {
+            SDL_SetTextureScaleMode(texture_, SDL_SCALEMODE_NEAREST);
+        }
     }
     if (new_samples && opts_.frames && !minimized_ && !opts_.frames_hud && !save_frame_from_window())
     {
@@ -4002,11 +4164,20 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         }
         if (e.key.key == SDLK_ESCAPE && !e.key.repeat)
         {
-            // Esc closes the help first, then lets the mouse go, and only then the window
+            // Esc closes the help first, then lets the mouse go, then stops a render to a file, and only then closes
+            // the window
             if (help_)
             {
                 help_ = false;
                 present_needed_ = true;
+                break;
+            }
+            if (job_)
+            {
+                if (const SDL_AppResult result = apply(cancel_render{}); result != SDL_APP_CONTINUE)
+                {
+                    return result;
+                }
                 break;
             }
             if (SDL_GetWindowRelativeMouseMode(window_))
@@ -4020,6 +4191,16 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         if (opts_.script)
         {
             break; // a script moves the camera alone
+        }
+        // While a render to a file runs, the keys that show (F3, H, F1, I) work; the others say what is happening
+        if (job_ && e.key.key != SDLK_F3 && e.key.key != SDLK_H && e.key.key != SDLK_F1 && e.key.key != SDLK_I)
+        {
+            if (!e.key.repeat && e.key.scancode != SDL_SCANCODE_LSHIFT && e.key.scancode != SDL_SCANCODE_RSHIFT &&
+                e.key.scancode != SDL_SCANCODE_LCTRL && e.key.scancode != SDL_SCANCODE_RCTRL)
+            {
+                tell("rendering to a file: Esc or the panel's Cancel stops it");
+            }
+            break;
         }
         // - = [ ] by the letter on the key, or by their place on a US keyboard, right of 0 and of P (on many layouts
         // the brackets need AltGr, which the key event doesn't carry)
@@ -4158,6 +4339,10 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         {
             break; // the panel's: no drag starts (one that started on the image goes on over it)
         }
+        if (job_)
+        {
+            break; // the camera stays while a render to a file runs
+        }
         drag_button_ = e.button.button;
         if (e.button.button == SDL_BUTTON_LEFT && e.button.clicks == 2)
         {
@@ -4219,7 +4404,7 @@ SDL_AppResult viewer::event(const SDL_Event& e)
         }
         break;
     case SDL_EVENT_MOUSE_WHEEL:
-        if (!opts_.script && !(panel_shown_ && panel_.over_panel(e.wheel.mouse_x, e.wheel.mouse_y)))
+        if (!opts_.script && !job_ && !(panel_shown_ && panel_.over_panel(e.wheel.mouse_x, e.wheel.mouse_y)))
         {
             const double steps = e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? -e.wheel.y : e.wheel.y;
             const camera_settings from = current_view();
@@ -4375,7 +4560,7 @@ SDL_AppResult viewer::iterate()
             const double forward = key(SDL_SCANCODE_W) - key(SDL_SCANCODE_S);
             const double right = key(SDL_SCANCODE_D) - key(SDL_SCANCODE_A);
             const double up = key(SDL_SCANCODE_E) - key(SDL_SCANCODE_Q);
-            if (flying())
+            if (flying() && !job_)
             {
                 const camera_settings from = current_view();
                 const double speed = 0.5 * (from.lookfrom - from.lookat).length() *
@@ -4384,17 +4569,21 @@ SDL_AppResult viewer::iterate()
                 fly_since_ns_ = now;
                 move_camera(fly(from, forward * step, right * step, up * step));
             }
+            // (A render to a file keeps the window's new size waiting until it ends: apply_pending_view)
             if (const auto applied = apply_pending_view(); !applied)
             {
                 return fail(applied.error());
             }
-            moving = now < moving_until_ns_;
-            // Paused, the image doesn't refine, but a new view (a camera move, a new size) still gets its first pass
-            const std::int64_t limit = paused_ ? std::min(target_, std::max<std::int64_t>(session_->state().passes, 1))
-                                               : target_;
+            moving = !job_ && now < moving_until_ns_;
+            // Paused, the image doesn't refine, but a new view (a camera move, a new size) still gets its first pass.
+            // A render to a file goes on whatever the pause.
+            const std::int64_t limit = paused_ && !job_
+                                           ? std::min(target_, std::max<std::int64_t>(session_->state().passes, 1))
+                                           : target_;
             // Under the denoiser, a moving view's frames show the image itself, and a still view's are denoised on
-            // their schedule (frame_bytes)
-            const denoise_rule rule = moving ? denoise_rule::moving : denoise_rule::schedule;
+            // their schedule (frame_bytes); a render to a file's frames show the image itself, and its denoised copy
+            // is made once, when it is saved
+            const denoise_rule rule = moving || job_ ? denoise_rule::moving : denoise_rule::schedule;
             if (!minimized_pause && session_->state().passes < limit)
             {
                 const double budget = moving ? moving_share * pacing_.frame_seconds : still_seconds;
@@ -4423,6 +4612,14 @@ SDL_AppResult viewer::iterate()
                 redisplayed = true;
             }
             done = session_->state().passes >= target_;
+            if (job_ && done)
+            {
+                if (const SDL_AppResult result = finish_render(); result != SDL_APP_CONTINUE)
+                {
+                    return result;
+                }
+                done = false;
+            }
         }
         // A frame to show and to save: new samples, or the same ones through another display
         const bool new_frame = new_samples || redisplayed;
